@@ -1,0 +1,29 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock.orig
+
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+.npm/
+
+# Tauri
+/src-tauri/target/
+/src-tauri/gen/
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Build artifacts / local state
+*.msi
+*.log
+.env
+.env.local
