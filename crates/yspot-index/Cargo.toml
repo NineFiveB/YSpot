@@ -1,0 +1,32 @@
+[package]
+name = "yspot-index"
+description = "YSpot filename index: volume discovery, MFT enumeration, USN tailing, in-memory index + matching (SPEC.md §3)"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+yspot-proto = { path = "../yspot-proto" }
+thiserror.workspace = true
+anyhow.workspace = true
+memchr.workspace = true
+log.workspace = true
+# M0: NFC + lowercase fold via unicode-normalization/std; SPEC §3.4 pins
+# ICU4X simple case folding — swap in icu_normalizer/icu_casemap in M1.
+unicode-normalization = "0.1"
+
+[dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_Security",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+]
+
+[dev-dependencies]
+tempfile = "3"

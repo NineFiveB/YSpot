@@ -1,0 +1,150 @@
+/* YSpot launcher — M0 styles. Both palettes via prefers-color-scheme (§5.8);
+   system font stack; minimal, launcher-like chrome. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f4f5f7;
+  --fg: #1b1d21;
+  --muted: #697077;
+  --border: rgba(0, 0, 0, 0.08);
+  --row-hover: rgba(0, 0, 0, 0.05);
+  --row-selected: rgba(37, 99, 235, 0.12);
+  --accent: #2563eb;
+  --mark-bg: rgba(37, 99, 235, 0.22);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1e22;
+    --fg: #e7e9ec;
+    --muted: #9aa1a9;
+    --border: rgba(255, 255, 255, 0.08);
+    --row-hover: rgba(255, 255, 255, 0.06);
+    --row-selected: rgba(96, 165, 250, 0.16);
+    --accent: #60a5fa;
+    --mark-bg: rgba(96, 165, 250, 0.3);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-size: 14px;
+  overflow: hidden;
+  user-select: none;
+  cursor: default;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.query-bar {
+  height: 64px;
+  flex: none;
+  display: flex;
+  align-items: center;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.query-input {
+  width: 100%;
+  font-family: inherit;
+  font-size: 20px;
+  color: var(--fg);
+  background: transparent;
+  border: none;
+  outline: none;
+  padding: 8px;
+  caret-color: var(--accent);
+}
+
+.query-input::placeholder {
+  color: var(--muted);
+}
+
+.results {
+  flex: none;
+  position: relative;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+.results-inner {
+  position: relative;
+}
+
+.row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 48px;
+  padding: 6px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  contain: strict;
+  border-left: 2px solid transparent;
+}
+
+.row:hover {
+  background: var(--row-hover);
+}
+
+.row-selected,
+.row-selected:hover {
+  background: var(--row-selected);
+  border-left-color: var(--accent);
+}
+
+.row-name {
+  font-size: 14px;
+  line-height: 18px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-path {
+  font-size: 11px;
+  line-height: 14px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+mark {
+  background: var(--mark-bg);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0;
+}
+
+.hud {
+  position: fixed;
+  right: 8px;
+  bottom: 6px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  opacity: 0.85;
+  pointer-events: none;
+}
