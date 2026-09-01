@@ -46,6 +46,9 @@ pub fn walk<S: EntrySink>(root: &Path, sink: &mut S) -> anyhow::Result<u64> {
         }
     }
 
+    // Whole tree pushed: let the sink settle its storage (§3.4 memory budget).
+    sink.finish();
+
     Ok(count)
 }
 

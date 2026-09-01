@@ -21,6 +21,14 @@
 //!   reference Machine A (NVMe/8-core) and Machine B (i5-5200U class). CI
 //!   results are a regression tripwire, not the sign-off measurement.
 //!
+//! Alongside the query classes it reports three things the classes cannot
+//! show on their own: a per-structure `ram_bytes` table (so §4.3's
+//! `ram_bytes.filename` is attributable rather than one opaque number), the
+//! measured mean name length `L` that the §3.4 byte accounting scales
+//! through, and an isolated Pass-A scan probe — one `memmem` over the folded
+//! arena with a needle that cannot hit, which is the irreducible floor under
+//! every query.
+//!
 //! Determinism: a fixed-seed inline xorshift64\* PRNG (no `rand` dependency);
 //! nothing wall-clock or environment derived feeds corpus generation, so two
 //! runs on one machine differ only by timing noise.
@@ -32,6 +40,8 @@
 //!       [--json] [--json-out PATH] [--strict]
 //! ```
 //!
+//! `--entries 1000000` is the §10 M0 target size (underscores accepted).
+//!
 //! `--json` writes one JSON object to stdout and nothing else. `--json-out`
 //! writes the same object to a file while keeping the human table on stdout
 //! (that is the CI shape: one run, readable log plus an archivable artifact).
@@ -41,7 +51,7 @@
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use yspot_index::index::VolumeIndex;
+use yspot_index::index::{RamBreakdown, VolumeIndex};
 use yspot_index::{flags, EntrySink, UsnEvent};
 
 /// §2.5: service first batch (in-memory match + rank + trimming) ≤ 10 ms p95.
@@ -51,6 +61,9 @@ const RAM_TYPICAL_PER_1M: f64 = 120.0 * 1024.0 * 1024.0;
 const RAM_CAP_PER_1M: f64 = 200.0 * 1024.0 * 1024.0;
 /// §2.5 / §4.3: the service's first batch is the top ~32 hits.
 const DEFAULT_MAX_RESULTS: usize = 32;
+/// Folded-arena size the §3.4 byte accounting puts a 1M-entry volume at, used
+/// only to extrapolate the isolated scan probe onto that reference point.
+const REFERENCE_ARENA_BYTES: f64 = 24.0 * 1024.0 * 1024.0;
 /// Representative queries generated per class.
 const QUERIES_PER_CLASS: usize = 6;
 
@@ -315,6 +328,14 @@ const NO_MATCH_QUERIES: &[&str] = &["zqxjvw", "qzzxwv", "jjqxzv", "xkqvzz", "wvz
 /// one is the prefix of a high-frequency vocabulary word, so each matches tens
 /// of thousands of entries at 1M — far past what the top-32 page needs.
 const COMMON_SUBSTRINGS: &[&str] = &["conf", "serv", "data", "repo", "temp", "sess"];
+
+/// Needle for the isolated Pass-A probe. Long, and built from letter runs no
+/// vocabulary word contains, so it is guaranteed to match nothing: the scan
+/// runs to the end of the folded arena and *only* the scan happens — no
+/// hit→entry mapping, no tiering, no ranking. That makes the irreducible
+/// `memmem` floor measurable on its own, which is the term SPEC §3.4's "a 1M
+/// -name arena scans in single-digit ms" premise rests on.
+const SCAN_PROBE_NEEDLE: &str = "zqxjvw-no-such-name-zqxjvw";
 
 // ---------------------------------------------------------------------------
 // Corpus synthesis.
@@ -797,6 +818,10 @@ struct Stats {
     min: f64,
     p50: f64,
     p95: f64,
+    /// Reported next to `max` because with a few hundred samples `max` is one
+    /// sample and can be pure scheduler noise, while p99 still describes the
+    /// tail the §2.5 budget is judged on.
+    p99: f64,
     max: f64,
 }
 
@@ -808,6 +833,7 @@ fn stats(mut v: Vec<f64>) -> Stats {
             min: 0.0,
             p50: 0.0,
             p95: 0.0,
+            p99: 0.0,
             max: 0.0,
         };
     }
@@ -820,6 +846,7 @@ fn stats(mut v: Vec<f64>) -> Stats {
         min: v[0],
         p50: at(0.50),
         p95: at(0.95),
+        p99: at(0.99),
         max: v[v.len() - 1],
     }
 }
@@ -975,8 +1002,17 @@ struct Report {
 
     inserted: usize,
     build_ms: f64,
+    finalize_ms: f64,
     ram_cold: u64,
     ram_warm: u64,
+    ram_cold_parts: RamBreakdown,
+    ram_warm_parts: RamBreakdown,
+    /// `name_arena.len()` / `folded_arena.len()` — payload, not capacity. The
+    /// mean of these over `inserted` is the `L` the §3.4 byte accounting
+    /// scales through, and it is the one parameter of that model this harness
+    /// can actually measure.
+    name_arena_bytes: usize,
+    folded_arena_bytes: usize,
     ram_budget_typical: f64,
     ram_budget_cap: f64,
     ram_pass: bool,
@@ -985,11 +1021,30 @@ struct Report {
     cold_trigram_us: f64,
     mutation_basic_us: f64,
     mutation_trigram_us: f64,
+    scan_probe_stats: Stats,
+    scan_probe_hits: usize,
     path_of_stats: Stats,
 
     classes: Vec<ClassResult>,
     overall_pass: bool,
 }
+
+/// Printed with the memory block: the totals below moved for two independent
+/// reasons and a run must not be read as a regression when it is a corrected
+/// measurement.
+const RAM_ACCOUNTING_NOTE: &str = "\
+              NOTE: frn_map is charged per hashbrown BUCKET — 16 B payload plus one control byte,
+              and capacity() reports only 7/8 of the buckets. That line is ~21% larger than the
+              capacity()*16 it replaced, so totals RISE against pre-fix runs: a corrected
+              accounting bug, not a memory regression. finish() then pulls them back down by
+              handing back bulk-load doubling slack, which IS a real reduction.";
+
+/// Printed with the isolated Pass-A probe; see [`SCAN_PROBE_NEEDLE`].
+const SCAN_PROBE_NOTE: &str = "\
+isolated Pass-A scan — one memmem over the folded arena with a needle that cannot hit, so the scan
+runs end to end and nothing maps, tiers, scores or ranks. This is the floor every query pays before
+doing any work of its own: above ~4 ms on a 1M-entry arena the scan alone eats the §2.5 budget and
+no amount of per-candidate work can recover it.";
 
 const HEADER_CAVEAT: &str = "\
 Synthetic corpus, no MFT/USN I/O, no pipe, no §3.8 AccessCheck trimming (§2.5
@@ -997,7 +1052,74 @@ allots 2 ms of the 10 ms budget to trimming that is NOT spent here). These are
 LOWER BOUNDS on service latency. CI runners are shared, throttled VMs; SPEC §10
 M0 sign-off requires numbers from reference Machine A and Machine B.";
 
+/// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
+/// object cannot drift apart.
+fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 8] {
+    [
+        ("entries", b.entries),
+        ("name_arena", b.name_arena),
+        ("folded_arena", b.folded_arena),
+        ("frn_map", b.frn_map),
+        ("free_slots", b.free_slots),
+        ("accel:folded_order", b.folded_order),
+        ("accel:initials", b.initials),
+        ("accel:trigrams", b.trigrams),
+    ]
+}
+
 impl Report {
+    /// Folded-arena bytes scanned per second, at the probe's p50.
+    fn scan_gb_per_s(&self) -> f64 {
+        let secs = self.scan_probe_stats.p50 / 1e6;
+        if secs <= 0.0 {
+            return 0.0;
+        }
+        self.folded_arena_bytes as f64 / secs / 1e9
+    }
+
+    /// The probe extrapolated onto the §3.4 reference point (a 1M-entry
+    /// volume, 24 MB folded arena), so a run at any `--entries` can be read
+    /// against the ~4 ms line that falsifies the "scan is not the bottleneck"
+    /// premise (docs/design/accel-redesign.md, falsifier 2).
+    fn scan_ms_at_1m(&self) -> f64 {
+        if self.folded_arena_bytes == 0 {
+            return 0.0;
+        }
+        self.scan_probe_stats.p50 / 1e3 * REFERENCE_ARENA_BYTES / self.folded_arena_bytes as f64
+    }
+
+    /// Per-structure attribution of `ram_bytes` (§4.3 `ram_bytes.filename`).
+    /// Cold is the settled index; warm is after the lazy accel structures
+    /// have been built, which is where the trigram postings appear.
+    fn print_ram_table(&self) {
+        println!(
+            "ram_bytes by structure — cold = after finish(), warm = after the accel is built:"
+        );
+        println!(
+            "{:<20} {:>14} {:>14} {:>10} {:>12}",
+            "structure", "cold bytes", "warm bytes", "warm MB", "warm B/entry"
+        );
+        let n = self.inserted.max(1) as f64;
+        for (&(name, cold), &(_, warm)) in ram_rows(&self.ram_cold_parts)
+            .iter()
+            .zip(ram_rows(&self.ram_warm_parts).iter())
+        {
+            println!(
+                "{name:<20} {cold:>14} {warm:>14} {:>10.2} {:>12.2}",
+                mib(warm),
+                warm as f64 / n
+            );
+        }
+        println!(
+            "{:<20} {:>14} {:>14} {:>10.2} {:>12.2}",
+            "TOTAL",
+            self.ram_cold,
+            self.ram_warm,
+            mib(self.ram_warm),
+            self.ram_warm as f64 / n
+        );
+    }
+
     fn print_table(&self) {
         println!("YSpot filename-index matching benchmark — SPEC §3.4 / §2.5 / §10 M0");
         println!("{}", "=".repeat(96));
@@ -1022,6 +1144,10 @@ impl Report {
              §3.2 enumeration budget]",
             self.inserted, self.build_ms, per_sec
         );
+        println!(
+            "              finalize (EntrySink::finish → shrink_to_fit): {:.0} ms",
+            self.finalize_ms
+        );
         let bpe = self.ram_warm as f64 / self.inserted.max(1) as f64;
         println!(
             "memory        ram_bytes cold={} ({:.1} MB)  warm+accel={} ({:.1} MB)  = {:.1} B/entry",
@@ -1039,6 +1165,14 @@ impl Report {
             self.ram_budget_cap / 1024.0 / 1024.0,
             verdict(self.ram_pass)
         );
+        println!(
+            "              mean name bytes L = {:.1} (folded {:.1}); arena payload, not capacity",
+            self.name_arena_bytes as f64 / self.inserted.max(1) as f64,
+            self.folded_arena_bytes as f64 / self.inserted.max(1) as f64,
+        );
+        println!("{RAM_ACCOUNTING_NOTE}");
+        println!("{}", "-".repeat(96));
+        self.print_ram_table();
         println!("{}", "-".repeat(96));
         println!("lazy accel-structure rebuild cost (§3.4 prefilters build on first use):");
         println!(
@@ -1063,6 +1197,26 @@ impl Report {
             self.max_results, self.path_of_stats.p50, self.path_of_stats.p95
         );
         println!("{}", "-".repeat(96));
+        println!("{SCAN_PROBE_NOTE}");
+        println!(
+            "  arena {:.1} MB   needle {:?}   hits {} (must be 0, or the probe is invalid)",
+            mib(self.folded_arena_bytes as u64),
+            SCAN_PROBE_NEEDLE,
+            self.scan_probe_hits
+        );
+        println!(
+            "  p50 {:.1} µs   p95 {:.1} µs   p99 {:.1} µs   max {:.1} µs   = {:.2} GB/s",
+            self.scan_probe_stats.p50,
+            self.scan_probe_stats.p95,
+            self.scan_probe_stats.p99,
+            self.scan_probe_stats.max,
+            self.scan_gb_per_s()
+        );
+        println!(
+            "  same scan over a 24 MB (1M-entry) arena: {:.2} ms",
+            self.scan_ms_at_1m()
+        );
+        println!("{}", "-".repeat(96));
         println!(
             "warm steady-state query latency — {} iterations/class, max_results={}, \
              budget = p95 ≤ {:.1} ms (§2.5)",
@@ -1071,17 +1225,18 @@ impl Report {
             BUDGET_P95_US / 1000.0
         );
         println!(
-            "{:<18} {:>10} {:>10} {:>10} {:>10} {:>9} {:>7}  note",
-            "class", "min µs", "p50 µs", "p95 µs", "max µs", "hits", "budget"
+            "{:<18} {:>9} {:>9} {:>9} {:>9} {:>9} {:>8} {:>7}  note",
+            "class", "min µs", "p50 µs", "p95 µs", "p99 µs", "max µs", "hits", "budget"
         );
         println!("{}", "-".repeat(96));
         for c in &self.classes {
             println!(
-                "{:<18} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>9.1} {:>7}  {}",
+                "{:<18} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>9.1} {:>8.1} {:>7}  {}",
                 c.name,
                 c.stats.min,
                 c.stats.p50,
                 c.stats.p95,
+                c.stats.p99,
                 c.stats.max,
                 c.mean_hits,
                 verdict(c.pass),
@@ -1132,20 +1287,49 @@ impl Report {
         } else {
             0.0
         };
+        let n = self.inserted.max(1) as f64;
         let _ = write!(
             s,
-            ",\"build\":{{\"inserted\":{},\"build_ms\":{:.3},\"entries_per_sec\":{:.0},\
-             \"ram_bytes_cold\":{},\"ram_bytes_warm\":{},\"bytes_per_entry\":{:.2},\
+            ",\"build\":{{\"inserted\":{},\"build_ms\":{:.3},\"finalize_ms\":{:.3},\
+             \"entries_per_sec\":{:.0},\"ram_bytes_cold\":{},\"ram_bytes_warm\":{},\
+             \"bytes_per_entry\":{:.2},\"name_arena_bytes\":{},\"folded_arena_bytes\":{},\
+             \"mean_name_bytes\":{:.2},\"mean_folded_bytes\":{:.2},\
              \"budget_typical_bytes\":{:.0},\"budget_cap_bytes\":{:.0},\"pass\":{}}}",
             self.inserted,
             self.build_ms,
+            self.finalize_ms,
             per_sec,
             self.ram_cold,
             self.ram_warm,
-            self.ram_warm as f64 / self.inserted.max(1) as f64,
+            self.ram_warm as f64 / n,
+            self.name_arena_bytes,
+            self.folded_arena_bytes,
+            self.name_arena_bytes as f64 / n,
+            self.folded_arena_bytes as f64 / n,
             self.ram_budget_typical,
             self.ram_budget_cap,
             self.ram_pass
+        );
+        s.push_str(",\"ram_breakdown\":{\"cold\":");
+        ram_json(&mut s, &self.ram_cold_parts);
+        s.push_str(",\"warm\":");
+        ram_json(&mut s, &self.ram_warm_parts);
+        s.push('}');
+        s.push_str(",\"pass_a_scan_us\":{\"needle\":");
+        json_str(SCAN_PROBE_NEEDLE, &mut s);
+        let _ = write!(
+            s,
+            ",\"hits\":{},\"arena_bytes\":{},\"min\":{:.1},\"p50\":{:.1},\"p95\":{:.1},\
+             \"p99\":{:.1},\"max\":{:.1},\"gb_per_s\":{:.3},\"ms_at_1m_reference\":{:.3}}}",
+            self.scan_probe_hits,
+            self.folded_arena_bytes,
+            self.scan_probe_stats.min,
+            self.scan_probe_stats.p50,
+            self.scan_probe_stats.p95,
+            self.scan_probe_stats.p99,
+            self.scan_probe_stats.max,
+            self.scan_gb_per_s(),
+            self.scan_ms_at_1m()
         );
         let _ = write!(
             s,
@@ -1159,11 +1343,12 @@ impl Report {
         let _ = write!(
             s,
             ",\"path_of_us\":{{\"results\":{},\"min\":{:.1},\"p50\":{:.1},\"p95\":{:.1},\
-             \"max\":{:.1}}}",
+             \"p99\":{:.1},\"max\":{:.1}}}",
             self.max_results,
             self.path_of_stats.min,
             self.path_of_stats.p50,
             self.path_of_stats.p95,
+            self.path_of_stats.p99,
             self.path_of_stats.max
         );
         let _ = write!(s, ",\"budget_p95_us\":{BUDGET_P95_US:.1},\"classes\":[");
@@ -1185,11 +1370,12 @@ impl Report {
             let _ = write!(
                 s,
                 "],\"iterations\":{},\"min_us\":{:.1},\"p50_us\":{:.1},\"p95_us\":{:.1},\
-                 \"max_us\":{:.1},\"mean_hits\":{:.3},\"pass\":{}}}",
+                 \"p99_us\":{:.1},\"max_us\":{:.1},\"mean_hits\":{:.3},\"pass\":{}}}",
                 self.iterations,
                 c.stats.min,
                 c.stats.p50,
                 c.stats.p95,
+                c.stats.p99,
                 c.stats.max,
                 c.mean_hits,
                 c.pass
@@ -1210,6 +1396,19 @@ fn verdict(ok: bool) -> &'static str {
     } else {
         "FAIL"
     }
+}
+
+/// One `RamBreakdown` as a JSON object, keyed exactly like the printed table.
+fn ram_json(out: &mut String, b: &RamBreakdown) {
+    out.push('{');
+    for (i, (name, bytes)) in ram_rows(b).iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json_str(&name.replace(':', "_"), out);
+        let _ = write!(out, ":{bytes}");
+    }
+    let _ = write!(out, ",\"total\":{}}}", b.total());
 }
 
 fn kv_str(out: &mut String, k: &str, v: &str) {
@@ -1256,8 +1455,17 @@ fn run(cfg: &Config) -> Report {
         ix.add(e.frn, e.parent_frn, &e.name, e.flags);
     }
     let build_ms = ms(t0);
+    // §3.2's sinks call finish() when enumeration ends; without it the bench
+    // would measure an index still carrying bulk-load doubling slack that the
+    // service never has.
+    let t_fin = Instant::now();
+    ix.finish();
+    let finalize_ms = ms(t_fin);
     let inserted = ix.len();
-    let ram_cold = ix.ram_bytes();
+    let ram_cold_parts = ix.ram_breakdown();
+    let ram_cold = ram_cold_parts.total();
+    let name_arena_bytes = ix.name_arena_len();
+    let folded_arena_bytes = ix.folded_arena_len();
 
     // Query harvesting reads the arenas but never searches, so the cold-query
     // measurement below is still the first search this index has ever served.
@@ -1309,7 +1517,26 @@ fn run(cfg: &Config) -> Report {
     std::hint::black_box(ix.search(&cold3, cfg.max_results, &|| false));
     let mutation_trigram_us = us(t);
 
-    let ram_warm = ix.ram_bytes();
+    let ram_warm_parts = ix.ram_breakdown();
+    let ram_warm = ram_warm_parts.total();
+
+    // --- Isolated Pass-A scan floor ----------------------------------------
+    // One memmem over the folded arena with a needle that cannot hit, so the
+    // scan runs end to end and nothing maps, scores or ranks. Measured warm
+    // and away from the cold-query probes above, which it would otherwise
+    // pull the arena into cache for.
+    for _ in 0..3 {
+        std::hint::black_box(ix.arena_scan_probe(SCAN_PROBE_NEEDLE));
+    }
+    let mut scan_samples = Vec::with_capacity(cfg.iterations);
+    let mut scan_probe_hits = 0usize;
+    for _ in 0..cfg.iterations {
+        let t = Instant::now();
+        let hits = ix.arena_scan_probe(SCAN_PROBE_NEEDLE);
+        scan_samples.push(us(t));
+        // Per scan, not a running total: any non-zero invalidates the probe.
+        scan_probe_hits = std::hint::black_box(hits);
+    }
 
     // --- path_of for one result page ---------------------------------------
     let mut path_samples = Vec::with_capacity(cfg.iterations);
@@ -1398,8 +1625,13 @@ fn run(cfg: &Config) -> Report {
         gen_ms,
         inserted,
         build_ms,
+        finalize_ms,
         ram_cold,
         ram_warm,
+        ram_cold_parts,
+        ram_warm_parts,
+        name_arena_bytes,
+        folded_arena_bytes,
         ram_budget_typical,
         ram_budget_cap,
         ram_pass,
@@ -1407,6 +1639,8 @@ fn run(cfg: &Config) -> Report {
         cold_trigram_us,
         mutation_basic_us,
         mutation_trigram_us,
+        scan_probe_stats: stats(scan_samples),
+        scan_probe_hits,
         path_of_stats: stats(path_samples),
         classes,
         overall_pass,
@@ -1555,9 +1789,27 @@ mod tests {
         assert_eq!(s.min, 1.0);
         assert_eq!(s.p50, 50.0);
         assert_eq!(s.p95, 95.0);
+        assert_eq!(s.p99, 99.0);
         assert_eq!(s.max, 100.0);
         let empty = stats(Vec::new());
         assert_eq!(empty.p95, 0.0);
+        assert_eq!(empty.p99, 0.0);
+    }
+
+    #[test]
+    fn scan_probe_needle_misses_but_the_probe_sees_the_arena() {
+        let corpus = generate(30_000, 11);
+        let mut ix = VolumeIndex::new(0, "C:\\".to_string());
+        for e in &corpus.entries {
+            ix.add(e.frn, e.parent_frn, &e.name, e.flags);
+        }
+        ix.finish();
+        // Zero hits is the whole point: the scan must run to the end of the
+        // arena, and a probe that matched would measure something else.
+        assert_eq!(ix.arena_scan_probe(SCAN_PROBE_NEEDLE), 0);
+        // …and the probe is reading the real arena, not returning 0 blindly.
+        let name = ix.name_of(corpus.entries[0].frn).unwrap().to_string();
+        assert!(ix.arena_scan_probe(&name) >= 1);
     }
 
     #[test]
@@ -1576,6 +1828,11 @@ mod tests {
         assert!(c.strict);
         assert!(!c.json);
         assert_eq!(c.max_results, DEFAULT_MAX_RESULTS);
+        // The §10 M0 target size, in both spellings a CI script might use.
+        for spelling in ["1000000", "1_000_000"] {
+            let c = parse_args(&v(&["--entries", spelling])).unwrap().unwrap();
+            assert_eq!(c.entries, 1_000_000);
+        }
         assert!(parse_args(&v(&["--help"])).unwrap().is_none());
         assert!(parse_args(&v(&["--entries"])).is_err());
         assert!(parse_args(&v(&["--nope"])).is_err());
@@ -1608,8 +1865,17 @@ mod tests {
         assert!(r.ram_warm >= r.ram_cold);
         assert_eq!(r.classes.len(), 9);
         assert!(r.classes.iter().all(|c| !c.queries.is_empty()));
+        // The breakdown must account for every reported byte, or §4.3's
+        // attribution is fiction.
+        assert_eq!(r.ram_cold_parts.total(), r.ram_cold);
+        assert_eq!(r.ram_warm_parts.total(), r.ram_warm);
+        assert_eq!(r.scan_probe_hits, 0);
+        assert!(r.name_arena_bytes > 0 && r.folded_arena_bytes > 0);
         let json = r.to_json();
         assert!(json.starts_with('{') && json.ends_with('}'));
         assert!(json.contains("\"overall_pass\""));
+        assert!(json.contains("\"ram_breakdown\""));
+        assert!(json.contains("\"pass_a_scan_us\""));
+        assert!(json.contains("\"p99_us\""));
     }
 }

@@ -21,12 +21,22 @@ pub mod flags {
     pub const DIR: u16 = 1 << 0;
     pub const HIDDEN: u16 = 1 << 1;
     pub const SYSTEM: u16 = 1 << 2;
+    /// Tombstone: the slot's file is gone but the slot itself is retained so
+    /// entry indices stay stable for structures keyed by them. Set only by
+    /// [`index::VolumeIndex`]; it is not a filesystem attribute, so
+    /// `mft::attrs_to_flags` can never produce it.
+    pub const DEAD: u16 = 1 << 3;
 }
 
 /// Where enumeration/tailing sources push entries. `VolumeIndex` implements
 /// this; tests may implement it to count entries.
 pub trait EntrySink {
     fn add(&mut self, frn: u64, parent_frn: u64, name: &str, flags: u16);
+
+    /// Called once by a bulk load (§3.2 enumeration, dev walk) after its last
+    /// `add`. Default no-op: only sinks that own storage have anything to
+    /// settle, and a sink that just counts must not have to say so.
+    fn finish(&mut self) {}
 }
 
 /// A change event decoded from the USN journal (§3.3), applied to the index.

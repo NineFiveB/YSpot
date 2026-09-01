@@ -177,6 +177,10 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
         med.StartFileReferenceNumber = next_start;
     }
 
+    // The sink has seen every record: let it settle its storage (§3.4 memory
+    // budget) before the volume is served from.
+    sink.finish();
+
     let secs = started.elapsed().as_secs_f64();
     log::info!(
         "enumerated {volume_root}: {added} entries kept of {seen} records in {secs:.2} s — \
@@ -596,6 +600,10 @@ mod tests {
             attrs_to_flags(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_HIDDEN | 0x80),
             crate::flags::DIR | crate::flags::HIDDEN
         );
+        // DEAD is the index's tombstone bit, not a filesystem attribute: no
+        // attribute word may ever produce it, or a create would index a file
+        // that search then refuses to see.
+        assert_eq!(attrs_to_flags(u32::MAX) & crate::flags::DEAD, 0);
     }
 
     #[test]

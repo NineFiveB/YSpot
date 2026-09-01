@@ -81,17 +81,22 @@ impl Accel {
         if !self.dirty {
             return;
         }
+        // Live entries only. A tombstoned slot keeps its name in both arenas,
+        // so a dead slot left in `folded_order` would map hits in those stale
+        // bytes back to a deleted file. Excluding it also makes those bytes
+        // unmappable: the nearest preceding live record ends before them, so
+        // `entry_at`'s bounds check rejects the hit.
         self.folded_order.clear();
-        self.folded_order.reserve(ix.entries.len());
-        for (i, e) in ix.entries.iter().enumerate() {
-            self.folded_order.push((e.folded_off, i as u32));
+        self.folded_order.reserve(ix.len());
+        for (slot, e) in ix.live_entries() {
+            self.folded_order.push((e.folded_off, slot));
         }
         self.folded_order.sort_unstable();
 
         self.initials_arena.clear();
         self.initials_spans.clear();
-        self.initials_spans.reserve(ix.entries.len());
-        for (i, e) in ix.entries.iter().enumerate() {
+        self.initials_spans.reserve(ix.len());
+        for (slot, e) in ix.live_entries() {
             let name = ix.name_of_entry(e);
             let off = self.initials_arena.len() as u32;
             for (seg_start, _) in segment_spans(name) {
@@ -105,7 +110,7 @@ impl Accel {
             self.initials_spans.push(InitialsSpan {
                 off,
                 len,
-                entry: i as u32,
+                entry: slot,
             });
         }
 
@@ -118,29 +123,65 @@ impl Accel {
             return;
         }
         let mut map: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
-        for (i, e) in ix.entries.iter().enumerate() {
+        // Live entries only (see `ensure_basic`), and ascending slot order —
+        // the postings are intersected by binary search.
+        for (slot, e) in ix.live_entries() {
             let bytes = ix.folded_of_entry(e).as_bytes();
             for w in bytes.windows(3) {
                 let list = map.entry([w[0], w[1], w[2]]).or_default();
-                if list.last().copied() != Some(i as u32) {
-                    list.push(i as u32);
+                if list.last().copied() != Some(slot) {
+                    list.push(slot);
                 }
             }
         }
         self.trigrams = Some(map);
     }
 
-    pub(crate) fn ram_bytes(&self) -> u64 {
-        let mut b = self.folded_order.capacity() * std::mem::size_of::<(u32, u32)>()
-            + self.initials_arena.capacity()
-            + self.initials_spans.capacity() * std::mem::size_of::<InitialsSpan>();
-        if let Some(tg) = &self.trigrams {
+    /// Resident bytes per structure. Kept split rather than summed because
+    /// the trigram postings are the largest single line in the whole index
+    /// and a single total hides that (§4.3 attribution).
+    pub(crate) fn ram_parts(&self) -> AccelRam {
+        let trigrams = match &self.trigrams {
             // key + bucket + Vec header per posting list, plus list payloads.
-            b += tg.len() * (3 + 8 + std::mem::size_of::<Vec<u32>>());
-            b += tg.values().map(|v| v.capacity() * 4).sum::<usize>();
+            Some(tg) => {
+                (tg.len() * (3 + 8 + std::mem::size_of::<Vec<u32>>())
+                    + tg.values().map(|v| v.capacity() * 4).sum::<usize>()) as u64
+            }
+            None => 0,
+        };
+        AccelRam {
+            folded_order: (self.folded_order.capacity() * std::mem::size_of::<(u32, u32)>()) as u64,
+            initials: (self.initials_arena.capacity()
+                + self.initials_spans.capacity() * std::mem::size_of::<InitialsSpan>())
+                as u64,
+            trigrams,
         }
-        b as u64
     }
+}
+
+/// Per-structure resident bytes of [`Accel`]; folded into the index's
+/// [`crate::index::RamBreakdown`].
+pub(crate) struct AccelRam {
+    pub folded_order: u64,
+    pub initials: u64,
+    pub trigrams: u64,
+}
+
+/// Count folded-arena hits for `needle` — Pass 1's `memmem` scan with nothing
+/// attached to it: no hit→entry mapping, no tier classification, no ranking.
+///
+/// Instrumentation only (bench §10 M0). It isolates the irreducible scan term
+/// every query pays, which is what SPEC §3.4's "a 1M-name arena scans in
+/// single-digit ms" premise rests on; a probe needle that matches nothing
+/// forces the scan to run to the end of the arena. The fold is done here so
+/// the caller passes the same string it would pass to [`search`]; at probe
+/// needle lengths it is far below the scan cost.
+pub(crate) fn arena_scan_probe(ix: &VolumeIndex, needle: &str) -> usize {
+    let fq = fold(needle);
+    if fq.is_empty() {
+        return 0;
+    }
+    memmem::find_iter(ix.folded_arena.as_bytes(), fq.as_bytes()).count()
 }
 
 /// Byte spans of name segments in the ORIGINAL (NFC, original-case) name:
@@ -283,6 +324,7 @@ fn entry_at(order: &[(u32, u32)], ix: &VolumeIndex, hit: usize, qlen: usize) -> 
     }
     let (off, eidx) = order[pos - 1];
     let e = &ix.entries[eidx as usize];
+    debug_assert!(!e.is_dead(), "folded_order must hold live slots only");
     if hit + qlen <= off as usize + e.folded_len as usize {
         Some(eidx)
     } else {
@@ -478,7 +520,9 @@ pub(crate) fn search(
     is_cancelled: &dyn Fn() -> bool,
 ) -> Vec<Hit> {
     let fq = fold(query);
-    if fq.is_empty() || max_results == 0 || ix.entries.is_empty() {
+    // `ix.is_empty()`, not `entries.is_empty()`: an index whose every entry has
+    // been deleted still has a full entry table of tombstones.
+    if fq.is_empty() || max_results == 0 || ix.is_empty() {
         return Vec::new();
     }
 
