@@ -44,8 +44,9 @@
 //! [`VolumeIndex::charclass_bsi`] and the [`VolumeIndex::tri_present`] family
 //! are the last: an 8 B/entry bit-sliced character-class index that generates
 //! the fuzzy tier's candidates, and fixed-size exact membership sets over the
-//! arena's byte uni/bi/trigrams that let a query that cannot possibly hit skip
-//! the arena scan outright. Between them they retire the byte-trigram posting
+//! arena's byte uni/bi/trigrams — with a second, smaller pair over the
+//! initials column — that let a query which cannot possibly hit skip a scan
+//! outright. Between them they retire the byte-trigram posting
 //! lists — 96 B/entry measured at 1M, larger than the entry table itself, the
 //! last structure any mutation invalidated, and the single line that held the
 //! index over its §3.4 memory cap.
@@ -231,6 +232,12 @@ const TRI_WORDS: usize = 1 << 18;
 /// `bi_present` (8 KiB) carries the gate alone below that.
 const TRI_PRESENT_MIN_ARENA: usize = TRI_WORDS * 8;
 /// `u64`s in [`VolumeIndex::bi_present`]: 2^16 bits, one per byte bigram.
+///
+/// Sizes [`VolumeIndex::initials_bi_present`] too — same bigram space, different
+/// text. 8 KiB each, and unlike the trigram set small enough to hold
+/// unconditionally at every corpus size (issue #6: a flat set has to be
+/// negligible against the §3.4 per-entry cap on a 20k-entry volume, and 8 KiB
+/// is 0.41 B/entry there).
 const BI_WORDS: usize = 1 << 10;
 
 #[inline]
@@ -339,8 +346,12 @@ pub struct RamBreakdown {
     /// Bit-sliced character-class index, 8 B per slot. Replaced the
     /// byte-trigram postings, which measured 96 B/entry at 1M.
     pub charclass_bsi: u64,
-    /// Uni/bi/trigram presence sets. FIXED size — 2 MiB + 8 KiB + 32 B — so
-    /// this line does not scale with the index and is charged whole.
+    /// Uni/bi/trigram presence sets over the folded arena, plus the uni/bigram
+    /// pair over the initials column. Charged whole, and never per entry: at
+    /// most 2 MiB + 2 × 8 KiB + 2 × 32 B, falling to 16,448 B on an index
+    /// whose arena is too small to have earned the trigram set (see
+    /// [`TRI_PRESENT_MIN_ARENA`]). The two 8 KiB pairs are unconditional; only
+    /// the 2 MiB set comes and goes.
     pub presence: u64,
 }
 
@@ -459,13 +470,74 @@ pub struct VolumeIndex {
     /// Gates Pass A and NOTHING else. Never the fuzzy pass: fuzzy does not
     /// require contiguity, so a query with no trigram in the arena can still
     /// have genuine subsequence matches. Never the initials pass either — the
-    /// column holds segment initials, which are not contiguous in any record.
+    /// column holds segment initials, which are not contiguous in any record,
+    /// so THIS set says nothing about it. Pass B has a gate of its own over
+    /// that column; see [`Self::initials_bi_present`].
     pub(crate) tri_present: Box<[u64]>,
     /// 2^16 bits over byte bigrams; see [`Self::tri_present`]. 8 KiB.
     pub(crate) bi_present: Box<[u64]>,
     /// 256 bits over single bytes; see [`Self::tri_present`]. Answers the
     /// cheapest form of the same question, out of L1.
     pub(crate) uni_present: [u64; 4],
+    /// 2^16 bits over the byte bigrams of [`Self::initials`]'s lanes, taken
+    /// PER LANE so no bigram spans a lane boundary. 8 KiB. Gates Pass B the
+    /// way [`Self::arena_may_contain`] gates Pass A.
+    ///
+    /// Sound for the same reason, over different text: Pass B accepts a hit
+    /// only when `hit % INITIALS_STRIDE + qlen <= INITIALS_STRIDE`, i.e. the
+    /// match lies wholly inside ONE lane, so every bigram of a real Pass B
+    /// match is a bigram of some single lane. A miss therefore proves the scan
+    /// would find nothing.
+    ///
+    /// A separate set is REQUIRED, not a convenience: the arena's `bi_present`
+    /// describes whole folded names and says nothing about which letters are
+    /// adjacent as segment INITIALS, so gating Pass B on it would drop genuine
+    /// camel-case results (`accel-redesign.md` §6 prescribed exactly that, and
+    /// the implementation correctly refused it — leaving Pass B with no gate
+    /// at all, which is issue #8).
+    ///
+    /// Taken over the WHOLE padded lane, not its live prefix. That is the
+    /// stronger rule, and it is free. Stronger, because the containment test
+    /// above makes a hit a substring of `lane[0..INITIALS_STRIDE]` by
+    /// definition — no reasoning about where the padding starts, and no
+    /// dependence on [`crate::matching::initials_lane`]'s packing discipline
+    /// or on invariant I3 holding for the ORIGINAL-case name, which `intern`
+    /// checks only on the folded form and only after truncating it. Free,
+    /// because the extra bits all involve [`FOLDED_DELIM`], and `search`
+    /// rejects any query carrying a byte below `0x20` before a pass runs — so
+    /// no probe can ever read one. The gate therefore answers identically to
+    /// the live-prefix rule wherever that rule is itself correct, and
+    /// correctly where it is not.
+    ///
+    /// Set-only, like the arena sets, but for a stronger reason than "clearing
+    /// would unset bigrams other live lanes carry". This set is only ever a
+    /// NEGATIVE test, so correctness needs it to be a SUPERSET of the live
+    /// column's n-grams — and [`Self::unregister_slot`] only ever removes
+    /// content from the column, so deletion preserves that trivially. An
+    /// over-populated set admits Pass B, which scans a column whose tombstoned
+    /// lanes are all-`FOLDED_DELIM` and therefore unmatchable: identical
+    /// results, one wasted scan. (This is why it is unlike
+    /// [`Self::charclass_bsi`], which MUST be cleared — that one is
+    /// slot-keyed, so a recycled slot ORs its new mask onto the old and the
+    /// staleness accumulates per slot. These sets are global and unkeyed, so
+    /// there is nothing to accumulate against.) [`Self::compact`] refills
+    /// them and they become exact again.
+    ///
+    /// Exempt from the capacity discipline every other column follows: fixed
+    /// size, allocated once in [`VolumeIndex::new`], never grown. For the same
+    /// reason there is deliberately no `finalize` site and no `resize_*`
+    /// sibling — unlike [`Self::tri_present`], whose 2 MiB has to be earned.
+    /// The allocation is UNCONDITIONAL: `tri_present` tolerates an empty box
+    /// only because every read and write site guards on `is_empty()`, and
+    /// these have no such guard, so an empty box would panic in `bit_set` on
+    /// the first insert — and a read-side "fix" returning `false` would turn
+    /// the gate into a universal reject that silently drops every Pass B
+    /// result.
+    pub(crate) initials_bi_present: Box<[u64]>,
+    /// 256 bits over the single bytes of [`Self::initials`]'s lanes; see
+    /// [`Self::initials_bi_present`]. Carries the gate alone for a one-byte
+    /// query, which has no bigram window for the set above to test.
+    pub(crate) initials_uni_present: [u64; 4],
     /// When a directory reparent armed the writer-side depth repair, or `None`
     /// if no repair is outstanding. See [`Self::repair_depths_slice`].
     depth_repair_armed: Option<Instant>,
@@ -506,6 +578,8 @@ impl VolumeIndex {
             tri_present: vec![0u64; TRI_WORDS].into_boxed_slice(),
             bi_present: vec![0u64; BI_WORDS].into_boxed_slice(),
             uni_present: [0u64; 4],
+            initials_bi_present: vec![0u64; BI_WORDS].into_boxed_slice(),
+            initials_uni_present: [0u64; 4],
             depth_repair_armed: None,
             depth_repair_cursor: 0,
             depth_repair_state: Vec::new(),
@@ -580,10 +654,11 @@ impl VolumeIndex {
     /// [`Self::tri_present`] proves the scan would find nothing. Tested
     /// cheapest-first: 32 B out of L1, then 8 KiB, then the 2 MiB table.
     ///
-    /// Answers a question about CONTIGUITY, which is why it gates Pass A and
-    /// only Pass A. The fuzzy tier matches subsequences and the initials tier
-    /// matches a column that is not in this arena at all; gating either on this
-    /// would drop genuine results.
+    /// Answers a question about CONTIGUITY *in this arena*, which is why it
+    /// gates Pass A and only Pass A. The fuzzy tier matches subsequences, so
+    /// gating it here would drop genuine results; the initials tier does ask a
+    /// contiguity question, but about a column that is not in this arena at
+    /// all, so it needs its own sets — [`Self::initials_may_contain`].
     pub(crate) fn arena_may_contain(&self, q: &[u8]) -> bool {
         if q.iter().any(|&b| !bit_test(&self.uni_present, b as usize)) {
             return false;
@@ -604,6 +679,50 @@ impl VolumeIndex {
                 (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
             )
         })
+    }
+
+    /// Whether the initials column can possibly contain `q` — the Pass B skip.
+    ///
+    /// The exact counterpart of [`Self::arena_may_contain`] over a different
+    /// column, and sound for the same reason: Pass B accepts a hit only when
+    /// it lies wholly inside one lane, so every byte and every 2-byte window
+    /// of a real Pass B match is a byte and a bigram of some single lane. One
+    /// miss proves the scan would find nothing.
+    ///
+    /// It must be a set over the INITIALS COLUMN. The arena's `bi_present`
+    /// answers which bytes are adjacent inside whole folded names, which says
+    /// nothing about which letters are adjacent as segment initials — gating
+    /// Pass B on it would drop genuine camel-case results. There is no trigram
+    /// tier here: 2 MiB to gate an 8 B/entry column would invert the rule
+    /// [`TRI_PRESENT_MIN_ARENA`] exists to enforce, and it buys little, since
+    /// the queries that reach this pass are 1..=[`INITIALS_STRIDE`] bytes.
+    pub(crate) fn initials_may_contain(&self, q: &[u8]) -> bool {
+        if q.iter()
+            .any(|&b| !bit_test(&self.initials_uni_present, b as usize))
+        {
+            return false;
+        }
+        !q.windows(2).any(|w| {
+            !bit_test(
+                &self.initials_bi_present,
+                (w[0] as usize) << 8 | w[1] as usize,
+            )
+        })
+    }
+
+    /// Record `lane`'s bytes and bigrams in the Pass B presence sets. The one
+    /// write path, called from [`Self::register_slot`] before the lane lands
+    /// in the column.
+    fn note_initials_lane(&mut self, lane: &[u8; INITIALS_STRIDE]) {
+        for &b in lane {
+            bit_set(&mut self.initials_uni_present, b as usize);
+        }
+        for w in lane.windows(2) {
+            bit_set(
+                &mut self.initials_bi_present,
+                (w[0] as usize) << 8 | w[1] as usize,
+            );
+        }
     }
 
     /// Release bulk-load growth slack (§3.4 memory budget) and switch to
@@ -1037,6 +1156,24 @@ impl VolumeIndex {
         self.tri_present.iter_mut().for_each(|w| *w = 0);
         self.bi_present.iter_mut().for_each(|w| *w = 0);
         self.uni_present = [0; 4];
+        self.initials_bi_present.iter_mut().for_each(|w| *w = 0);
+        self.initials_uni_present = [0; 4];
+        // Refilled from the COLUMN, never from a re-derived `initials_lane`.
+        // Reading the bytes Pass B actually scans makes the set a superset of
+        // them by construction; re-deriving would instead make it a superset
+        // of a different function of index state, and would couple the gate to
+        // the arena pass above having rewritten every live `name_off` — a live
+        // entry it missed would re-derive a garbage lane, which is a false
+        // negative rather than a wasted scan. The column is already renumbered
+        // and truncated by this point, and `0..new_len` is exactly the live
+        // set, so this reads each surviving lane once in its final position.
+        for slot in 0..new_len {
+            let off = slot * INITIALS_STRIDE;
+            let lane: [u8; INITIALS_STRIDE] = self.initials[off..off + INITIALS_STRIDE]
+                .try_into()
+                .expect("lane is exactly one stride");
+            self.note_initials_lane(&lane);
+        }
         for slot in 0..new_len {
             let e = self.entries[slot];
             let (off, len) = (e.folded_off as usize, e.folded_len as usize);
@@ -1249,6 +1386,14 @@ impl VolumeIndex {
         let lane = initials_lane(
             &self.name_arena[name_off as usize..name_off as usize + name_len as usize],
         );
+        // Bits BEFORE bytes, and outside both column-write branches below. The
+        // two failure modes are not symmetric: a bit set for a lane that never
+        // lands is stale and harmless, while a lane that lands with its bits
+        // unset is a false negative in the Pass B gate — a missing result. The
+        // append branch allocates, so recording first is what makes the
+        // superset invariant hold at every intermediate point rather than only
+        // at function exit.
+        self.note_initials_lane(&lane);
         let e = Entry {
             frn,
             parent_frn,
@@ -1434,6 +1579,11 @@ impl VolumeIndex {
         // across records, so clearing one record's n-grams would unset n-grams
         // other live names still carry. Set-only makes them a superset of the
         // live arena, which is sound — a stale bit costs one wasted scan.
+        //
+        // The same goes for the Pass B sets over the lane just zeroed above,
+        // and note the ORDER trap two blocks up does NOT apply to them: they
+        // are global and unkeyed, so unlike `charclass_bsi` there is no
+        // per-slot union to go stale and nothing to read before the erase.
         self.erase_folded(folded_off, folded_len);
         self.dead_bytes += bytes;
         self.live_count -= 1;
@@ -1655,8 +1805,12 @@ impl VolumeIndex {
         // direction for a hard cap. `frn_map_buckets` is therefore tracked
         // monotonically and only reset where the map actually shrinks.
         let frn_map = (self.frn_map_buckets * (std::mem::size_of::<(u64, u32)>() + 1)) as u64;
-        let presence =
-            ((self.tri_present.len() + self.bi_present.len() + self.uni_present.len()) * 8) as u64;
+        let presence = ((self.tri_present.len()
+            + self.bi_present.len()
+            + self.uni_present.len()
+            + self.initials_bi_present.len()
+            + self.initials_uni_present.len())
+            * 8) as u64;
         RamBreakdown {
             entries: (self.entries.capacity() * std::mem::size_of::<Entry>()) as u64,
             name_arena: self.name_arena.capacity() as u64,
@@ -2374,7 +2528,7 @@ mod tests {
         assert_eq!(
             v.ram_breakdown(),
             RamBreakdown {
-                presence: ((TRI_WORDS + BI_WORDS + 4) * 8) as u64,
+                presence: ((TRI_WORDS + 2 * BI_WORDS + 8) * 8) as u64,
                 ..RamBreakdown::default()
             }
         );
@@ -2409,8 +2563,12 @@ mod tests {
         );
         assert_eq!(v.charclass_bsi.len(), BSI_CLASSES * v.bsi_words);
         assert!(v.bsi_words * 64 >= 1000, "bsi must address every slot");
-        // Fixed-size sets: 2 MiB + 8 KiB + 32 B whatever the index holds.
-        assert_eq!(b.presence, ((TRI_WORDS + BI_WORDS + 4) * 8) as u64);
+        // The presence sets, charged whole. 2 MiB + 2 x 8 KiB + 2 x 32 B here
+        // because this index has never been finalized: the trigram set is
+        // allocated eagerly and only sized against the arena by `finalize`, so
+        // a corpus this small still carries it. The two pairs are always held;
+        // only the trigram set is conditional.
+        assert_eq!(b.presence, ((TRI_WORDS + 2 * BI_WORDS + 8) * 8) as u64);
         // Nothing is lazy any more, so a query that reaches every tier moves
         // no line of the breakdown at all.
         let before = v.ram_breakdown();
@@ -2578,7 +2736,12 @@ mod tests {
     /// the FULL result vector, scores included, before and after.
     #[test]
     fn compaction_preserves_results_and_reclaims_bytes() {
-        const QUERIES: [&str; 6] = ["report", "draft", "rd", "eport", "final", "zzqx"];
+        // `dt` is the Pass B row: `draft`+`txt` are adjacent segments, and the
+        // pair never occurs contiguously in a folded name, so it can only be
+        // answered by the initials column — which makes it the query that
+        // proves compaction rebuilt that column's presence sets rather than
+        // leaving the gate rejecting everything.
+        const QUERIES: [&str; 7] = ["report", "draft", "rd", "dt", "eport", "final", "zzqx"];
 
         let mut v = ix();
         for i in 0..3_000u64 {
@@ -2599,9 +2762,37 @@ mod tests {
                 new_name: format!("report-{i}-final.txt"),
             });
         }
+        // Give the HIGHEST live slot a lane no other entry shares. Every other
+        // name here yields `r`,digit,`d`/`f`,`t`, so the last live lane is a
+        // duplicate of hundreds of others and its bigrams stay set however the
+        // refill loop is bounded — an off-by-one on that bound would be
+        // invisible. A rename is the only way to place a name in the final
+        // slot: `add` recycles a freed one.
+        v.apply(crate::UsnEvent::Rename {
+            frn: 3_000,
+            new_parent_frn: ABSENT_PARENT,
+            new_name: "Zulu Yankee Xray.log".to_string(),
+        });
         assert!(v.should_compact(), "churn did not trip the trigger");
 
         let before: Vec<Vec<Hit>> = QUERIES.iter().map(|q| v.search(q, 32, &|| false)).collect();
+        assert_eq!(
+            before[3].len(),
+            32,
+            "`dt` must answer from the initials column, or the Pass B row \
+             proves nothing"
+        );
+        // Entry 0's lane was `r0dt` and no surviving name has a segment
+        // starting `0` followed by one starting `d`, so `0d` is a bigram only
+        // the DELETED entry ever carried. The sets are set-only during normal
+        // operation, so it is still present here — and compaction, which
+        // refills them from the live column, must drop it. That is the direct
+        // check that the refill ran and is exact rather than merely a
+        // superset.
+        assert!(
+            v.initials_may_contain(b"0d"),
+            "stale bigram should survive until compaction"
+        );
         let live_before = v.len();
         let ram_before = v.ram_bytes();
         let paths_before: Vec<Option<String>> =
@@ -2611,6 +2802,19 @@ mod tests {
 
         assert_eq!(v.len(), live_before, "compaction changed the live count");
         assert!(!v.should_compact(), "still wants compacting afterwards");
+        // Both directions, and both are needed. The negative alone proves only
+        // that the sets were ZEROED — deleting the refill loop entirely leaves
+        // them all-zero and still satisfies it. The positive is what proves
+        // the refill ran and reached the last live slot.
+        assert!(
+            !v.initials_may_contain(b"0d"),
+            "compaction did not refill the initials presence sets from the \
+             live column"
+        );
+        assert!(
+            v.initials_may_contain(b"zy"),
+            "the last live lane's bigrams were dropped by the refill"
+        );
         assert!(
             v.ram_bytes() < ram_before,
             "no bytes reclaimed: {} -> {}",

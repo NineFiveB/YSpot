@@ -98,8 +98,15 @@ Presence sets (fixed size, independent of n):
 tri_present: [u64; 1<<18],   // 2^24 bits, EXACT membership over 24-bit byte trigrams   2.10 MB
 bi_present:  [u64; 1<<10],   // 2^16 bits                                                8 KB
 uni_present: [u64; 4],       // 256 bits                                                32 B
+
+// The same question asked of the INITIALS COLUMN rather than the arena, which
+// is what gates Pass B (§6). Separate sets are required, not a convenience:
+// the arena's bigrams say nothing about which letters are adjacent as segment
+// initials. N-grams are taken per lane, over the whole padded 8 bytes.
+initials_bi_present:  [u64; 1<<10],   // 2^16 bits over lane bigrams                     8 KB
+initials_uni_present: [u64; 4],       // 256 bits over lane bytes                       32 B
 ```
-Set-only (deletes do not clear); a stale bit costs one wasted scan, never a wrong result; rebuilt at compaction. Trigrams are inserted per-record (never across a delimiter). Note this is an *exact* 24-bit membership set, not a Bloom filter — the only false positives come from dead entries.
+Set-only (deletes do not clear); a stale bit costs one wasted scan, never a wrong result; rebuilt at compaction. Trigrams are inserted per-record (never across a delimiter). Note this is an *exact* 24-bit membership set, not a Bloom filter — the only false positives come from dead entries. `tri_present` is the one set that is conditionally allocated (only once the arena it accelerates exceeds its own 2 MiB); the two 8 KiB pairs break even around 1k entries, two orders of magnitude earlier, and are always held.
 
 `initials_arena`, `initials_spans`, `InitialsSpan`, `initials_entry_at`, `trigrams`, `ensure_trigrams`, `ensure_basic`, `Accel`, `dirty`, `accel_lock`, `mark_dirty`, `Mutex<Accel>`, `best: HashMap<u32,Cand>`, `Cand`, `upgrade` are all deleted.
 
@@ -107,9 +114,9 @@ Set-only (deletes do not clear); a stale bit costs one wasted scan, never a wron
 
 All mutation goes through `fn register_slot(&mut self, slot, frn, parent_frn, name, flags)` and `fn unregister_slot(&mut self, slot)`. Nothing else writes a column. `debug_assert` on column lengths at both.
 
-**Create** (and `add_entry`'s existing-FRN update path, index.rs:166-173, which behaves as a rename — Judge 1 correctly flagged Design 1 for leaving this unspecified): intern (NUL + NFC + folded, O(|name|)); `slot = free_slots.pop().unwrap_or(entries.len())`; `arena_recs.push`; extend `owner`; `rank_key[slot] = (parent_depth+1).min(127) | hidden<<7`; write the 8-byte `initials` lane (allocation-free segment walk); set BSI bits for the <=12 distinct classes; set trigram/bigram/unigram presence bits; `frn_map.insert`; `live_count += 1`. ~1-3 us. **Nothing is rebuilt, nothing is sorted, nothing is invalidated — this is the entire fix for the 167 ms cliff.**
+**Create** (and `add_entry`'s existing-FRN update path, index.rs:166-173, which behaves as a rename — Judge 1 correctly flagged Design 1 for leaving this unspecified): intern (NUL + NFC + folded, O(|name|)); `slot = free_slots.pop().unwrap_or(entries.len())`; `arena_recs.push`; extend `owner`; `rank_key[slot] = (parent_depth+1).min(127) | hidden<<7`; set the initials-lane presence bits, then write the 8-byte `initials` lane (allocation-free segment walk) — bits before bytes, so the superset invariant holds at every intermediate point rather than only at function exit; set BSI bits for the <=12 distinct classes; set trigram/bigram/unigram presence bits; `frn_map.insert`; `live_count += 1`. ~1-3 us. **Nothing is rebuilt, nothing is sorted, nothing is invalidated — this is the entire fix for the 167 ms cliff.**
 
-**Delete**: `frn_map.remove`; read the still-live folded name and clear BSI bits for its distinct classes (exact, ~12 scattered writes — NOT optional, since slots are recycled and a stale union degrades selectivity monotonically); NUL-fill the folded record; zero the initials lane; `flags |= DEAD`; `dead_bytes += name_len + folded_len`; `free_slots.push(slot)`; `live_count -= 1`. O(|name|).
+**Delete**: `frn_map.remove`; read the still-live folded name and clear BSI bits for its distinct classes (exact, ~12 scattered writes — NOT optional, since slots are recycled and a stale union degrades selectivity monotonically); NUL-fill the folded record; zero the initials lane (the initials presence bits are NOT cleared, for the same reason the arena's are not: they are global and unkeyed, and the sets are only ever a negative test, so correctness needs a superset of the live column — which deletion preserves trivially, since it only removes content); `flags |= DEAD`; `dead_bytes += name_len + folded_len`; `free_slots.push(slot)`; `live_count -= 1`. O(|name|).
 
 **Rename / same-FRN Create**: delete-side bookkeeping for the old name, then create-side for the new, keeping the same slot. Old `arena_recs` entry self-invalidates (`rec.off != entries[slot].folded_off`) and its bytes are NUL-filled.
 
@@ -149,7 +156,13 @@ flush(pend);
 
 Poll `is_cancelled` every `CANCEL_STRIDE` hits AND every 1 MiB of arena advanced, so a zero-hit 24 MB scan is interruptible.
 
-**Pass B — initials.** Skipped if `fq.len() > 8` (cannot fit a lane — this is what keeps the `exact` class from regressing on the wider fixed-stride array), if `bi_present` misses, or if `floor > 0.7`. `memmem` over the stride-8 array; `slot = hit >> 3`; `(hit & 7) + qlen <= 8`; same flush path.
+**Pass B — initials.** Skipped if `fq.len() > 8` (cannot fit a lane — this is what keeps the `exact` class from regressing on the wider fixed-stride array), if `floor > 0.7`, or if `initials_bi_present`/`initials_uni_present` miss. `memmem` over the stride-8 array; `slot = hit >> 3`; `(hit & 7) + qlen <= 8`; same flush path.
+
+CORRECTED (issue #8). This section originally prescribed gating Pass B on `bi_present`, the ARENA's bigram set. That gate is unsound: the arena's bigrams describe which bytes are adjacent inside whole folded names, which says nothing about which letters are adjacent as segment INITIALS — `Foo Bar.txt` carries the lane bigram `fb` while its folded name does not contain `fb` anywhere. The implementation correctly refused the gate and, having no replacement, left Pass B scanning the entire 8 MB column for every query of 8 bytes or fewer. The fix is a set over the initials column's own lane bytes, sound for the same reason `bi_present` is sound for Pass A: the containment test `(hit & 7) + qlen <= 8` forces a match to lie wholly inside one lane, so every byte and bigram of a real Pass B match is a byte and bigram of some single lane. N-grams are taken over the whole padded lane rather than its live prefix — the extra bits all involve the NUL pad, and no query can carry a byte below `0x20`, so the gate's answers are unchanged while the rule stops depending on the lane's packing discipline. Both sets are set-only and refilled at compaction, exactly like the arena's. Ordered AFTER the `floor > 0.7` test, which is cheaper and in practice more selective.
+
+Measured at 1M, 200 iterations/class: `no-match` p50 274 -> 95 us. At 300k: 65 -> 11 us p50, p95 ~20-36 us — still several times the ~5 us p95 this design predicted for that path at 300k (see the prediction table below), so the prediction stands unmet, not met. No other class moves outside run-to-run noise. That is the expected shape: a presence gate can only skip a pass whose OWN column cannot carry the query, and for `initials-2`/`initials-3` the queries are harvested from real lanes, so they match, the gate passes, and the column is scanned as it must be. Note the gate is per-column, not per-query: a query the initials sets reject can still be answered by another tier, which `an_initials_miss_does_not_suppress_a_substring_hit` pins.
+
+Issue #8's second claim — that this also removes "a floor under every short query: 590 us of the `initials-2` class at 1M" — is NOT addressed here and cannot be, for the reason above. That floor was `Selector::offer` evaluating the caller's name filter on every candidate before scoring it; fixed separately in the preceding commit, which is where `initials-2` improves.
 
 **Pass C — fuzzy.** Gated on `fq.len() >= 3` (unchanged, SPEC 3.4) and `floor > 0.5`. Note `tri_present` gates ONLY Pass A — fuzzy does not require contiguity, so gating Pass C on it would be wrong. Stage 1: AND the 4-8 BSI slices the query's distinct classes need (0.5-1 MB read, not an 8 MB sweep), extract survivors with `trailing_zeros`, skip `seen`, and drop any whose `rank_key` depth exceeds `d_max = ((0.5/floor - 1)/0.02)` when the heap is full. Stage 2: drain depth buckets **shallowest first**, verifying with an allocation-free `fuzzy_density`, capped at `FUZZY_CAP` verified candidates. Because fuzzy base <= 0.5 regardless of density, shallow candidates dominate, so the cap drops exactly the candidates least able to reach the page — a defensible rule, unlike today's "first 20,000 in arena order".
 
@@ -195,16 +208,16 @@ Derivation of L (the judges split 17 vs 26; neither is derived): the measured co
 | 8 | `rank_key: Vec<u8>` | 1.00 | 1.00 |
 | 9 | `charclass_bsi` 64 x ceil(n/64) x 8 B | 8.00 | 8.00 |
 | 10 | `tri_present` 2^24 bits | 2.10 | 2.10 |
-| 11 | `bi_present` + `uni_present` | 0.01 | 0.01 |
+| 11 | `bi_present` + `uni_present`, and the same pair over the initials column | 0.02 | 0.02 |
 | 12 | `free_slots` (empty post-compaction) | 0.00 | 0.00 |
 | 13 | fixed-chunk allocation slack (2 MiB entries + 2 x 1 MiB arenas) | 4.19 | 4.19 |
-| | **TOTAL — Phase A (std HashMap kept)** | **147.45** | **147.45** |
+| | **TOTAL — Phase A (std HashMap kept)** | **147.46** | **147.46** |
 | | replace row 4 with open-addressed `frn_index` (2^21 slots x 4 B = 8.39) | -27.26 | -27.26 |
-| | **TOTAL — Phase B (Step 11 landed)** | **120.19** | **120.19** |
+| | **TOTAL — Phase B (Step 11 landed)** | **120.20** | **120.20** |
 
-Sum check A: 32.00+23.00=55.00; +24.00=79.00; +35.65=114.65; +8.00=122.65; +1.50=124.15; +8.00=132.15; +1.00=133.15; +8.00=141.15; +2.10=143.25; +0.01=143.26; +0.00=143.26; +4.19 = **147.45**. Phase B: 147.45 - 35.65 + 8.39 = **120.19**.
+Sum check A: 32.00+23.00=55.00; +24.00=79.00; +35.65=114.65; +8.00=122.65; +1.50=124.15; +8.00=132.15; +1.00=133.15; +8.00=141.15; +2.10=143.25; +0.02=143.27; +0.00=143.27; +4.19 = **147.46**. Phase B: 147.46 - 35.65 + 8.39 = **120.20**.
 
-- Phase A = **73.7% of the 200 MB hard cap** (52.6 MB headroom), 22.9% over the 120 MB typical target.
+- Phase A = **73.7% of the 200 MB hard cap** (52.5 MB headroom), 22.9% over the 120 MB typical target.
 - Phase B = **60.1% of the cap**, and lands **0.2% over the 120 MB typical target** — at the line.
 - **The budget closes under the hard cap without the risky hand-rolled table.** That is the deliberate risk posture both judges asked for: stage the ~120-line open-addressed table last and drop it if the schedule tightens.
 - Versus the measured 270.9 B/entry warm at 300k: **1.84x reduction (Phase A) / 2.25x (Phase B)**.
@@ -223,13 +236,13 @@ Sum check A: 32.00+23.00=55.00; +24.00=79.00; +35.65=114.65; +8.00=122.65; +1.50
 | rank_key | x1.125 | 1.13 |
 | charclass_bsi | x1.125 | 9.00 |
 | tri_present | — | 2.10 |
-| bi/uni_present | — | 0.01 |
+| bi/uni_present, arena and initials column | — | 0.02 |
 | free_slots (125k x 4 B) | — | 0.50 |
 | allocation slack | — | 4.19 |
-| **TOTAL at trigger — Phase A** | | **168.21** |
-| **TOTAL at trigger — Phase B** | | **140.95** |
+| **TOTAL at trigger — Phase A** | | **168.22** |
+| **TOTAL at trigger — Phase B** | | **140.96** |
 
-Sum check: 36.00+28.75=64.75; +30.00=94.75; +35.65=130.40; +10.00=140.40; +1.88=142.28; +9.00=151.28; +1.13=152.41; +9.00=161.41; +2.10=163.51; +0.01=163.52; +0.50=164.02; +4.19 = **168.21**. Phase B: 168.21 - 35.65 + 8.39 = **140.95**.
+Sum check: 36.00+28.75=64.75; +30.00=94.75; +35.65=130.40; +10.00=140.40; +1.88=142.28; +9.00=151.28; +1.13=152.41; +9.00=161.41; +2.10=163.51; +0.02=163.53; +0.50=164.03; +4.19 = **168.22**. Phase B: 168.22 - 35.65 + 8.39 = **140.96**.
 
 Phase A at trigger = 84.1% of cap. Phase B at trigger = 70.5% of cap. (Design 1 omitted this transient entirely — Judge 1's flaw #3.)
 
@@ -237,8 +250,8 @@ Phase A at trigger = 84.1% of cap. Phase B at trigger = 70.5% of cap. (Design 1 
 
 In-place leftward copy, so the arenas and `arena_recs` need no second copy, and the FRN table's values are rewritten through a remap rather than the table being rebuilt. Only transient = `remap: Vec<u32>` sized by pre-compaction slots = 1.125M x 4 B = **4.50 MB**.
 
-- **Phase A peak = 168.21 + 4.50 = 172.71 MB/1M (86.4% of cap).**
-- **Phase B peak = 140.95 + 4.50 = 145.45 MB/1M (72.7% of cap).**
+- **Phase A peak = 168.22 + 4.50 = 172.72 MB/1M (86.4% of cap).**
+- **Phase B peak = 140.96 + 4.50 = 145.46 MB/1M (72.7% of cap).**
 
 For contrast: Design 2's background build-and-swap would peak at ~218 MB/1M, and a naive "rebuild the frn_map" step inside compaction would push Phase A to 203.9 MB — over the cap. Both are forbidden in a comment on `compact()`.
 
@@ -256,7 +269,7 @@ Rows 2, 3, and 6 scale with L; nothing else does. d(total)/dL = 2 + 1/64*... ~= 
 
 **Phase A stays under the 200 MB cap up to L ~= 34 B; Phase B up to L ~= 63 B.** So even at Design 2's more pessimistic 26 B the plan holds with room, and Phase B is robust to any realistic filename distribution. If Step 0's real-volume measurement puts L above 30, land Step 11 before Step 9.
 
-### E. Where the ~123-151 B/entry goes (270.9 measured -> 120.19)
+### E. Where the ~123-151 B/entry goes (270.9 measured -> 120.20)
 
 | delta | source |
 |---:|---|
@@ -269,7 +282,7 @@ Rows 2, 3, and 6 scale with L; nothing else does. d(total)/dL = 2 + 1/64*... ~= 
 | +8.00 | `arena_recs` (replaces `folded_order`; +1.5 for `owner`, buying O(1) lookup and zero rebuild) |
 | +1.00 | `rank_key` |
 | +1.00 | folded-arena NUL delimiters |
-| +2.11 | presence sets (fixed size) |
+| +2.11 | presence sets, arena and initials column (fixed size) |
 
 ### F. Prerequisite: `ram_bytes()` is currently wrong
 
@@ -340,7 +353,7 @@ Cost model behind these (per candidate, replacing today's ~800 ns): reject-witho
 
 6. STEP 6 - Fixed-stride initials column. `initials: Vec<u8>` at stride 8; rewrite `segment_spans` (matching.rs:149) as an allocation-free `for_each_segment_start`, keeping the allocating wrapper for tests and `initials_ranges`. Mapping becomes `hit >> 3` with `(hit & 7) + qlen <= 8`; skip Pass B when `fq.len() > 8` (this is what keeps the `exact` class from regressing on the wider array). Zero the lane on delete. Delete `initials_arena`, `initials_spans`, `InitialsSpan`, `initials_entry_at`, and the remainder of `ensure_basic`. GATE: `initials_camel_case`, `segment_spans_camel_and_separators`, `tier_ordering`, `fold_with_map_matches_fold_on_nfc_input`. NEW TEST: a 9-segment name with a 9-char initials query, documenting the truncation (SPEC DECISION 2).
 
-7. STEP 7 - Replace trigram postings. Add `charclass_bsi` (64 slices, 4 KiB growth chunks, bits CLEARED on delete — not optional, since slots are recycled and a stale union degrades selectivity monotonically), `tri_present` (2^24 bits, exact, per-record so no trigram spans a delimiter), `bi_present`, `uni_present`. Wire the presence sets to skip Pass A ONLY — never Pass C, since fuzzy does not require contiguity. Add the depth-bucketed shallowest-first fuzzy drain with `d_max` derived from the floor. Rewrite `fuzzy_density` (matching.rs:310) allocation-free with a stack `[char; 64]` query buffer — it currently collects two `Vec<char>` per candidate, i.e. 40,000 allocations per query at FUZZY_CAP. Delete `ensure_trigrams` and the `trigrams` field. GATE: `fuzzy_subsequence_density_and_ranges`, `fuzzy_density_basics`, `fuzzy_skipped_below_three_bytes`; bench's `every_query_class_hits_the_corpus` must still find the planted family AND still return empty for `NO_MATCH_QUERIES`. NEW TESTS: (a) the gapped subsequence "a_b_c_d" vs query "abcd" now matches (SPEC DECISION 1 — this FAILS on today's code); (b) a `tri_present` miss returns empty without scanning (assert via a cfg(test) scan counter); (c) a `tri_present` miss does NOT suppress a genuine fuzzy hit.
+7. STEP 7 - Replace trigram postings. Add `charclass_bsi` (64 slices, 4 KiB growth chunks, bits CLEARED on delete — not optional, since slots are recycled and a stale union degrades selectivity monotonically), `tri_present` (2^24 bits, exact, per-record so no trigram spans a delimiter), `bi_present`, `uni_present`. Wire the arena presence sets to skip Pass A ONLY — never Pass C, since fuzzy does not require contiguity, and never Pass B, which asks a contiguity question about a different column and so needs sets of its own (issue #8). Add the depth-bucketed shallowest-first fuzzy drain with `d_max` derived from the floor. Rewrite `fuzzy_density` (matching.rs:310) allocation-free with a stack `[char; 64]` query buffer — it currently collects two `Vec<char>` per candidate, i.e. 40,000 allocations per query at FUZZY_CAP. Delete `ensure_trigrams` and the `trigrams` field. GATE: `fuzzy_subsequence_density_and_ranges`, `fuzzy_density_basics`, `fuzzy_skipped_below_three_bytes`; bench's `every_query_class_hits_the_corpus` must still find the planted family AND still return empty for `NO_MATCH_QUERIES`. NEW TESTS: (a) the gapped subsequence "a_b_c_d" vs query "abcd" now matches (SPEC DECISION 1 — this FAILS on today's code); (b) a `tri_present` miss returns empty without scanning (assert via a cfg(test) scan counter); (c) a `tri_present` miss does NOT suppress a genuine fuzzy hit.
 
 8. STEP 8 - Delete the accel mutex; close issue #3. Move the former `Accel` fields into `VolumeIndex` as plain fields; delete `Accel`, `dirty`, `accel_lock` (index.rs:120), `mark_dirty` (index.rs:124), `Mutex<Accel>`; `search(&self)` and `ram_bytes(&self)` become lock-free. Batch USN application to one write-lock acquisition per journal read batch. GATE: confirm `VolumeIndex: Sync`. NEW TESTS: N searcher threads plus one writer thread applying Create/Delete/Rename — no panic, every returned FRN resolves through `path_of`, and results are always a valid snapshot. NEW BENCH CLASS: concurrent search with 4 threads on one index, asserting near-linear scaling — this is the regression tripwire that keeps issue #3 closed.
 
@@ -350,7 +363,7 @@ Cost model behind these (per candidate, replacing today's ~800 ns): reject-witho
 
 11. STEP 11 - Service path (session.rs). Return `(frn, score, tier, slot)` from search and expand `match_ranges` only for items surviving the ext/path filters; push the ext filter into `flush` as a name-suffix predicate so `fetch == max` again instead of `max*8` clamped to 4096 (session.rs:269-273). GATE: new indexd test for filtered-search correctness; new bench class WITH filters set, which the harness has never exercised.
 
-12. STEP 12 - MEASURED-GATED, optional, -27.3 B/entry. Open-addressed `frn_index: Vec<u32>` (2^21 slots, key re-derived from `entries[slot].frn`, multiply-shift hashing since NTFS packs a sequence number into the FRN's high bits so identity hashing is wrong) replacing `HashMap<u64,u32>`. Takes the budget from 147.45 to 120.19 MB/1M. Stage LAST and drop it if the schedule tightens — the cap closes without it. Move it earlier only if Step 0's real-volume L measurement comes back above 30 B.
+12. STEP 12 - MEASURED-GATED, optional, -27.3 B/entry. Open-addressed `frn_index: Vec<u32>` (2^21 slots, key re-derived from `entries[slot].frn`, multiply-shift hashing since NTFS packs a sequence number into the FRN's high bits so identity hashing is wrong) replacing `HashMap<u64,u32>`. Takes the budget from 147.46 to 120.20 MB/1M. Stage LAST and drop it if the schedule tightens — the cap closes without it. Move it earlier only if Step 0's real-volume L measurement comes back above 30 B.
 
 13. STEP 13 - MEASURED-GATED, optional, only if Step 0's 1M scan probe or Step 4's 300k gate says the memmem scan itself eats the budget. In order of preference: (a) chunk the arena scan across 2-4 std threads with `qlen-1` overlap and merge per-thread 2K heaps — embarrassingly parallel, no new dependency, but burning cores per query is a policy question under SPEC 2.3's multi-session model; (b) a 2-byte prefix/exact CSR index (`p2_start: [u32; 65537]` + `p2_flat: Vec<u32>` rebuilt at compaction, plus a bounded post-compaction delta map), +4.3 MB/1M, which answers Exact+Prefix scan-free and lets the pass-skip fire BEFORE Pass A runs — the direct fix for initials-2 at 1M.
 
@@ -389,5 +402,5 @@ Cost model behind these (per candidate, replacing today's ~800 ns): reject-witho
 - Should the arena scan be parallelized (Step 13a), and if so under what policy? It is the cleanest fix for initials-2 at 1M (4 ms -> ~1.2 ms on 4 cores, no new dependency), but SPEC 2.3 says one machine-wide index serves every session, so burning 4 cores per query is a fairness question that the current thread-per-query shape in session.rs makes worse. Needs an architectural ruling alongside the worker-pool question below.
 - session.rs spawns a fresh OS thread per query (~50-100 us of the 10 ms budget). Removing the accel mutex is what finally makes that thread able to run in parallel, so the spawn cost becomes the next visible item. Replacing it with a small worker pool is a follow-up outside this plan - but it should be scoped now, because it interacts with any decision to parallelize the scan.
 - How should the bench harness's four `lazy_rebuild_us` rows (bench.rs:1289-1310) be replaced? After Step 4 they read the same as the steady-state class means and stop being a tripwire. Proposed replacement: direct per-event `apply()` timing; 'first query after N USN events' rather than one; a sustained-mutation class with a writer thread applying events WHILE the query classes run (the current probe only measures the first query after one event); and the concurrent-search class from Step 8. Needs agreement before Step 4 lands, or the regression tripwire silently stops tripping.
-- No new dependencies are proposed - everything uses std, `memchr` (already a dependency), and `unicode-normalization`. If the hand-rolled open-addressed FRN table in Step 12 is judged not worth ~120 lines of tombstone/resize/load-factor code, the alternative is `hashbrown` with a custom `RawTable`, which would need a cleanroom and licence check (and note SPEC 3.9 already establishes that this project takes licence provenance seriously). The plan deliberately does not depend on it - the cap closes at 147.45 MB/1M without it.
+- No new dependencies are proposed - everything uses std, `memchr` (already a dependency), and `unicode-normalization`. If the hand-rolled open-addressed FRN table in Step 12 is judged not worth ~120 lines of tombstone/resize/load-factor code, the alternative is `hashbrown` with a custom `RawTable`, which would need a cleanroom and licence check (and note SPEC 3.9 already establishes that this project takes licence provenance seriously). The plan deliberately does not depend on it - the cap closes at 147.46 MB/1M without it.
 - The plan assumes `FSCTL_ENUM_USN_DATA` order requires the `finalize()` depth sweep but that steady-state USN Creates virtually always arrive after their parent. If real journal traffic shows a meaningful rate of child-before-parent Creates, those entries get depth 0 until the next repair sweep and rank too high. Worth measuring the out-of-order rate during Step 0; if non-trivial, the debounced repair sweep needs a lower debounce or an out-of-order counter as its trigger.

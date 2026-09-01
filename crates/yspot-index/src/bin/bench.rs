@@ -322,7 +322,10 @@ const FUZZY_STEMS: &[(&str, &str)] = &[
 
 /// Nothing in the vocabulary produces these, so they exercise the "query
 /// matched nothing" path — and, at ≥ 3 bytes, the `tri_present` early-out that
-/// skips the whole arena scan.
+/// skips the whole arena scan. At six bytes they also fit an initials lane, so
+/// they exercise the second early-out: without it this class still paid a full
+/// scan of the 8 MB initials column, which was roughly two thirds of its
+/// remaining cost.
 ///
 /// They must miss the WIDENED fuzzy prefilter too, not just contiguous
 /// matching: each is six rare letters, so a hit would need all six as an
@@ -1053,7 +1056,7 @@ const RAM_ACCOUNTING_NOTE: &str = "\
               handing back bulk-load doubling slack, which IS a real reduction.
               NOTE: accel:trigrams is gone. The byte-trigram posting lists measured 96 B/entry
               warm at 1M — larger than the entry table — and are replaced by charclass_bsi at a
-              flat 8 B/entry plus a fixed 2.1 MB of presence sets. That IS a real reduction, and
+              flat 8 B/entry plus a fixed 2.11 MB of presence sets. That IS a real reduction, and
               it is the line that decides the §3.4 cap.";
 
 /// Printed with the isolated Pass-A probe; see [`SCAN_PROBE_NEEDLE`].
@@ -1645,7 +1648,7 @@ fn run(cfg: &Config) -> Report {
         measure_class(
             &ix,
             "no-match",
-            "tri_present early-out: Pass A skipped entirely",
+            "presence-set early-out: both column scans skipped entirely",
             NO_MATCH_QUERIES.iter().map(|s| s.to_string()).collect(),
             it,
             mr,

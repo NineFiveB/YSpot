@@ -69,12 +69,14 @@ fn is_sep_char(c: char) -> bool {
 /// is the whole point of [`fuzzy_density`]'s signature.
 const FUZZY_QBUF: usize = 64;
 
-// Count of Pass A arena scans actually started, for the tests that assert a
-// presence-set miss returns without touching the arena. Thread-local, so the
-// test harness's parallel threads cannot see each other's scans.
+// Counts of Pass A arena scans and Pass B initials-column scans actually
+// started, for the tests that assert a presence-set miss returns without
+// touching the column. Thread-local, so the test harness's parallel threads
+// cannot see each other's scans.
 #[cfg(test)]
 thread_local! {
     static ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INITIALS_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -85,6 +87,15 @@ fn note_arena_scan() {
 #[cfg(not(test))]
 #[inline(always)]
 fn note_arena_scan() {}
+
+#[cfg(test)]
+fn note_initials_scan() {
+    INITIALS_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_initials_scan() {}
 
 /// Count folded-arena hits for `needle` — Pass 1's `memmem` scan with nothing
 /// attached to it: no hit→entry mapping, no tier classification, no ranking.
@@ -802,10 +813,11 @@ pub(crate) fn search(
     // exactly, so nothing about which hits are seen changes here.
     //
     // Skipped outright when the presence sets prove the arena cannot contain
-    // the query — a few L1/L2 probes in place of a 24 MB scan, and the reason
-    // a query that matches nothing costs microseconds. It gates THIS pass and
-    // no other: the sets answer a question about contiguity, which neither the
-    // initials column nor the fuzzy tier asks.
+    // the query — a few L1/L2 probes in place of a 24 MB scan, and half the
+    // reason a query that matches nothing costs microseconds. These sets gate
+    // THIS pass and no other: they describe the ARENA. Pass C never asks a
+    // contiguity question at all, and Pass B asks one about a different column,
+    // which is why it carries its own sets rather than borrowing these.
     if !cancelled && ix.arena_may_contain(fq.as_bytes()) {
         note_arena_scan();
         let arena = ix.folded_arena.as_bytes();
@@ -900,7 +912,26 @@ pub(crate) fn search(
     // skip is what keeps the `exact` class off this array — at
     // `INITIALS_STRIDE` B/entry it is several times the packed arena it
     // replaces, and exact-match queries are exactly the long ones.
-    if !cancelled && qlen <= INITIALS_STRIDE && !sel.rejects(tier_upper_bound(Tier::Initials)) {
+    //
+    // Then the presence gate, which is to this column what `arena_may_contain`
+    // is to the arena — and it has to be its OWN set: the arena's bigrams
+    // describe whole folded names, not which letters are adjacent as segment
+    // initials, so gating this pass on them would drop genuine camel-case
+    // results. Without it this pass scanned the whole 8 MB column for every
+    // query of 8 bytes or fewer — roughly two thirds of what a query matching
+    // nothing cost, once Pass A had already early-outed (issue #8).
+    //
+    // Ordered cheapest-first, as the presence sets themselves are: `rejects` is
+    // a length compare and a float compare that touch no memory, and it is the
+    // more selective of the two in practice — it already takes this pass out
+    // whenever a higher tier has filled the page. No point probing two tables
+    // to answer a question the floor has settled.
+    if !cancelled
+        && qlen <= INITIALS_STRIDE
+        && !sel.rejects(tier_upper_bound(Tier::Initials))
+        && ix.initials_may_contain(fq.as_bytes())
+    {
+        note_initials_scan();
         let lanes = &ix.initials[..];
         debug_assert_eq!(lanes.len(), ix.entries.len() * INITIALS_STRIDE);
         let mut pend: Option<u32> = None;
@@ -1111,6 +1142,11 @@ mod tests {
     /// Pass A arena scans started since the last call, and reset.
     fn arena_scans_since() -> usize {
         ARENA_SCANS.with(|c| c.replace(0))
+    }
+
+    /// Pass B initials-column scans started since the last call, and reset.
+    fn initials_scans_since() -> usize {
+        INITIALS_SCANS.with(|c| c.replace(0))
     }
 
     #[test]
@@ -1581,6 +1617,157 @@ mod tests {
         assert!(approx(hits[0].score, 0.7));
     }
 
+    /// A query no lane carries must answer without scanning the column.
+    ///
+    /// This is Pass B's half of the presence machinery, and it needs its OWN
+    /// set: `qz` here is a perfectly ordinary pair of arena bigrams — `quux
+    /// zed` contains both letters and the arena's `bi_present` says nothing
+    /// about whether they are ever adjacent as segment INITIALS. Gating this
+    /// pass on the arena's sets would have dropped the `fb` hit below.
+    #[test]
+    fn an_initials_presence_miss_skips_the_column_scan() {
+        let mut v = ix();
+        v.add(1, 999, "Foo Bar.txt", 0);
+        v.add(2, 999, "quux zed.txt", 0);
+
+        // Lanes are `fbt` and `qzt` — the extension is a segment too. So both
+        // bytes of `fz` are in the column and `fb` is a genuine lane bigram:
+        // only the initials BIGRAM set can decide this query.
+        assert_eq!(&initials_lane("Foo Bar.txt")[..3], b"fbt");
+        assert_eq!(&initials_lane("quux zed.txt")[..3], b"qzt");
+        assert!(v.initials_may_contain(b"f") && v.initials_may_contain(b"z"));
+        assert!(v.initials_may_contain(b"fb"), "fb is a real lane bigram");
+        assert!(
+            !v.initials_may_contain(b"fz"),
+            "`f` and `z` are never adjacent initials"
+        );
+
+        initials_scans_since();
+        assert!(v.search("fz", 10, &no_cancel).is_empty());
+        assert_eq!(
+            initials_scans_since(),
+            0,
+            "the initials column must not be scanned"
+        );
+
+        // Control, so the counter is proved to count: a query the column does
+        // hold scans exactly once.
+        assert_eq!(v.search("fb", 10, &no_cancel)[0].frn, 1);
+        assert_eq!(initials_scans_since(), 1);
+
+        // And the UNIGRAM half carries the gate on its own for a one-byte
+        // query, which has no bigram window at all. Without this the unigram
+        // set is redundant — a set bigram bit already implies both its bytes
+        // were noted — and deleting it would pass every other test here while
+        // making every one-byte miss re-scan the whole column.
+        assert!(!v.initials_may_contain(b"w"), "no lane carries `w`");
+        initials_scans_since();
+        assert!(v.search("w", 10, &no_cancel).is_empty());
+        assert_eq!(
+            initials_scans_since(),
+            0,
+            "a one-byte miss must skip the column too"
+        );
+    }
+
+    /// …and the same miss must NOT take the other tiers down with it.
+    ///
+    /// Two presence families over two different columns, and neither may leak
+    /// into the other's pass. `ackup` is absent from every lane — no name has
+    /// five segments starting a,c,k,u,p — but it is a plain substring of
+    /// `backup`, which Pass A must still return.
+    #[test]
+    fn an_initials_miss_does_not_suppress_a_substring_hit() {
+        let mut v = ix();
+        v.add(1, 999, "backup.txt", 0);
+
+        assert!(!v.initials_may_contain(b"ackup"));
+
+        initials_scans_since();
+        let hits = v.search("ackup", 10, &no_cancel);
+        assert_eq!(initials_scans_since(), 0, "Pass B must still be skipped");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 1);
+        // Contiguous, not at a word boundary: the substring tier.
+        assert!(approx(hits[0].score, 0.55));
+    }
+
+    /// The sets are built PER LANE, so a bigram that exists only across a lane
+    /// boundary must miss — and missing must be result-neutral, because the
+    /// containment test rejects such a hit anyway.
+    #[test]
+    fn an_initials_bigram_never_spans_two_lanes() {
+        let mut v = ix();
+        // Lanes are `…a` and `b…`, so the column bytes read `…a` `b…` and a
+        // naive scan of the whole array would find `ab` straddling them.
+        v.add(1, 999, "xylophone alpha", 0);
+        v.add(2, 999, "beta gamma", 0);
+        assert_eq!(&initials_lane("xylophone alpha")[..2], b"xa");
+        assert_eq!(&initials_lane("beta gamma")[..2], b"bg");
+
+        assert!(
+            !v.initials_may_contain(b"ab"),
+            "`ab` exists only across the lane boundary"
+        );
+        // And rejecting it costs nothing, because Pass B would have thrown the
+        // straddling hit away: neither before nor after the gate is there a
+        // result here.
+        assert!(v.search("ab", 10, &no_cancel).is_empty());
+    }
+
+    /// The sets cover the WHOLE fixed-width lane, so a query matching a full
+    /// eight-byte lane or its interior is admitted. A construction that read
+    /// only a lane's leading bytes fails here.
+    #[test]
+    fn the_initials_sets_cover_the_whole_lane() {
+        let mut v = ix();
+        v.add(
+            1,
+            999,
+            "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel",
+            0,
+        );
+        assert_eq!(
+            &initials_lane("Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel"),
+            b"abcdefgh"
+        );
+
+        // Full lane, no padding at all.
+        assert!(v.initials_may_contain(b"abcdefgh"));
+        // Lane-interior, which a leading-bytes-only set would miss.
+        assert!(v.initials_may_contain(b"gh"));
+        assert!(v.initials_may_contain(b"de"));
+        assert_eq!(v.search("gh", 10, &no_cancel)[0].frn, 1);
+    }
+
+    /// Deleting from a column whose every lane is packed full is still
+    /// consistent.
+    ///
+    /// The one lane write that does NOT record its bytes is
+    /// `unregister_slot`'s NUL fill, and `compact` refills from live lanes
+    /// only — so if no live lane ever carried padding, `FOLDED_DELIM` is
+    /// absent from the sets and a delete leaves an all-NUL lane nothing
+    /// recorded. Harmless, because invariant I3 keeps bytes below 0x20 out of
+    /// every folded query, so no gate decision can read those bits; the point
+    /// of this test is that the invariant checker agrees, rather than
+    /// reporting a violation the first time a corpus has full lanes and a
+    /// delete.
+    #[test]
+    fn deleting_from_a_fully_packed_column_keeps_the_invariants() {
+        let mut v = ix();
+        v.add(1, 999, "Al Bo Ca Da Ez Fo Gu Hi", 0);
+        v.add(2, 999, "Ja Iv Hi Gu Fo Ez Da Ca", 0);
+        assert_eq!(&initials_lane("Al Bo Ca Da Ez Fo Gu Hi"), b"abcdefgh");
+        assert_eq!(&initials_lane("Ja Iv Hi Gu Fo Ez Da Ca"), b"jihgfedc");
+        assert_invariants(&v, "packed column");
+
+        v.apply(crate::UsnEvent::Delete { frn: 1 });
+        assert_invariants(&v, "after deleting a packed lane");
+        // The survivor is still reachable, and the deleted one is gone.
+        assert_eq!(v.search("jihg", 10, &no_cancel)[0].frn, 2);
+        assert!(v.search("abcd", 10, &no_cancel).is_empty());
+    }
+
     /// The lane packs FOLDED initials and never a partial character: an initial
     /// whose folded form does not fit is dropped whole, and the walk stops
     /// there rather than pulling a later, narrower initial into its place.
@@ -1693,7 +1880,15 @@ mod tests {
     }
 
     /// Deliberately tiny, so names collide verbatim and scores tie exactly.
-    const WORDS: [&str; 6] = ["aa", "ab", "ba", "bb", "ac", "ca"];
+    /// `AaBbCc` and `Ärger` are here for the initials column specifically:
+    /// without them every generated name is 1-3 single-segment words, so lanes
+    /// never exceed 3 of their 8 bytes and every initial is one byte. The
+    /// camel word contributes three initials per segment, so three of them
+    /// overflow the lane and exercise `initials_lane`'s drop-whole truncation;
+    /// the accented one gives a two-byte initial. Both are cases the presence
+    /// sets' invariant would otherwise never see. Neither introduces a `d`,
+    /// which the `abcd` note below depends on.
+    const WORDS: [&str; 8] = ["aa", "ab", "ba", "bb", "ac", "ca", "AaBbCc", "Ärger"];
     const SEPS: [char; 4] = ['-', '_', '.', ' '];
 
     /// Queries across every tier: whole words (exact/prefix), separator-led
@@ -2212,6 +2407,48 @@ mod tests {
         // Slot-keyed columns must all be exactly as long as the entry table,
         // or a slot indexes into the wrong occupant's data.
         assert_eq!(v.rank_key.len(), v.entries.len(), "{ctx}: rank_key length");
+        assert_eq!(
+            v.initials.len(),
+            v.entries.len() * INITIALS_STRIDE,
+            "{ctx}: initials length"
+        );
+
+        // The Pass B gate's whole soundness claim: the presence sets are a
+        // SUPERSET of the initials column's n-grams. This is the direct check
+        // — a miss here is a query the gate would skip that Pass B would have
+        // answered, i.e. a silently missing result, which no timing or
+        // result-diffing test can attribute.
+        //
+        // Restricted to n-grams a query could actually carry, which is the
+        // property that matters and the only one that holds. `unregister_slot`
+        // fills a lane with FOLDED_DELIM without recording it, and `compact`
+        // refills from live lanes only — so on a column whose every live lane
+        // is packed to all eight bytes, no NUL is ever recorded and a
+        // subsequent delete would leave an unrecorded all-NUL lane behind.
+        // That is harmless precisely because invariant I3 keeps bytes below
+        // 0x20 out of every folded query, so those n-grams are unprobeable;
+        // asserting over them would be a false alarm about a bit no gate
+        // decision can ever read.
+        for (slot, lane) in v
+            .initials
+            .as_chunks::<INITIALS_STRIDE>()
+            .0
+            .iter()
+            .enumerate()
+        {
+            for &b in lane.iter().filter(|&&b| b >= 0x20) {
+                assert!(
+                    v.initials_may_contain(&[b]),
+                    "{ctx}: slot {slot} byte {b:#04x} missing from the initials unigrams"
+                );
+            }
+            for w in lane.windows(2).filter(|w| w.iter().all(|&b| b >= 0x20)) {
+                assert!(
+                    v.initials_may_contain(w),
+                    "{ctx}: slot {slot} bigram {w:?} missing from the initials bigrams"
+                );
+            }
+        }
 
         // `arena_recs` is sorted by construction (invariant I2) and is never
         // sorted at runtime, so a regression shows up as a broken ordering
