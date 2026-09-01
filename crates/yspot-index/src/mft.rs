@@ -44,6 +44,8 @@ const _: () = assert!(ROOT_FILE_NUMBER < FIRST_USER_FILE_NUMBER);
 const USN_RECORD_V2_HEADER: usize = 60;
 
 const ENUM_BUF_SIZE: usize = 1 << 20; // 1 MiB (§3.2: >= 1 MiB)
+/// How often a running enumeration reports progress.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const JOURNAL_MAX_SIZE: u64 = 64 * 1024 * 1024; // 64 MiB
 const JOURNAL_ALLOC_DELTA: u64 = 8 * 1024 * 1024; // 8 MiB
 
@@ -99,6 +101,16 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
     };
     let mut buf = vec![0u8; ENUM_BUF_SIZE];
 
+    // Progress accounting. A whole-volume scan is the one operation that can
+    // run for many seconds with nothing to show for it, so it reports at a
+    // fixed cadence — this is what turns "it hung" into a rate we can compare
+    // against the §10 M0 budget. It also backs the `index.progress` topic
+    // (§4.3) once the service subscribes to it.
+    let started = std::time::Instant::now();
+    let mut last_report = started;
+    let mut seen: u64 = 0;
+    let mut added: u64 = 0;
+
     loop {
         let mut bytes: u32 = 0;
         // SAFETY: `med` is a live MFT_ENUM_DATA_V0 for the input size given;
@@ -132,12 +144,14 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
         let next_start = read_u64(&buf, 0);
 
         for_each_record(&buf[8..filled], |rec| {
+            seen += 1;
             // File numbers 0–15 are reserved NTFS metafiles ($MFT, $LogFile,
             // $Bitmap, …, and record 5 = the volume root directory). None of
             // them is user-openable content; indexing them is pure noise (§3.8).
             if rec.frn & FRN_FILE_NUMBER_MASK < FIRST_USER_FILE_NUMBER {
                 return;
             }
+            added += 1;
             sink.add(
                 rec.frn,
                 rec.parent_frn,
@@ -146,6 +160,16 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
             );
         });
 
+        if last_report.elapsed() >= PROGRESS_INTERVAL {
+            let secs = started.elapsed().as_secs_f64();
+            log::info!(
+                "enumerating {volume_root}: {added} entries ({seen} records) in {secs:.1} s — \
+                 {:.0} entries/s",
+                added as f64 / secs.max(f64::EPSILON)
+            );
+            last_report = std::time::Instant::now();
+        }
+
         if next_start == med.StartFileReferenceNumber {
             log::warn!("FSCTL_ENUM_USN_DATA on {volume_root} made no forward progress; stopping");
             break;
@@ -153,6 +177,12 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
         med.StartFileReferenceNumber = next_start;
     }
 
+    let secs = started.elapsed().as_secs_f64();
+    log::info!(
+        "enumerated {volume_root}: {added} entries kept of {seen} records in {secs:.2} s — \
+         {:.0} entries/s",
+        added as f64 / secs.max(f64::EPSILON)
+    );
     Ok(cursor)
 }
 
