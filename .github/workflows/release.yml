@@ -1,0 +1,242 @@
+name: Release
+
+# Builds the shippable Windows artifacts and, when Azure Artifact Signing is
+# provisioned, signs every PE we ship. Everything signing-related is optional:
+# in a fork, or before Azure is set up, this workflow still produces working
+# (unsigned) builds. See docs/SIGNING.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Artifact Signing leaf certificates live ~72 hours, so every signature must
+  # be timestamped or it stops validating three days later.
+  YSPOT_TIMESTAMP_URL: http://timestamp.acs.microsoft.com
+
+jobs:
+  release:
+    name: Build and sign (windows-latest)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      # Lets azure/login exchange a GitHub OIDC token for an Azure token, so no
+      # long-lived credential is needed for the action-based signing steps.
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/shell/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The `secrets` context is not available in step-level `if:` expressions,
+      # so the "do we sign?" decision is made once here and exposed as outputs.
+      #   enabled -> action-based signing (OIDC) is possible
+      #   inline  -> tauri's own signCommand can run during bundling, which is
+      #              the only way the app exe *inside* the installer ends up
+      #              with a valid signature (see docs/SIGNING.md).
+      - name: "Resolve signing configuration"
+        id: signing
+        shell: pwsh
+        env:
+          SIGN_ENDPOINT: ${{ vars.YSPOT_SIGN_ENDPOINT }}
+          SIGN_ACCOUNT: ${{ vars.YSPOT_SIGN_ACCOUNT }}
+          SIGN_PROFILE: ${{ vars.YSPOT_SIGN_PROFILE }}
+          SIGN_TENANT_ID: ${{ vars.YSPOT_AZURE_TENANT_ID }}
+          SIGN_CLIENT_ID: ${{ vars.YSPOT_AZURE_CLIENT_ID }}
+          SIGN_SUBSCRIPTION_ID: ${{ vars.YSPOT_AZURE_SUBSCRIPTION_ID }}
+          SIGN_CLIENT_SECRET: ${{ secrets.YSPOT_AZURE_CLIENT_SECRET }}
+        run: |
+          $required = @{
+            'vars.YSPOT_SIGN_ENDPOINT'         = $env:SIGN_ENDPOINT
+            'vars.YSPOT_SIGN_ACCOUNT'          = $env:SIGN_ACCOUNT
+            'vars.YSPOT_SIGN_PROFILE'          = $env:SIGN_PROFILE
+            'vars.YSPOT_AZURE_TENANT_ID'       = $env:SIGN_TENANT_ID
+            'vars.YSPOT_AZURE_CLIENT_ID'       = $env:SIGN_CLIENT_ID
+            'vars.YSPOT_AZURE_SUBSCRIPTION_ID' = $env:SIGN_SUBSCRIPTION_ID
+          }
+          $missing = @($required.GetEnumerator() |
+            Where-Object { [string]::IsNullOrWhiteSpace($_.Value) } |
+            ForEach-Object { $_.Key } | Sort-Object)
+
+          $enabled = ($missing.Count -eq 0)
+          $inline = $enabled -and -not [string]::IsNullOrWhiteSpace($env:SIGN_CLIENT_SECRET)
+
+          "enabled=$($enabled.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+          "inline=$($inline.ToString().ToLower())"   >> $env:GITHUB_OUTPUT
+
+          if (-not $enabled) {
+            Write-Host "::warning::Code signing is DISABLED for this run. Missing: $($missing -join ', '). Artifacts will be unsigned and will be blocked by Smart App Control on end-user machines."
+          } elseif (-not $inline) {
+            Write-Host "::warning::Signing secret YSPOT_AZURE_CLIENT_SECRET is absent. Standalone binaries and installers will be signed, but the app executable packaged INSIDE the installers will not be (the bundler rewrites it after we sign it). See docs/SIGNING.md."
+          } else {
+            Write-Host "Signing enabled (action + in-bundler signCommand)."
+          }
+
+      - name: Build frontend
+        working-directory: apps/shell
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build yspot-indexd (release)
+        run: cargo build -p yspot-indexd --release
+
+      # `tauri build --no-bundle` compiles the shell executable but stops before
+      # packaging, so the binaries can be signed before they are swept into an
+      # installer.
+      - name: "Build the Tauri app (compile only, no bundle)"
+        working-directory: apps/shell
+        run: npm run tauri -- build --no-bundle
+
+      - name: "Azure login (OIDC)"
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ vars.YSPOT_AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.YSPOT_AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.YSPOT_AZURE_SUBSCRIPTION_ID }}
+
+      # Signs the standalone binaries we publish next to the installers
+      # (yspot-indexd.exe, the shell exe, any DLL dropped beside them).
+      - name: "Sign standalone binaries"
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.YSPOT_SIGN_ENDPOINT }}
+          signing-account-name: ${{ vars.YSPOT_SIGN_ACCOUNT }}
+          certificate-profile-name: ${{ vars.YSPOT_SIGN_PROFILE }}
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe,dll
+          files-folder-recurse: "false"
+          file-digest: SHA256
+          timestamp-rfc3161: ${{ env.YSPOT_TIMESTAMP_URL }}
+          timestamp-digest: SHA256
+          description: YSpot
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+
+      # Only needed for the in-bundler signCommand path; skipped otherwise so a
+      # normal build never pays for this compile.
+      - name: Install artifact-signing-cli
+        if: steps.signing.outputs.inline == 'true'
+        run: cargo install artifact-signing-cli --locked
+
+      # Bundling patches the main executable with bundle-type information, which
+      # invalidates any signature applied beforehand. tauri re-signs it after the
+      # patch *if* a signCommand is configured, so YSPOT_SIGNING_ENABLED is what
+      # decides whether the exe inside the installer is trustworthy.
+      - name: "Bundle installers (NSIS + MSI)"
+        working-directory: apps/shell
+        env:
+          YSPOT_SIGNING_ENABLED: ${{ steps.signing.outputs.inline == 'true' && '1' || '0' }}
+          YSPOT_SIGN_ENDPOINT: ${{ vars.YSPOT_SIGN_ENDPOINT }}
+          YSPOT_SIGN_ACCOUNT: ${{ vars.YSPOT_SIGN_ACCOUNT }}
+          YSPOT_SIGN_PROFILE: ${{ vars.YSPOT_SIGN_PROFILE }}
+          YSPOT_SIGN_TIMESTAMP_URL: ${{ env.YSPOT_TIMESTAMP_URL }}
+          YSPOT_SIGN_DESCRIPTION: YSpot
+          AZURE_TENANT_ID: ${{ vars.YSPOT_AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ vars.YSPOT_AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.YSPOT_AZURE_CLIENT_SECRET }}
+        run: npm run tauri -- bundle --bundles nsis,msi
+
+      # The installer and the MSI are files in their own right and must be
+      # signed after they exist, or Smart App Control blocks the installer itself.
+      - name: "Sign installers"
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.YSPOT_SIGN_ENDPOINT }}
+          signing-account-name: ${{ vars.YSPOT_SIGN_ACCOUNT }}
+          certificate-profile-name: ${{ vars.YSPOT_SIGN_PROFILE }}
+          files-folder: ${{ github.workspace }}\target\release\bundle
+          files-folder-filter: exe,msi
+          files-folder-recurse: "true"
+          file-digest: SHA256
+          timestamp-rfc3161: ${{ env.YSPOT_TIMESTAMP_URL }}
+          timestamp-digest: SHA256
+          description: YSpot installer
+          description-url: ${{ github.server_url }}/${{ github.repository }}
+
+      - name: "Stage artifacts"
+        id: stage
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:GITHUB_WORKSPACE 'dist-release'
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          $release = Join-Path $env:GITHUB_WORKSPACE 'target/release'
+          $wanted = @(
+            (Join-Path $release 'yspot-indexd.exe'),
+            (Join-Path $release 'yspot-shell.exe')
+          )
+          foreach ($file in $wanted) {
+            if (Test-Path -LiteralPath $file) {
+              Copy-Item -LiteralPath $file -Destination $stage
+            } else {
+              Write-Host "::warning::expected binary not found: $file"
+            }
+          }
+
+          $installers = @(Get-ChildItem -Path (Join-Path $release 'bundle') -Recurse -File -Include *.exe, *.msi -ErrorAction SilentlyContinue)
+          foreach ($installer in $installers) {
+            Copy-Item -LiteralPath $installer.FullName -Destination $stage
+          }
+
+          Get-ChildItem -Path $stage | ForEach-Object { Write-Host "staged: $($_.Name) ($($_.Length) bytes)" }
+          "path=$stage" >> $env:GITHUB_OUTPUT
+
+      - name: "Report signature status"
+        shell: pwsh
+        run: |
+          $stage = '${{ steps.stage.outputs.path }}'
+          $rows = foreach ($file in Get-ChildItem -Path $stage -File) {
+            $sig = Get-AuthenticodeSignature -LiteralPath $file.FullName
+            [pscustomobject]@{
+              File    = $file.Name
+              Status  = $sig.Status
+              Signer  = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '(unsigned)' }
+              Stamped = if ($sig.TimeStamperCertificate) { 'yes' } else { 'no' }
+            }
+          }
+          $table = ($rows | Format-Table -AutoSize -Wrap | Out-String -Width 200).TrimEnd()
+          Write-Host $table
+          "## Signature status" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $table | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          '```' | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          if ('${{ steps.signing.outputs.enabled }}' -eq 'true') {
+            $unsigned = @($rows | Where-Object { $_.Status -ne 'Valid' })
+            foreach ($row in $unsigned) {
+              Write-Host "::error::$($row.File) is not validly signed (status: $($row.Status))"
+            }
+            if ($unsigned.Count -gt 0) { exit 1 }
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: yspot-windows-x86_64
+          path: ${{ steps.stage.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14

@@ -10,6 +10,14 @@ The indexer architecture (MFT enumeration + USN journal tailing + Tantivy) is re
 
 Safe references: Microsoft Learn documentation (`FSCTL_ENUM_USN_DATA`, `FSCTL_READ_USN_JOURNAL`, USN record layouts), the `windows-rs`/`windows-sys` crates, Tantivy's own docs and examples.
 
+## Builds failing with `os error 4551`
+
+That is Smart App Control (a Windows 11 Code Integrity policy) blocking an
+unsigned binary — most often a cargo build script or a proc-macro DLL, not
+anything you wrote. Run `pwsh -File scripts/sac-status.ps1` to see exactly what
+was blocked and what launched it. Code signing does **not** fix this; see
+[docs/SIGNING.md](docs/SIGNING.md) §2 for why and what to do instead.
+
 ## Ground rules
 
 - Rust for the service and shell, TypeScript/React for the frontend and extensions — see SPEC.md §2.7 for the rationale; no new languages without a spec change.

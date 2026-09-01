@@ -9,9 +9,9 @@ dist/
 *.tsbuildinfo
 .npm/
 
-# Tauri
-/src-tauri/target/
-/src-tauri/gen/
+# Tauri (src-tauri lives at apps/shell/src-tauri, so a leading-/ anchor misses it)
+**/src-tauri/target/
+**/src-tauri/gen/
 
 # IDE / editors
 .vscode/
@@ -23,6 +23,7 @@ Thumbs.db
 Desktop.ini
 
 # Build artifacts / local state
+/dist-release/
 *.msi
 *.log
 .env
