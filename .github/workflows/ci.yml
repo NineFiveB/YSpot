@@ -80,7 +80,7 @@ jobs:
             exit 1
           }
 
-      - name: MFT enumeration of C: (timing for SPEC §10 M0)
+      - name: "MFT enumeration of C: (timing for SPEC §10 M0)"
         shell: pwsh
         run: |
           $exe = "target/release/yspot-indexd.exe"
