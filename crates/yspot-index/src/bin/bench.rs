@@ -1054,7 +1054,7 @@ M0 sign-off requires numbers from reference Machine A and Machine B.";
 
 /// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
 /// object cannot drift apart.
-fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 9] {
+fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 10] {
     [
         ("entries", b.entries),
         ("name_arena", b.name_arena),
@@ -1062,7 +1062,8 @@ fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 9] {
         ("frn_map", b.frn_map),
         ("free_slots", b.free_slots),
         ("rank_key", b.rank_key),
-        ("accel:folded_order", b.folded_order),
+        ("arena_recs", b.arena_recs),
+        ("owner", b.owner),
         ("accel:initials", b.initials),
         ("accel:trigrams", b.trigrams),
     ]
@@ -1177,7 +1178,7 @@ impl Report {
         println!("{}", "-".repeat(96));
         println!("lazy accel-structure rebuild cost (§3.4 prefilters build on first use):");
         println!(
-            "  cold first query (2-char, builds folded_order + initials arena) : {:>12.1} µs",
+            "  cold first query (2-char, builds the initials arena)            : {:>12.1} µs",
             self.cold_basic_us
         );
         // The 3-char rows no longer imply a trigram build: a full page above the
@@ -1188,11 +1189,11 @@ impl Report {
             self.cold_trigram_us
         );
         println!(
-            "  after ONE UsnEvent::Create, next 2-char query (full rebuild)    : {:>12.1} µs",
+            "  after ONE UsnEvent::Create, next 2-char query (initials rebuild): {:>12.1} µs",
             self.mutation_basic_us
         );
         println!(
-            "  after ONE UsnEvent::Create, next 3-char query (full rebuild)    : {:>12.1} µs",
+            "  after ONE UsnEvent::Create, next 3-char query (initials rebuild): {:>12.1} µs",
             self.mutation_trigram_us
         );
         println!(
@@ -1485,9 +1486,10 @@ fn run(cfg: &Config) -> Report {
     drop(corpus);
 
     // --- Lazy accel-structure cost, measured before anything is warm. -------
-    // First search ever: pays Accel::ensure_basic (folded_order sort + the
-    // initials arena). A 2-char query stops there — the fuzzy tier is skipped
-    // below 3 bytes (§3.4).
+    // First search ever: pays Accel::ensure_basic (the initials arena; the
+    // hit → slot map is NOT built here any more — `arena_recs`/`owner` are
+    // maintained at the mutation choke points). A 2-char query stops there —
+    // the fuzzy tier is skipped below 3 bytes (§3.4).
     let cold2 = queries
         .initials2
         .first()
@@ -1505,9 +1507,10 @@ fn run(cfg: &Config) -> Report {
     std::hint::black_box(ix.search(&cold3, cfg.max_results, &|| false));
     let cold_trigram_us = us(t);
 
-    // One USN create marks the accel dirty, which discards *everything* —
-    // including the trigram postings. This is the per-keystroke-after-a-file-
-    // change worst case, and it is a §2.5 risk in its own right.
+    // One USN create marks the accel dirty, which discards the initials arena
+    // and the trigram postings. This is the per-keystroke-after-a-file-change
+    // worst case and a §2.5 risk in its own right — it shrinks with every
+    // structure that moves out of `Accel` into incremental maintenance.
     ix.apply(UsnEvent::Create {
         frn: frn_of(corpus_generated + 1),
         parent_frn: ROOT_FRN,

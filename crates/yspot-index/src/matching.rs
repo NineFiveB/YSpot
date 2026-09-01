@@ -22,8 +22,8 @@
 //! exact/prefix/word-boundary/substring fall out of one `memmem` scan over
 //! the folded name arena — which is `0x00 rec 0x00 rec 0x00`, so the two
 //! bytes fencing a hit give its tier outright and a delimiter-free query can
-//! only ever match inside a single record (hits are mapped to entries via a
-//! sorted offset vec);
+//! only ever match inside a single record (hits are mapped to slots in O(1)
+//! through the index's `owner`/`arena_recs` pair, see [`slot_at`]);
 //! initials are substring-scanned in their own small arena; fuzzy candidates
 //! come from byte-trigram posting-list intersection, capped at
 //! [`FUZZY_CAP`] scored candidates per query.
@@ -36,7 +36,9 @@ use std::collections::{BinaryHeap, HashMap};
 
 use memchr::memmem;
 
-use crate::index::{fold, has_control_byte, VolumeIndex, DEPTH_PEN, FOLDED_DELIM};
+use crate::index::{
+    fold, has_control_byte, ArenaRec, Entry, VolumeIndex, DEPTH_PEN, FOLDED_DELIM, OWNER_SHIFT,
+};
 use crate::Hit;
 
 /// Cancellation is polled at least every this many hits/candidates (§3.4
@@ -62,12 +64,16 @@ fn is_sep_char(c: char) -> bool {
 
 /// Matcher acceleration structures, owned by the index behind a `Mutex` and
 /// rebuilt lazily on the first search after any mutation (`dirty`).
+///
+/// Shrinking: the hit → slot map used to live here as a sorted
+/// `(folded_off, slot)` vec that was rebuilt and re-sorted on the first query
+/// after ANY mutation. It is now the index's own append-only
+/// `arena_recs`/`owner` pair, maintained at the mutation choke points and never
+/// rebuilt. Step 6 takes the initials arena the same way, and step 7 the
+/// trigrams — at which point this type and its mutex go away entirely.
 pub(crate) struct Accel {
     /// Set by index mutations; cleared by [`Accel::ensure_basic`].
     pub(crate) dirty: bool,
-    /// `(folded_off, entry_idx)` for every live entry, sorted by offset —
-    /// maps folded-arena hit offsets back to entries via binary search.
-    folded_order: Vec<(u32, u32)>,
     /// First char of each name segment (folded), all entries back to back.
     initials_arena: String,
     /// Per-entry span of `initials_arena`, in ascending offset order.
@@ -88,30 +94,19 @@ impl Accel {
     pub(crate) fn new() -> Self {
         Self {
             dirty: true,
-            folded_order: Vec::new(),
             initials_arena: String::new(),
             initials_spans: Vec::new(),
             trigrams: None,
         }
     }
 
+    /// Rebuild the initials arena. Live entries only: a tombstoned slot keeps
+    /// its ORIGINAL-case name in the name arena, so a dead slot left in the
+    /// span table would map a hit back to a deleted file.
     fn ensure_basic(&mut self, ix: &VolumeIndex) {
         if !self.dirty {
             return;
         }
-        // Live entries only. A tombstoned slot keeps its ORIGINAL-case name in
-        // the name arena, so a dead slot left in `folded_order` would map a
-        // hit back to a deleted file. Its folded record is erased at
-        // `unregister_slot`, so those bytes can no longer produce a hit at
-        // all — the exclusion here and the erasure there are belt and braces
-        // for the same wrong-result failure.
-        self.folded_order.clear();
-        self.folded_order.reserve(ix.len());
-        for (slot, e) in ix.live_entries() {
-            self.folded_order.push((e.folded_off, slot));
-        }
-        self.folded_order.sort_unstable();
-
         self.initials_arena.clear();
         self.initials_spans.clear();
         self.initials_spans.reserve(ix.len());
@@ -169,7 +164,6 @@ impl Accel {
             None => 0,
         };
         AccelRam {
-            folded_order: (self.folded_order.capacity() * std::mem::size_of::<(u32, u32)>()) as u64,
             initials: (self.initials_arena.capacity()
                 + self.initials_spans.capacity() * std::mem::size_of::<InitialsSpan>())
                 as u64,
@@ -181,7 +175,6 @@ impl Accel {
 /// Per-structure resident bytes of [`Accel`]; folded into the index's
 /// [`crate::index::RamBreakdown`].
 pub(crate) struct AccelRam {
-    pub folded_order: u64,
     pub initials: u64,
     pub trigrams: u64,
 }
@@ -359,35 +352,55 @@ fn classify(before: u8, after: u8) -> Tier {
     }
 }
 
-/// Map a folded-arena hit offset to the entry containing it.
+/// Map a folded-arena hit offset to the slot whose record contains it, or
+/// `None` if that record has been superseded or its slot tombstoned.
 ///
-/// With the arena fenced this can no longer reject anything, and that is the
-/// point. A delimiter-free query only matches inside a maximal run of
-/// non-delimiter bytes; every such run is exactly one live record, because
-/// each record is appended with its own trailing fence and a vacated one is
-/// overwritten with fences; and record offsets are unique and ascending. So
-/// the greatest live offset `≤ hit` is the record the hit is in, and the whole
-/// match lies inside it.
+/// **O(1), no search.** `owner[hit >> OWNER_SHIFT]` names the last record
+/// starting at or before the 64-byte block the hit lies in, so the walk that
+/// follows is bounded by how many records start inside one block — ~2.7 at the
+/// §3.4 accounting's 23 B mean name. Both arrays are read in ascending order
+/// across a scan, so they stream rather than missing once per hit.
 ///
-/// That is what retires the straddle bug: the containment test used to reject
-/// a match spanning two records *after* `find_iter` had already moved its
-/// non-overlapping cursor past a genuine match starting inside the straddle,
-/// so the second entry was silently unreachable. The test is kept as a
-/// defensive belt — a later structure could reintroduce a stale offset here —
-/// and asserted on in debug so a broken invariant is loud rather than a
-/// quietly missing result.
-fn entry_at(order: &[(u32, u32)], ix: &VolumeIndex, hit: usize, qlen: usize) -> Option<u32> {
-    let pos = order.partition_point(|&(off, _)| (off as usize) <= hit);
-    if pos == 0 {
-        return None; // unreachable while the arena is fenced: hit ≥ 1 and the
-                     // first live record starts at offset 1 or before the hit
+/// What it replaces is a named contributor to the 1M latency: a
+/// `partition_point` over a sorted 8 MB `(folded_off, slot)` vec — ~20 random
+/// probes per raw hit — that also had to be rebuilt and re-sorted on the first
+/// query after any mutation.
+///
+/// **Why the record is checked against the entry.** `arena_recs` is
+/// append-only, so a renamed slot leaves its old record behind pointing at a
+/// byte range that no longer describes it — and, once the freelist hands that
+/// slot to a new file, describes a DIFFERENT file. A delete leaves one pointing
+/// at a tombstone. `unregister_slot` NUL-filled both ranges (invariant I4), so
+/// a delimiter-free needle cannot actually match inside them; the two tests
+/// here are the belt to that pair of braces, and what keeps this function
+/// honest if a later step relaxes the erase or leaves a record behind at
+/// compaction. `folded_off` and `flags` are fields of the same 32 B `Entry`, so
+/// together they cost the one read the containment `debug_assert` needs anyway.
+#[inline]
+fn slot_at(
+    owner: &[u32],
+    recs: &[ArenaRec],
+    entries: &[Entry],
+    hit: usize,
+    qlen: usize,
+) -> Option<u32> {
+    let mut ri = owner[hit >> OWNER_SHIFT] as usize;
+    while ri + 1 < recs.len() && (recs[ri + 1].off as usize) <= hit {
+        ri += 1;
     }
-    let (off, eidx) = order[pos - 1];
-    let e = &ix.entries[eidx as usize];
-    debug_assert!(!e.is_dead(), "folded_order must hold live slots only");
-    let contained = hit + qlen <= off as usize + e.folded_len as usize;
-    debug_assert!(contained, "hit at {hit} escaped its record: arena fencing");
-    contained.then_some(eidx)
+    let rec = recs[ri];
+    let e = &entries[rec.slot as usize];
+    if rec.off != e.folded_off || e.is_dead() {
+        return None;
+    }
+    // Live record + fenced arena + delimiter-free needle ⇒ the whole match is
+    // inside this record. Asserted rather than tested: a violation means the
+    // arena lost a fence, and a silently dropped hit would hide that.
+    debug_assert!(
+        hit + qlen <= rec.off as usize + e.folded_len as usize,
+        "hit at {hit} escaped its record: arena fencing"
+    );
+    Some(rec.slot)
 }
 
 fn initials_entry_at(spans: &[InitialsSpan], hit: usize, qlen: usize) -> Option<u32> {
@@ -714,6 +727,9 @@ pub(crate) fn search(
     // exactly, so nothing about which hits are seen changes here.
     if !cancelled {
         let arena = ix.folded_arena.as_bytes();
+        // Hoisted out of the hit loop: three slices read in ascending order,
+        // so the mapping streams instead of chasing a `Vec` header per hit.
+        let (owner, recs, entries) = (&ix.owner[..], &ix.arena_recs[..], &ix.entries[..]);
         // Tier classification reads `arena[hit - 1]` and `arena[hit + qlen]`
         // unchecked; both are in bounds only because the arena opens and closes
         // with a fence. Step 9's in-place compaction truncates this arena, and
@@ -765,7 +781,7 @@ pub(crate) fn search(
                 if sel.rejects(tier_upper_bound(tier)) {
                     continue;
                 }
-                let Some(slot) = entry_at(&accel.folded_order, ix, hit, qlen) else {
+                let Some(slot) = slot_at(owner, recs, entries, hit, qlen) else {
                     continue;
                 };
                 match pend {
@@ -1591,6 +1607,149 @@ mod tests {
             assert_eq!(tier_upper_bound(t), tier_base(t));
         }
         assert!(tier_upper_bound(Tier::Substring) > tier_upper_bound(Tier::Fuzzy));
+    }
+
+    /// A rename to a SAME-LENGTH name must stop the old name matching.
+    ///
+    /// `arena_recs` is append-only, so the renamed slot's first record is still
+    /// in it, still pointing at the bytes the old name occupied and still
+    /// naming the slot. The only thing that tells the two records apart is
+    /// [`slot_at`]'s `rec.off == entries[slot].folded_off` compare: length
+    /// cannot, because a same-length rename leaves the containment arithmetic
+    /// (`hit + qlen ≤ rec.off + folded_len`) bit-identical, and the slot cannot,
+    /// because it is the same slot. Delete the compare and every offset inside
+    /// the superseded record answers for the live entry again.
+    #[test]
+    fn same_length_rename_stops_matching_under_the_old_name() {
+        let mut v = ix();
+        v.add(1, 999, "alpha.txt", 0);
+        v.add(2, 999, "gamma.txt", 0);
+        let slot = v.frn_map[&1];
+        let old = v.entries[slot as usize].folded_off;
+        let old_len = v.entries[slot as usize].folded_len;
+
+        v.apply(crate::UsnEvent::Rename {
+            frn: 1,
+            new_parent_frn: 999,
+            new_name: "bravo.txt".into(),
+        });
+        let new = v.entries[slot as usize].folded_off;
+        assert_eq!(
+            v.entries[slot as usize].folded_len, old_len,
+            "the rename must be same-length for this test to bite"
+        );
+        assert_ne!(old, new, "the rename appended a second record for the slot");
+
+        // Black box: nothing of the old name is reachable, in any tier.
+        for q in ["alpha.txt", "alpha", "lph", "pha.tx"] {
+            assert!(v.search(q, 10, &no_cancel).is_empty(), "query {q:?}");
+        }
+        let hits = v.search("bravo", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 1);
+        assert_eq!(v.search("gamma", 10, &no_cancel)[0].frn, 2);
+
+        // White box, and this is the assertion the liveness compare is
+        // load-bearing for. The superseded record is STILL in `arena_recs`,
+        // still covering the old byte range, still naming the live slot — so
+        // the mapping has to reject it on the offset compare alone. It is what
+        // stands between "those bytes were NUL-filled" (invariant I4) and a
+        // wrong result, for anything that later relaxes the erase or leaves a
+        // record behind at compaction.
+        let stale = v
+            .arena_recs
+            .iter()
+            .find(|r| r.off == old)
+            .expect("the superseded record is kept until compaction");
+        assert_eq!(stale.slot, slot);
+        for h in old as usize..old as usize + old_len as usize {
+            assert_eq!(
+                slot_at(&v.owner, &v.arena_recs, &v.entries, h, 1),
+                None,
+                "arena byte {h} still resolves to the renamed slot"
+            );
+        }
+        assert_eq!(
+            slot_at(&v.owner, &v.arena_recs, &v.entries, new as usize, 1),
+            Some(slot),
+            "the live record must still map"
+        );
+    }
+
+    /// The hit → slot mapping at every offset a real scan can produce, on a
+    /// churned arena, against an expectation built from the entry table alone.
+    ///
+    /// Two directions, and both matter. Every byte of a live record must
+    /// resolve to that record's OWN slot — an off-by-one in `owner`'s fill rule
+    /// or a missed record moves a hit to a neighbouring file, which no
+    /// result-shaped assertion notices. And every byte of a vacated record must
+    /// resolve to nothing, including after its slot has been handed to a new
+    /// file off the freelist.
+    ///
+    /// Fence bytes are deliberately not probed: `slot_at`'s contract is a hit
+    /// offset, and a delimiter-free needle can never start on a delimiter.
+    #[test]
+    fn slot_at_maps_live_bytes_and_rejects_vacated_ones() {
+        const ABSENT: u64 = 9_000_000;
+        /// Byte range the named entry is about to stop occupying.
+        fn vacating(v: &VolumeIndex, frn: u64) -> (usize, usize) {
+            let e = &v.entries[v.frn_map[&frn] as usize];
+            (e.folded_off as usize, e.folded_len as usize)
+        }
+
+        let mut v = ix();
+        for i in 0..300u64 {
+            let pad = "y".repeat((i % 11) as usize);
+            v.add(i + 1, ABSENT, &format!("doc-{i}-{pad}.md"), 0);
+        }
+        let mut vacated: Vec<(usize, usize)> = Vec::new();
+        // Disjoint FRN sets: deletes take 6k+1 (odd), renames 4k+2 (even).
+        for i in (0..300u64).step_by(6) {
+            vacated.push(vacating(&v, i + 1));
+            v.apply(crate::UsnEvent::Delete { frn: i + 1 });
+        }
+        for i in (1..300u64).step_by(4) {
+            vacated.push(vacating(&v, i + 1));
+            v.apply(crate::UsnEvent::Rename {
+                frn: i + 1,
+                new_parent_frn: ABSENT,
+                new_name: format!("moved-{i}.md"),
+            });
+        }
+        // Recycles the tombstoned slots, so a vacated record now names a slot
+        // that belongs to a different file entirely.
+        for i in 0..25u64 {
+            v.add(50_000 + i, ABSENT, &format!("fresh-{i}.md"), 0);
+        }
+        v.finalize();
+        assert!(
+            v.live_entries().any(|(_, e)| e.frn >= 50_000),
+            "the recycling creates must have landed"
+        );
+
+        let mut live_bytes = 0usize;
+        for (slot, e) in v.live_entries() {
+            for h in e.folded_off as usize..e.folded_off as usize + e.folded_len as usize {
+                assert_eq!(
+                    slot_at(&v.owner, &v.arena_recs, &v.entries, h, 1),
+                    Some(slot),
+                    "arena byte {h} of frn {}",
+                    e.frn
+                );
+                live_bytes += 1;
+            }
+        }
+        assert!(live_bytes > 2_000, "corpus too small to prove much");
+
+        for &(off, len) in &vacated {
+            for h in off..off + len {
+                assert_eq!(
+                    slot_at(&v.owner, &v.arena_recs, &v.entries, h, 1),
+                    None,
+                    "vacated arena byte {h} still resolves to a slot"
+                );
+            }
+        }
     }
 
     #[test]

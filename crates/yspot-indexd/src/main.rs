@@ -66,6 +66,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let state = Arc::new(ServiceState::new(idx, root, Mode::Walk));
             // Dev mode has no USN tailing; the index is as live as it gets.
             state.set_vol_state(VS_TAILING);
+            spawn_housekeeping(state.clone());
             pipe::serve(state)
         }
         Cli::Mft(drive) => {
@@ -94,9 +95,44 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let state = Arc::new(ServiceState::new(idx, root, Mode::Mft));
             state.set_vol_state(VS_TAILING);
             spawn_usn_tail(state.clone(), drive, cursor);
+            spawn_housekeeping(state.clone());
             pipe::serve(state)
         }
     }
+}
+
+/// How often the housekeeping thread looks for deferred writer-side work.
+///
+/// Sized under the index's own ~500 ms depth-repair debounce, so the debounce
+/// — not the poll — is what decides when a repair runs. A tick that finds
+/// nothing to do is one atomic-free read-lock acquisition and a compare.
+const HOUSEKEEPING_TICK: Duration = Duration::from_millis(250);
+
+/// Deferred writer-side maintenance, on a clock of its own.
+///
+/// This exists because the USN tail thread is NOT a clock. `read_batch` blocks
+/// until the journal produces data, so on a quiescent volume — precisely the
+/// case where a `move` is the last thing that happened — a repair armed by that
+/// move would wait for the next unrelated filesystem event before anything
+/// looked at it. Not "a few hundred milliseconds of stale ranking depth"
+/// (behavior change 4), but unbounded. The tail loop keeps polling too, since
+/// it is already holding the write lock for its batch, but nothing depends on
+/// it any more.
+///
+/// Step 9's in-place compaction wants the same cadence (its triggers are
+/// fractions of garbage that only a periodic look can notice), so it lands
+/// here rather than on the tail thread.
+fn spawn_housekeeping(state: Arc<ServiceState>) {
+    std::thread::Builder::new()
+        .name("housekeeping".into())
+        .spawn(move || loop {
+            std::thread::sleep(HOUSEKEEPING_TICK);
+            // §3.6 pause suspends index maintenance, not just tailing.
+            if !state.is_paused() {
+                repair_depths(&state);
+            }
+        })
+        .expect("spawning housekeeping thread");
 }
 
 fn spawn_usn_tail(state: Arc<ServiceState>, drive: String, cursor: UsnCursor) {
@@ -134,13 +170,12 @@ fn usn_tail_loop(state: Arc<ServiceState>, drive: String, mut cursor: UsnCursor)
             // back as NeedsRebuild, never as Err (§3.3 recovery contract).
             match idx_api::usn_read_batch(&mut tailer, &mut cursor) {
                 Ok(idx_api::TailOutcome::Events(events)) => {
-                    // Also on an empty batch — a housekeeping-only read still
-                    // wakes this thread, and it is the only clock the depth
-                    // repair has. `read_batch` blocks until journal data
-                    // arrives, so an outstanding repair lands one batch after
-                    // its debounce elapses, not on a timer: on a volume with no
-                    // filesystem activity at all it simply waits, which is
-                    // exactly when a stale ranking depth costs nothing.
+                    // Opportunistic only. This thread is NOT the depth repair's
+                    // clock — `read_batch` blocks until the journal produces
+                    // data, so on a quiescent volume nothing would come back
+                    // here at all. `spawn_housekeeping` owns the cadence; this
+                    // call just takes the chance to drain a repair while the
+                    // batch has already warmed the index.
                     let n = events.len();
                     if n > 0 {
                         let mut idx = state.index_write();
@@ -166,20 +201,24 @@ fn usn_tail_loop(state: Arc<ServiceState>, drive: String, mut cursor: UsnCursor)
     }
 }
 
-/// Drain an outstanding ranking-depth repair on the WRITER thread, one slice
-/// per write-lock acquisition (§3.4 `depth_penalty`, design §5).
+/// Drain an outstanding ranking-depth repair off the query path, one slice per
+/// write-lock acquisition (§3.4 `depth_penalty`, design §5).
 ///
 /// A directory that changes parent shifts every descendant's cached depth by a
 /// constant. The alternative — refreshing depth from the query path — would put
 /// an O(n) sweep inside the §2.5 10 ms budget on the first keystroke after any
 /// `move`, which is exactly the rebuild-on-mutation cliff the cached column
-/// exists to remove. Here it costs the writer a few slices and readers nothing:
-/// the lock is released between slices, so a search never waits for the whole
-/// sweep, and until it lands the only effect is a few percent of score on a
-/// moved subtree. No result appears or disappears.
+/// exists to remove. Here it costs readers nothing: the lock is released between
+/// slices, so a search never waits for the whole sweep, and until it lands the
+/// only effect is a few percent of score on a moved subtree. No result appears
+/// or disappears.
+///
+/// Called from the housekeeping thread on a fixed tick, and opportunistically
+/// from the USN tail loop. It must stay safe to call from either — the guard
+/// below and `repair_depths_slice` are both no-ops when nothing is armed.
 fn repair_depths(state: &ServiceState) {
-    // Read lock for the poll: it runs after every USN batch and almost always
-    // says no, so it must not contend with searches.
+    // Read lock for the poll: it runs on every tick and after every USN batch
+    // and almost always says no, so it must not contend with searches.
     if !idx_api::depth_repair_due(&state.index_read()) {
         return;
     }

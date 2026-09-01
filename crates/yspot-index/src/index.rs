@@ -29,6 +29,12 @@
 //! quality. It is maintained incrementally at the two mutation choke points,
 //! settled by a memoized sweep in [`VolumeIndex::finalize`], and repaired on
 //! the WRITER after a directory reparent — never rebuilt from a query.
+//!
+//! [`VolumeIndex::arena_recs`] and [`VolumeIndex::owner`] are the second: they
+//! answer "which slot owns folded-arena byte `h`" in O(1) and are appended to,
+//! never rebuilt and never sorted. What they replace was a
+//! `(folded_off, slot)` vec rebuilt from scratch and `sort_unstable`d on the
+//! first query after ANY mutation, then binary-searched once per raw hit.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -111,6 +117,14 @@ const DEPTH_REPAIR_SLICE: usize = 64 * 1024;
 const ENTRY_GROW_CHUNK: usize = 64 * 1024;
 const ARENA_GROW_CHUNK: usize = 1024 * 1024;
 
+/// Folded-arena bytes covered by one [`VolumeIndex::owner`] slot.
+///
+/// 64 B is one cache line and, at the §3.4 accounting's 23 B mean name, ~2.7
+/// records — so the forward walk from `owner[h >> OWNER_SHIFT]` is a couple of
+/// steps, and the index itself costs 4 B per 64 B of arena (1.5 B/entry).
+pub(crate) const OWNER_BLOCK: usize = 64;
+pub(crate) const OWNER_SHIFT: u32 = OWNER_BLOCK.trailing_zeros();
+
 /// Folded-arena record delimiter. U+0000 is valid UTF-8 and, by
 /// [`has_control_byte`], can never occur inside a record — so one byte fences
 /// each record with no escaping and no ambiguity, and a delimiter-free query
@@ -126,6 +140,23 @@ pub(crate) const FOLDED_DELIM: u8 = 0x00;
 /// in filenames, so only synthetic and walk-mode inputs can produce them.
 pub(crate) fn has_control_byte(s: &str) -> bool {
     s.bytes().any(|b| b < 0x20)
+}
+
+/// One folded-arena record: where it starts, and the slot that appended it.
+/// 8 B.
+///
+/// A record is not the same thing as an entry. A slot that is renamed appends
+/// a second record and leaves its first behind — the old bytes are NUL-filled
+/// where they stand, and the old record is *superseded*, recognisable by
+/// `off != entries[slot].folded_off`. Compaction (step 9) is what finally
+/// drops them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ArenaRec {
+    /// `folded_arena` offset of the record's first byte, i.e. what
+    /// `Entry::folded_off` held when the record was appended.
+    pub off: u32,
+    /// The slot that appended it.
+    pub slot: u32,
 }
 
 /// One file or directory (§3.4). 32 B with padding.
@@ -193,8 +224,11 @@ pub struct RamBreakdown {
     pub free_slots: u64,
     /// Packed depth + hidden/system ranking column, 1 B per slot.
     pub rank_key: u64,
-    /// Matcher accel: sorted `(folded_off, entry_idx)` vec.
-    pub folded_order: u64,
+    /// Folded-arena record table, 8 B per record (≥ 1 per live entry; renames
+    /// leave superseded records behind until compaction).
+    pub arena_recs: u64,
+    /// 64-byte-block index into `arena_recs`, 4 B per 64 B of folded arena.
+    pub owner: u64,
     /// Matcher accel: initials arena plus its span table.
     pub initials: u64,
     /// Matcher accel: byte-trigram postings; zero until the first fuzzy query.
@@ -210,7 +244,8 @@ impl RamBreakdown {
             + self.frn_map
             + self.free_slots
             + self.rank_key
-            + self.folded_order
+            + self.arena_recs
+            + self.owner
             + self.initials
             + self.trigrams
     }
@@ -247,6 +282,22 @@ pub struct VolumeIndex {
     /// candidate at a time in arena order, and a 1 MB column streams where a
     /// 32 MB entry table misses. Scoring reads it through [`DEPTH_PEN`].
     pub(crate) rank_key: Vec<u8>,
+    /// Every folded-arena record ever appended, in append order — therefore
+    /// STRICTLY ASCENDING in `off` by construction (invariant I2), therefore
+    /// never sorted at runtime. Superseded records stay until compaction
+    /// (§3.7); [`crate::matching`] recognises them by
+    /// `rec.off != entries[rec.slot].folded_off`.
+    pub(crate) arena_recs: Vec<ArenaRec>,
+    /// One `u32` per [`OWNER_BLOCK`] bytes of `folded_arena`: the index in
+    /// `arena_recs` of the last record starting at or before that block's
+    /// first byte (or 0 when no record does, which only concerns block 0, the
+    /// arena's opening fence).
+    ///
+    /// This is what makes hit → slot O(1). The forward walk from `owner[b]` is
+    /// bounded by how many records start inside one 64 B block, and because a
+    /// scan produces hits in ascending offset order both this array and
+    /// `arena_recs` are read sequentially — they stream rather than missing.
+    pub(crate) owner: Vec<u32>,
     /// When a directory reparent armed the writer-side depth repair, or `None`
     /// if no repair is outstanding. See [`Self::repair_depths_slice`].
     depth_repair_armed: Option<Instant>,
@@ -283,6 +334,8 @@ impl VolumeIndex {
             free_slots: Vec::new(),
             dead_bytes: 0,
             rank_key: Vec::new(),
+            arena_recs: Vec::new(),
+            owner: Vec::new(),
             depth_repair_armed: None,
             depth_repair_cursor: 0,
             depth_repair_state: Vec::new(),
@@ -363,6 +416,8 @@ impl VolumeIndex {
         self.folded_arena.shrink_to_fit();
         self.frn_map.shrink_to_fit();
         self.rank_key.shrink_to_fit();
+        self.arena_recs.shrink_to_fit();
+        self.owner.shrink_to_fit();
         // The one place the map's allocation actually gets smaller, so the one
         // place the monotonic bucket count may be lowered.
         self.frn_map_buckets = 0;
@@ -533,6 +588,22 @@ impl VolumeIndex {
         arena.reserve_exact(spare + chunks * ARENA_GROW_CHUNK);
     }
 
+    /// Keep [`Self::owner`] able to index every byte the folded arena can
+    /// currently hold.
+    ///
+    /// Deliberately driven by the ARENA's capacity rather than by `owner`'s own
+    /// fill level: `owner` gains an entry only when a name happens to push the
+    /// arena across a 64-byte boundary, so left to itself it would allocate on
+    /// an insert that looks identical to the one before it. Tying it to the
+    /// arena's chunk clock means 16 Ki `u32`s (64 KiB) per
+    /// [`ARENA_GROW_CHUNK`] and no allocation at all in between.
+    fn reserve_owner(owner: &mut Vec<u32>, folded_capacity: usize) {
+        let need = folded_capacity / OWNER_BLOCK + 1;
+        if owner.capacity() < need {
+            owner.reserve_exact(need - owner.len());
+        }
+    }
+
     fn mark_dirty(&mut self) {
         self.accel
             .get_mut()
@@ -582,6 +653,7 @@ impl VolumeIndex {
         if self.settled {
             Self::reserve_arena(&mut self.name_arena, nfc.len());
             Self::reserve_arena(&mut self.folded_arena, folded.len() + fences);
+            Self::reserve_owner(&mut self.owner, self.folded_arena.capacity());
         }
         let name_off = self.name_arena.len() as u32;
         self.name_arena.push_str(nfc);
@@ -668,10 +740,49 @@ impl VolumeIndex {
             self.rank_key[slot as usize] = key;
         }
         debug_assert_eq!(self.rank_key.len(), self.entries.len());
+        self.push_arena_rec(folded_off, slot);
         self.frn_map.insert(frn, slot);
         self.live_count += 1;
         self.note_frn_map_buckets();
         debug_assert_eq!(self.live_count, self.frn_map.len());
+    }
+
+    /// Publish the folded-arena record [`Self::intern`] has just appended and
+    /// extend [`Self::owner`] over the bytes it added.
+    ///
+    /// **Why there is no sort here, ever.** `intern` only appends, and every
+    /// successful `intern` is followed by exactly one `register_slot` — the two
+    /// mutation choke points guarantee it — so records enter `arena_recs` in
+    /// the same order their bytes enter the arena. That is invariant I2, and it
+    /// is the whole difference from the structure this replaces: a
+    /// `(folded_off, slot)` vec that was cleared, refilled from a full sweep of
+    /// the entry table and `sort_unstable`d on the first query after any
+    /// mutation, then binary-searched once per raw hit.
+    ///
+    /// `owner` is filled to cover every block whose first byte is inside the
+    /// arena. The `<` (not `≤`) in the loop is what makes the index EXACT
+    /// rather than merely usable: it leaves the block that starts at
+    /// `folded_arena.len()` unwritten, so the next record — which starts at
+    /// exactly that offset — claims it here instead of finding it already
+    /// pointing at its predecessor. With `≤` the mapping would still be correct
+    /// (the forward walk repairs it) but `owner[b]` would no longer be the last
+    /// record at or before `b·OWNER_BLOCK`, and the invariant test could not be
+    /// written as an equality.
+    fn push_arena_rec(&mut self, off: u32, slot: u32) {
+        debug_assert!(
+            self.arena_recs.last().is_none_or(|r| r.off < off),
+            "arena_recs must be strictly ascending in off (invariant I2)"
+        );
+        // Each structure is guarded on its OWN capacity — see `register_slot`.
+        if self.settled && self.arena_recs.len() == self.arena_recs.capacity() {
+            self.arena_recs.reserve_exact(ENTRY_GROW_CHUNK);
+        }
+        self.arena_recs.push(ArenaRec { off, slot });
+        // `owner`'s capacity was taken with the arena's, in `intern`.
+        let ri = self.arena_recs.len() as u32 - 1;
+        while self.owner.len() * OWNER_BLOCK < self.folded_arena.len() {
+            self.owner.push(ri);
+        }
     }
 
     /// Record the map's bucket count after a possible grow. Monotonic by
@@ -942,7 +1053,8 @@ impl VolumeIndex {
             frn_map,
             free_slots: (self.free_slots.capacity() * std::mem::size_of::<u32>()) as u64,
             rank_key: self.rank_key.capacity() as u64,
-            folded_order: accel.folded_order,
+            arena_recs: (self.arena_recs.capacity() * std::mem::size_of::<ArenaRec>()) as u64,
+            owner: (self.owner.capacity() * std::mem::size_of::<u32>()) as u64,
             initials: accel.initials,
             trigrams: accel.trigrams,
         }
@@ -1450,6 +1562,93 @@ mod tests {
         assert_eq!(v.search("delta", 10, &|| false).len(), 1);
     }
 
+    /// Invariant I2, and the block index that rests on it, on a churned index.
+    ///
+    /// `arena_recs` is never sorted at runtime: the hit → slot lookup assumes
+    /// it comes out of `intern` in ascending offset order, and `owner` assumes
+    /// it too. Neither assumption is observable from a query, and breaking
+    /// either yields WRONG RESULTS rather than a panic — a hit resolves to some
+    /// other file's slot. So both are asserted here against a brute-force
+    /// definition, after creates, deletes, renames, slot recycling and the
+    /// `finalize` that switches growth to fixed chunks.
+    #[test]
+    fn arena_recs_ascend_and_owner_indexes_the_containing_record() {
+        const ABSENT: u64 = 9_000_000;
+        let mut v = ix();
+        for i in 0..400u64 {
+            let pad = "x".repeat((i % 17) as usize);
+            v.add(i + 1, ABSENT, &format!("file-{i}-{pad}.txt"), 0);
+        }
+        for i in (0..400u64).step_by(7) {
+            v.apply(UsnEvent::Delete { frn: i + 1 });
+        }
+        for i in (1..400u64).step_by(5) {
+            v.apply(UsnEvent::Rename {
+                frn: i + 1,
+                new_parent_frn: ABSENT,
+                new_name: format!("renamed-{i}"),
+            });
+        }
+        for i in 0..40u64 {
+            // Pops the freelist, so slot order stops agreeing with arena order.
+            v.add(10_000 + i, ABSENT, &format!("recycled-{i}.bin"), 0);
+        }
+        v.finalize();
+
+        // A record starting EXACTLY on a block boundary is the one arrangement
+        // `owner`'s fill rule can get wrong: the block would already be filled,
+        // pointing at the PREVIOUS record. Manufacture one rather than hoping
+        // the corpus produced it.
+        let mut pad = 0u64;
+        while !v.folded_arena.len().is_multiple_of(OWNER_BLOCK) {
+            let gap = OWNER_BLOCK - v.folded_arena.len() % OWNER_BLOCK;
+            v.add(20_000 + pad, ABSENT, &"p".repeat(gap.max(2) - 1), 0);
+            pad += 1;
+        }
+        v.add(30_000, ABSENT, "boundarymark.dat", 0);
+        let mark = v.entries[v.frn_map[&30_000] as usize].folded_off as usize;
+        assert_eq!(mark % OWNER_BLOCK, 0, "the boundary case must be covered");
+
+        // I2: strictly ascending in `off`, in bounds, one record per intern.
+        for w in v.arena_recs.windows(2) {
+            assert!(w[0].off < w[1].off, "arena_recs must be strictly ascending");
+        }
+        for r in &v.arena_recs {
+            assert!((r.off as usize) < v.folded_arena.len(), "off in bounds");
+            assert!((r.slot as usize) < v.entries.len(), "slot in bounds");
+        }
+        // Every live entry's CURRENT record is present exactly once. Renamed
+        // slots also keep their superseded records, which is why this counts
+        // rather than just looking one up.
+        for (slot, e) in v.live_entries() {
+            let n = v
+                .arena_recs
+                .iter()
+                .filter(|r| r.off == e.folded_off && r.slot == slot)
+                .count();
+            assert_eq!(n, 1, "frn {} has {n} live records", e.frn);
+        }
+        assert!(
+            v.arena_recs.len() > v.len(),
+            "the churn must have left superseded records behind"
+        );
+
+        // `owner` covers every byte of the arena, one entry per OWNER_BLOCK…
+        assert_eq!(v.owner.len(), v.folded_arena.len().div_ceil(OWNER_BLOCK));
+        // …and each entry is the LAST record starting at or before its block's
+        // first byte. Block 0 is the arena's opening fence, before any record,
+        // so it clamps to record 0 — it can never be a hit offset.
+        for (b, &ri) in v.owner.iter().enumerate() {
+            let byte = b * OWNER_BLOCK;
+            let want = v
+                .arena_recs
+                .iter()
+                .rposition(|r| r.off as usize <= byte)
+                .unwrap_or(0);
+            assert_eq!(ri as usize, want, "owner[{b}] (arena byte {byte})");
+        }
+    }
+
     #[test]
     fn ram_bytes_grows() {
         let mut v = ix();
@@ -1478,8 +1677,12 @@ mod tests {
         // capacity() is only 7/8 of the buckets — so strictly more than the
         // pre-fix `capacity() * 16`.
         assert!(b.frn_map > (v.frn_map.capacity() * 16) as u64);
+        // The hit → slot map is maintained by the mutations themselves, so it
+        // is charged before any search has run.
+        assert!(b.arena_recs >= (1000 * std::mem::size_of::<ArenaRec>()) as u64);
+        assert!(b.owner >= (v.folded_arena.len() / OWNER_BLOCK * 4) as u64);
         // Accel is untouched until the first search.
-        assert_eq!((b.folded_order, b.initials, b.trigrams), (0, 0, 0));
+        assert_eq!((b.initials, b.trigrams), (0, 0));
         assert!(!v.search("file-7", 4, &|| false).is_empty());
         assert!(v.ram_breakdown().initials > 0);
     }
