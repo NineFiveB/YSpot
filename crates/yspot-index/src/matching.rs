@@ -2165,4 +2165,160 @@ mod tests {
         assert!(v.search("beta", 10, &no_cancel).is_empty());
         assert_eq!(v.search("gamma", 10, &no_cancel)[0].frn, 3);
     }
+
+    /// Assert every structural invariant the columns depend on. A violation
+    /// here is the silent wrong-results mode: nothing panics, results just
+    /// quietly become wrong for some slots.
+    fn assert_invariants(v: &VolumeIndex, ctx: &str) {
+        // Slot-keyed columns must all be exactly as long as the entry table,
+        // or a slot indexes into the wrong occupant's data.
+        assert_eq!(v.rank_key.len(), v.entries.len(), "{ctx}: rank_key length");
+
+        // `arena_recs` is sorted by construction (invariant I2) and is never
+        // sorted at runtime, so a regression shows up as a broken ordering
+        // rather than a slow sort.
+        let mut prev: Option<u32> = None;
+        for rec in &v.arena_recs {
+            if let Some(p) = prev {
+                assert!(rec.off > p, "{ctx}: arena_recs not strictly ascending");
+            }
+            prev = Some(rec.off);
+        }
+
+        // The FRN map holds exactly the live entries — no tombstone may remain
+        // reachable, and no live entry may be missing.
+        assert_eq!(v.len(), v.frn_map.len(), "{ctx}: live_count vs frn_map");
+        let counted = v.entries.iter().filter(|e| !e.is_dead()).count();
+        assert_eq!(counted, v.len(), "{ctx}: DEAD count vs live_count");
+
+        // Fencing (invariant I3/I4): every live record's bytes are non-NUL and
+        // every vacated record has been erased to NUL.
+        let arena = v.folded_arena.as_bytes();
+        assert_eq!(arena.first(), Some(&FOLDED_DELIM), "{ctx}: leading fence");
+        assert_eq!(arena.last(), Some(&FOLDED_DELIM), "{ctx}: trailing fence");
+        for (slot, e) in v.entries.iter().enumerate() {
+            if e.is_dead() {
+                continue;
+            }
+            let (off, len) = (e.folded_off as usize, e.folded_len as usize);
+            assert!(
+                arena[off..off + len].iter().all(|&b| b != FOLDED_DELIM),
+                "{ctx}: live slot {slot} contains a delimiter"
+            );
+            assert_eq!(
+                arena[off - 1],
+                FOLDED_DELIM,
+                "{ctx}: slot {slot} left fence"
+            );
+            assert_eq!(
+                arena[off + len],
+                FOLDED_DELIM,
+                "{ctx}: slot {slot} right fence"
+            );
+        }
+    }
+
+    /// Step 10: the standing safety net.
+    ///
+    /// `pruned_selector_matches_an_exhaustive_reference` builds a fresh corpus
+    /// per seed, so it never exercises MUTATION — and mutation is where the
+    /// columns can silently disagree with `entries`. Slot recycling, arena
+    /// erasure, the `arena_recs` liveness compare, the initials lane and the
+    /// BSI bits all have to stay in step through delete/create/rename churn,
+    /// and every one of them fails by returning the WRONG rows rather than by
+    /// crashing.
+    ///
+    /// So: churn the index, then diff `search()` against the same exhaustive
+    /// reference over the live set, and check the structural invariants after
+    /// every round.
+    #[test]
+    fn churn_keeps_search_equal_to_the_reference() {
+        const SEEDS: u64 = 60;
+        const ROUNDS: usize = 10;
+        const MUTATIONS: usize = 6;
+        const PAGES: [usize; 3] = [1, 5, 32];
+
+        let mut checked = 0usize;
+        for seed in 1..=SEEDS {
+            let mut rng = Rng::new(seed.wrapping_mul(0xD1B5_4A32_D192_ED03));
+            let mut v = random_corpus(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 40);
+            v.finalize();
+            let mut next_frn = 500_000u64;
+
+            for round in 0..ROUNDS {
+                for _ in 0..MUTATIONS {
+                    // Pick a live FRN to target, if any.
+                    let live: Vec<u64> = v.frn_map.keys().copied().collect();
+                    let victim = if live.is_empty() {
+                        None
+                    } else {
+                        Some(live[rng.below(live.len())])
+                    };
+                    match rng.below(4) {
+                        0 => {
+                            next_frn += 1;
+                            v.apply(crate::UsnEvent::Create {
+                                frn: next_frn,
+                                parent_frn: NO_PARENT,
+                                name: random_name(&mut rng),
+                                flags: 0,
+                            });
+                        }
+                        1 => {
+                            if let Some(frn) = victim {
+                                v.apply(crate::UsnEvent::Delete { frn });
+                            }
+                        }
+                        2 => {
+                            if let Some(frn) = victim {
+                                v.apply(crate::UsnEvent::Rename {
+                                    frn,
+                                    new_parent_frn: NO_PARENT,
+                                    new_name: random_name(&mut rng),
+                                });
+                            }
+                        }
+                        // Same-FRN re-create: the update path, which tears the
+                        // slot down and re-registers it.
+                        _ => {
+                            if let Some(frn) = victim {
+                                v.apply(crate::UsnEvent::Create {
+                                    frn,
+                                    parent_frn: NO_PARENT,
+                                    name: random_name(&mut rng),
+                                    flags: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let ctx = format!("seed {seed} round {round}");
+                assert_invariants(&v, &ctx);
+
+                for q in QUERIES.iter().take(12) {
+                    let full = reference_search(&v, q, 33);
+                    for k in PAGES {
+                        let got = v.search(q, k, &no_cancel);
+                        let want = &full[..k.min(full.len())];
+                        checked += 1;
+                        assert_eq!(got.len(), want.len(), "{ctx} query {q:?} k {k}: count");
+                        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                            assert_eq!(g.frn, w.frn, "{ctx} query {q:?} k {k} row {i}: frn");
+                            assert_eq!(
+                                g.score.to_bits(),
+                                w.score.to_bits(),
+                                "{ctx} query {q:?} k {k} row {i}: score"
+                            );
+                        }
+                        // Nothing may be returned that cannot be resolved.
+                        for hit in &got {
+                            assert!(v.name_of(hit.frn).is_some(), "{ctx}: unresolvable frn");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000, "too few comparisons to prove anything");
+    }
 }

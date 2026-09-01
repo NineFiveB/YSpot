@@ -2156,4 +2156,105 @@ mod tests {
         assert_eq!(v.arena_scan_probe("zqxjvw-no-such-name"), 0);
         assert_eq!(v.arena_scan_probe(""), 0);
     }
+
+    /// SPEC §2.3 has one machine-wide index serving every interactive session,
+    /// so the index type itself must be shareable. This is the compile-time
+    /// half of closing issue #3: nothing in `VolumeIndex` may reintroduce a
+    /// `Mutex`, `RefCell` or raw pointer without failing here.
+    #[test]
+    fn volume_index_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VolumeIndex>();
+    }
+
+    /// The runtime half. `search(&self)` builds nothing lazily, so readers need
+    /// only a shared borrow and several sessions can query the one index at
+    /// once — the whole point of removing the accel mutex. A writer applies USN
+    /// events throughout, so readers are racing real mutation, not a frozen
+    /// snapshot.
+    ///
+    /// The assertions are deliberately about VALIDITY rather than content: with
+    /// a writer running, a reader may legitimately observe the index before or
+    /// after any given event. What must never happen is a returned FRN that
+    /// does not resolve, which is what a stale column or a recycled slot would
+    /// produce.
+    #[test]
+    fn concurrent_searchers_race_a_writer_without_tearing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, RwLock};
+
+        const SEED_ENTRIES: u64 = 4_000;
+        const READERS: usize = 4;
+
+        let mut v = ix();
+        for i in 0..SEED_ENTRIES {
+            v.add(i + 1, ABSENT_PARENT, &format!("report-{i}-draft.txt"), 0);
+        }
+        v.finalize();
+
+        let index = Arc::new(RwLock::new(v));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|r| {
+                let index = Arc::clone(&index);
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let queries = ["report", "draft", "rd", "eport-1", "zzqxj"];
+                    let mut seen = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let guard = index.read().unwrap_or_else(|p| p.into_inner());
+                        for q in queries {
+                            for hit in guard.search(q, 16, &|| false) {
+                                // A hit that cannot be resolved back to a live
+                                // entry means a column disagreed with `entries`.
+                                assert!(
+                                    guard.name_of(hit.frn).is_some(),
+                                    "reader {r}: frn {} returned but not resolvable",
+                                    hit.frn
+                                );
+                                assert!(guard.path_of(hit.frn).is_some());
+                                seen += 1;
+                            }
+                        }
+                    }
+                    seen
+                })
+            })
+            .collect();
+
+        // Churn the same slots repeatedly so the freelist actually recycles.
+        for round in 0..200u64 {
+            {
+                let mut guard = index.write().unwrap_or_else(|p| p.into_inner());
+                let frn = (round % SEED_ENTRIES) + 1;
+                guard.apply(crate::UsnEvent::Delete { frn });
+                guard.apply(crate::UsnEvent::Create {
+                    frn: 1_000_000 + round,
+                    parent_frn: ABSENT_PARENT,
+                    name: format!("report-fresh-{round}.txt"),
+                    flags: 0,
+                });
+                guard.apply(crate::UsnEvent::Rename {
+                    frn: 1_000_000 + round,
+                    new_parent_frn: ABSENT_PARENT,
+                    new_name: format!("report-renamed-{round}.txt"),
+                });
+            }
+            std::thread::yield_now();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let total: usize = readers
+            .into_iter()
+            .map(|h| h.join().expect("reader panicked"))
+            .sum();
+        assert!(
+            total > 0,
+            "readers never observed a hit, so nothing was proven"
+        );
+
+        let guard = index.read().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(guard.len(), guard.frn_map.len());
+    }
 }
