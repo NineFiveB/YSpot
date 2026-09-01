@@ -27,9 +27,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER,
     ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
 use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::session;
 use crate::state::ServiceState;
@@ -77,7 +80,10 @@ pub fn serve(state: Arc<ServiceState>) -> anyhow::Result<()> {
                  the pipe stays ACL-hardened, but its owner is this user, so clients cannot \
                  perform the §4.1 SYSTEM-owner check. DEV MODE."
             );
-            secdesc = SecDesc::from_sddl(yspot_proto::PIPE_SDDL_NO_OWNER);
+            secdesc = dev_sddl()
+                .as_deref()
+                .and_then(SecDesc::from_sddl)
+                .or_else(|| SecDesc::from_sddl(yspot_proto::PIPE_SDDL_NO_OWNER));
             match create_instance(&wide_name, secdesc.as_ref().map(|d| d.ptr), true) {
                 Ok(h) => h,
                 Err(e) if e == ERROR_ACCESS_DENIED => squat_refusal(),
@@ -128,6 +134,83 @@ pub fn serve(state: Arc<ServiceState>) -> anyhow::Result<()> {
             }
         };
     }
+}
+
+/// Dev-mode security descriptor: the §4.1 DACL plus full control for the user
+/// this process is running as.
+///
+/// Without that extra ACE an unelevated service can create the FIRST pipe
+/// instance and no others. `PIPE_SDDL_NO_OWNER` grants `GA` to SYSTEM and
+/// Administrators — neither of which an ordinary dev process is — and gives
+/// interactive users `0x12019B`, which deliberately withholds
+/// `FILE_CREATE_PIPE_INSTANCE` so a client cannot stand up a rogue instance of
+/// our name. Creating a second instance is checked against the existing pipe's
+/// DACL, so the service matched only the client ACE and got
+/// `ERROR_ACCESS_DENIED` forever: it served exactly one connection and then
+/// spun. In production the service IS SYSTEM, so the SY ace covers it and this
+/// path never runs.
+///
+/// Other interactive users keep the reduced mask, so this widens nothing for
+/// anyone but the process itself.
+fn dev_sddl() -> Option<String> {
+    let sid = current_user_sid()?;
+    Some(format!(
+        "D:P(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)S:(ML;;NW;;;ME)"
+    ))
+}
+
+/// SDDL string form of the process token's user SID.
+fn current_user_sid() -> Option<String> {
+    // SAFETY: pseudo-handle, not a real one to close; out-param is a valid slot.
+    let mut token: HANDLE = null_mut();
+    let ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if ok == 0 {
+        return None;
+    }
+    let mut len = 0u32;
+    // First call sizes the buffer; failing with anything other than "too small"
+    // means we cannot ask, so give up rather than guess.
+    // SAFETY: null buffer with a zero length is the documented sizing call.
+    unsafe { GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len) };
+    if len == 0 {
+        // SAFETY: `token` is a valid handle we opened.
+        unsafe { CloseHandle(token) };
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: `buf` is `len` bytes, which is what the sizing call asked for.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut c_void,
+            len,
+            &mut len,
+        )
+    };
+    // SAFETY: `token` is a valid handle we opened; closed exactly once.
+    unsafe { CloseHandle(token) };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: on success the buffer holds a TOKEN_USER whose SID pointer aims
+    // into that same buffer, which outlives this read.
+    let sid = unsafe { (*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut wide: *mut u16 = null_mut();
+    // SAFETY: `sid` is valid for the call; `wide` receives a LocalAlloc'd string.
+    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 || wide.is_null() {
+        return None;
+    }
+    // SAFETY: `wide` is a NUL-terminated string from the API.
+    let mut n = 0usize;
+    while unsafe { *wide.add(n) } != 0 {
+        n += 1;
+    }
+    // SAFETY: `n` units precede the terminator.
+    let s = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(wide, n) });
+    // SAFETY: LocalFree is the documented release for this allocation.
+    unsafe { LocalFree(wide as _) };
+    Some(s)
 }
 
 fn squat_refusal() -> ! {

@@ -142,23 +142,31 @@ pub fn run(mut reader: File, state: Arc<ServiceState>) {
                     }
                     continue;
                 }
-                let (st, lg, w) = (state.clone(), latest_gen.clone(), writer.clone());
-                let spawned = std::thread::Builder::new()
-                    .name("search".into())
-                    .spawn(move || run_search(st, lg, w, gen, text, filters, max_results));
-                if let Err(e) = spawned {
-                    log::error!("search thread spawn failed: {e}");
-                    let overloaded = Message::Error {
-                        id: None,
-                        gen: Some(gen),
-                        code: codes::OVERLOADED,
-                        message: "search worker unavailable".into(),
-                        retryable: true,
-                    };
-                    if !send(&writer, &overloaded) {
-                        return;
-                    }
-                }
+                // Run INLINE on this thread, not on a spawned one. A pipe
+                // handle created without `FILE_FLAG_OVERLAPPED` is
+                // synchronous, and Windows serializes I/O per FILE OBJECT —
+                // which `try_clone` duplicates a handle to rather than
+                // escaping. So a write issued from another thread blocks until
+                // this thread's outstanding `ReadFile` completes, and that read
+                // is waiting for the client's next message, which is waiting
+                // for this reply: a deadlock that only appears once a real
+                // client connects, which is why the CI smoke test (start the
+                // service, read the log) never saw it.
+                //
+                // The cost is that a `Cancel` cannot be read while a search
+                // runs, so §4.4 cancellation only takes effect between queries.
+                // Acceptable while searches are sub-millisecond; the real fix
+                // is overlapped I/O, which §4.1 already schedules for the M1
+                // service wrapper.
+                run_search(
+                    state.clone(),
+                    latest_gen.clone(),
+                    writer.clone(),
+                    gen,
+                    text,
+                    filters,
+                    max_results,
+                );
             }
             Message::Cancel { gen } => {
                 // Raise past `gen` so is_cancelled (latest > gen) kills the
