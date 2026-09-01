@@ -6,8 +6,11 @@
 //! - The listening instance is re-armed on one thread after each accept; a
 //!   client connecting in the gap sees `ERROR_PIPE_BUSY` and retries via
 //!   `WaitNamedPipe` (retry behavior §4.1 already mandates for clients).
-//! - Unelevated dev runs cannot assert the SDDL's `O:SY` owner; on failure the
-//!   pipe is created once more with DEFAULT security and a prominent warning.
+//! - Unelevated dev runs cannot assert the SDDL's `O:SY` owner (`CreateNamedPipeW`
+//!   fails with `ERROR_INVALID_OWNER`); the pipe is then created with
+//!   `PIPE_SDDL_NO_OWNER` — the same DACL and integrity label, owned by the
+//!   running user — so it stays ACL-hardened and only the §4.1 client-side
+//!   SYSTEM-owner check does not apply.
 //!
 //! Squat detection (§4.1) is honored: the first instance carries
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE`, and `ERROR_ACCESS_DENIED` on that create
@@ -21,8 +24,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_CONNECTED, HANDLE,
-    INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_INVALID_OWNER,
+    ERROR_PIPE_CONNECTED, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
@@ -57,26 +60,30 @@ pub fn serve(state: Arc<ServiceState>) -> anyhow::Result<()> {
     }
 
     // First instance carries FILE_FLAG_FIRST_PIPE_INSTANCE — the squat check.
-    // (Pointer hoisted out of the scrutinee so the arm below may reassign
+    // (Pointer hoisted out of the scrutinee so the arms below may reassign
     // `secdesc` without borrow-extension trouble.)
     let sd_ptr = secdesc.as_ref().map(|d| d.ptr);
     let mut handle = match create_instance(&wide_name, sd_ptr, true) {
         Ok(h) => h,
-        Err(err) if secdesc.is_some() => {
-            // Typical unelevated dev failure: the caller cannot assert the
-            // descriptor's O:SY owner. Retry once with default security.
+        Err(err) if err == ERROR_ACCESS_DENIED => squat_refusal(),
+        // Only SYSTEM may assign SYSTEM as owner, so an unelevated dev run
+        // fails the full descriptor with ERROR_INVALID_OWNER. Fall back to the
+        // same DACL and integrity label without the owner/group prefix — still
+        // ACL-hardened, only the owner differs.
+        Err(err) if err == ERROR_INVALID_OWNER && secdesc.is_some() => {
             log::warn!(
-                "CreateNamedPipeW with the SPEC §4.1 SDDL failed (os error {err}); retrying with \
-                 DEFAULT security. M0 DEV MODE ONLY: the pipe is NOT ACL-hardened — do not ship."
+                "CreateNamedPipeW with the SPEC §4.1 SDDL failed (ERROR_INVALID_OWNER): this \
+                 process is not SYSTEM. Retrying with the same DACL minus the O:SY/G:SY prefix — \
+                 the pipe stays ACL-hardened, but its owner is this user, so clients cannot \
+                 perform the §4.1 SYSTEM-owner check. DEV MODE."
             );
-            secdesc = None; // Drop frees the descriptor via LocalFree.
-            match create_instance(&wide_name, None, true) {
+            secdesc = SecDesc::from_sddl(yspot_proto::PIPE_SDDL_NO_OWNER);
+            match create_instance(&wide_name, secdesc.as_ref().map(|d| d.ptr), true) {
                 Ok(h) => h,
                 Err(e) if e == ERROR_ACCESS_DENIED => squat_refusal(),
-                Err(e) => anyhow::bail!("CreateNamedPipeW failed: os error {e}"),
+                Err(e) => anyhow::bail!("CreateNamedPipeW (dev descriptor) failed: os error {e}"),
             }
         }
-        Err(err) if err == ERROR_ACCESS_DENIED => squat_refusal(),
         Err(err) => anyhow::bail!("CreateNamedPipeW failed: os error {err}"),
     };
     log::info!("pipe server listening on {}", yspot_proto::PIPE_NAME);

@@ -75,8 +75,16 @@ jobs:
           }
           Stop-Process -Id $proc.Id -Force
           Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
-          if (-not (Select-String -Path walk.log -Pattern "walk complete" -Quiet)) {
-            Write-Host "::error::indexd never logged 'walk complete'"
+          # env_logger writes to stderr, so assert against both streams.
+          $out = @(Get-Content walk.log, walk.err -ErrorAction SilentlyContinue) -join "`n"
+          foreach ($expected in @("walk complete", "pipe server listening")) {
+            if ($out -notmatch [regex]::Escape($expected)) {
+              Write-Host "::error::indexd never logged '$expected'"
+              exit 1
+            }
+          }
+          if ($out -match "NOT ACL-hardened") {
+            Write-Host "::error::pipe fell back to DEFAULT security instead of the dev DACL"
             exit 1
           }
 

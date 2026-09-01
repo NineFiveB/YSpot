@@ -216,7 +216,7 @@ fn normalize_root(p: &str) -> String {
 
 /// Accepts `C`, `c:`, `C:\` … and yields the canonical `C:`.
 fn parse_drive(s: &str) -> Option<String> {
-    let t = s.trim().trim_end_matches(|c| c == '\\' || c == '/');
+    let t = s.trim().trim_end_matches(['\\', '/']);
     let mut chars = t.chars();
     let letter = chars.next()?;
     if !letter.is_ascii_alphabetic() {

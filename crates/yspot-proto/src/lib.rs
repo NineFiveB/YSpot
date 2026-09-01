@@ -26,6 +26,14 @@ pub const MAX_FRAME_S2C: u32 = 16 << 20; // 16 MiB
 /// SDDL for the service pipe (§4.1).
 pub const PIPE_SDDL: &str = "O:SYG:SYD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)S:(ML;;NW;;;ME)";
 
+/// [`PIPE_SDDL`] without the `O:SY G:SY` owner/group prefix. A process that is
+/// not SYSTEM cannot assign SYSTEM as owner — `CreateNamedPipeW` then fails
+/// with `ERROR_INVALID_OWNER` (1307) — so unelevated dev runs use this form.
+/// The DACL and integrity label are identical, so the pipe stays ACL-hardened;
+/// only the owner differs (the creating user instead of SYSTEM), which means
+/// the §4.1 client-side owner check does not apply to dev-mode pipes.
+pub const PIPE_SDDL_NO_OWNER: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;IU)S:(ML;;NW;;;ME)";
+
 /// Explicit client open rights (§4.1): FILE_GENERIC_READ |
 /// (FILE_GENERIC_WRITE & !FILE_APPEND_DATA). Never GENERIC_WRITE.
 pub const CLIENT_PIPE_ACCESS: u32 = 0x0012_019B;

@@ -496,7 +496,7 @@ pub(crate) fn search(
         let arena = ix.folded_arena.as_bytes();
         for hit in finder.find_iter(arena) {
             processed += 1;
-            if processed % CANCEL_STRIDE == 0 && is_cancelled() {
+            if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -523,7 +523,7 @@ pub(crate) fn search(
     if !cancelled {
         for hit in finder.find_iter(accel.initials_arena.as_bytes()) {
             processed += 1;
-            if processed % CANCEL_STRIDE == 0 && is_cancelled() {
+            if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
                 cancelled = true;
                 break;
             }
@@ -566,7 +566,7 @@ pub(crate) fn search(
                 if scored > FUZZY_CAP {
                     break;
                 }
-                if scored % CANCEL_STRIDE == 0 && is_cancelled() {
+                if scored.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
                     cancelled = true;
                     break;
                 }
@@ -584,7 +584,7 @@ pub(crate) fn search(
     // Rank: score = base × depth_penalty × hidden_penalty; top-K via heap.
     let mut heap: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
     for (i, (&eidx, cand)) in best.iter().enumerate() {
-        if (i + 1) % CANCEL_STRIDE == 0 && is_cancelled() {
+        if (i + 1).is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
             break; // return what we have (§3.4 cancellation)
         }
         let e = &ix.entries[eidx as usize];

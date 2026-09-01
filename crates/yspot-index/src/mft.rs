@@ -375,7 +375,10 @@ fn parse_v2_record(buf: &[u8], off: usize, rec_len: usize) -> Option<UsnRecord> 
     let name_len = read_u16(buf, off + 56) as usize;
     let name_off = read_u16(buf, off + 58) as usize;
 
-    if name_off < USN_RECORD_V2_HEADER || name_len % 2 != 0 || name_off + name_len > rec_len {
+    if name_off < USN_RECORD_V2_HEADER
+        || !name_len.is_multiple_of(2)
+        || name_off + name_len > rec_len
+    {
         log::warn!(
             "malformed USN record name (offset {name_off}, length {name_len}, record {rec_len}); skipping record"
         );
@@ -383,8 +386,10 @@ fn parse_v2_record(buf: &[u8], off: usize, rec_len: usize) -> Option<UsnRecord> 
     }
     let start = off + name_off;
     let units: Vec<u16> = buf[start..start + name_len]
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     Some(UsnRecord {
         frn,
