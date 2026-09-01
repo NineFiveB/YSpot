@@ -11,7 +11,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 authors = ["YSpot contributors"]
-repository = "https://github.com/AegiosOT/YSpot"
+repository = "https://github.com/NineFiveB/YSpot"
 publish = false
 
 [workspace.dependencies]

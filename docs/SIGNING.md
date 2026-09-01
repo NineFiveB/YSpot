@@ -210,7 +210,7 @@ organization; all future YSpot binaries must carry that publisher.
 | Endpoint | `https://eus.codesigning.azure.net/` | repo var `YSPOT_SIGN_ENDPOINT` |
 | Certificate profile | `release-signing` | repo var `YSPOT_SIGN_PROFILE` |
 | Signing identity | user-assigned MI `ytile-release-signer` | repo var `YSPOT_AZURE_CLIENT_ID` |
-| Federated credential | `github-yspot-release` → `repo:AegiosOT@2933384/YSpot@1350372443:environment:release` | on that MI |
+| Federated credential | `github-yspot-release-org` → `repo:NineFiveB@323532061/YSpot@1350372443:environment:release` (plus a plain-name form, and the pre-transfer `AegiosOT` one retained) | on that MI |
 | Environment gate | `environment: release` on the release job | `.github/workflows/release.yml` |
 
 The account name (`aegiosot`) is **not** part of the certificate — it is just an
