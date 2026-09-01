@@ -4732,6 +4732,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "yspot-m0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "log",
+ "windows-sys 0.59.0",
+ "yspot-proto",
+]
+
+[[package]]
 name = "yspot-proto"
 version = "0.1.0"
 dependencies = [

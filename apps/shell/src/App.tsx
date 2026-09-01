@@ -21,6 +21,7 @@ import {
   statsSnapshot,
   type LatencySnapshot,
 } from "./lib/latency";
+import { noteHidden, noteShown, startThrottleProbe } from "./lib/throttle";
 
 const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 
@@ -61,6 +62,14 @@ export default function App(): ReactElement {
       setGeneration(cur);
     }
     if (markApplied(cur) !== null) setLat(statsSnapshot());
+    // §10 M0 harness endpoint: this rAF committed `cur`'s results. The final
+    // flag says whether the committed set includes the generation's final
+    // batch — the harness pairs `applied gen=N final=1` with the results
+    // marker of the same generation, so a partial-batch commit can never be
+    // mistaken for the completed one if batching ever appears (M0 sends
+    // exactly one final batch, so today this is always 1).
+    const sawFinal = fresh.some((p) => p.isFinal);
+    ipc.m0Mark(`applied gen=${cur} final=${sawFinal ? 1 : 0}`);
   }, []);
 
   const scheduleApply = useCallback(() => {
@@ -90,6 +99,7 @@ export default function App(): ReactElement {
     track(ipc.onIndexState((p) => setConnected(p.connected === true)));
     track(
       ipc.onWindowShown(() => {
+        noteShown();
         const el = inputRef.current;
         if (el) {
           el.focus();
@@ -97,6 +107,7 @@ export default function App(): ReactElement {
         }
       }),
     );
+    track(ipc.onWindowHidden(() => noteHidden()));
     return () => {
       disposed = true;
       for (const u of unlisteners) u();
@@ -124,6 +135,7 @@ export default function App(): ReactElement {
 
   // First frame rendered → tell the shell the renderer is warm (§5.4).
   useEffect(() => {
+    startThrottleProbe();
     const id = requestAnimationFrame(() => {
       void ipc.frontendReady().catch(() => undefined);
     });

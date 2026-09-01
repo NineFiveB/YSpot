@@ -74,3 +74,16 @@ export function onIndexState(
 export function onWindowShown(cb: () => void): Promise<UnlistenFn> {
   return listen("window:shown", () => cb());
 }
+
+export function onWindowHidden(cb: () => void): Promise<UnlistenFn> {
+  return listen("window:hidden", () => cb());
+}
+
+/**
+ * Relay a §10 M0 measurement marker to the shell's ETW provider. Prefix
+ * whitelisted on the Rust side; fire-and-forget by design — instrumentation
+ * must never block or fail the UI path.
+ */
+export function m0Mark(text: string): void {
+  void invoke("m0_mark", { text }).catch(() => undefined);
+}

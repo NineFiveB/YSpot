@@ -38,6 +38,29 @@ pub const PIPE_SDDL_NO_OWNER: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x12019B;;;
 /// (FILE_GENERIC_WRITE & !FILE_APPEND_DATA). Never GENERIC_WRITE.
 pub const CLIENT_PIPE_ACCESS: u32 = 0x0012_019B;
 
+/// ETW provider GUID for the §10 M0 latency markers, as
+/// `(Data1, Data2, Data3, Data4)`.
+///
+/// The shell writes plain-string events (`EventWriteString`) under this GUID
+/// at the §2.5 measurement points — `shown` / `hidden` on the window
+/// lifecycle, `results gen=…` when a `SearchResults` frame arrives off the
+/// pipe, `applied gen=…` when the frontend commits it in a rAF, and
+/// `rafgap …` with the hidden-throttling observations. The M0 harness
+/// (`yspot-m0`) records them in the same ETW session as the
+/// `Microsoft-Windows-Dwm-Core` present events, which is what puts injected
+/// keydowns, marker timestamps, and composited frames on one QPC timeline.
+///
+/// Instrumentation only: not part of the §4 wire protocol, carried here so
+/// the emitting and consuming crates share one definition. Free when nobody
+/// listens — an ETW write to a provider with no enabled session is a couple
+/// of predictable branches.
+pub const M0_MARKER_PROVIDER: (u32, u16, u16, [u8; 8]) = (
+    0x5953_5054, // "YSPT"
+    0x4d30,      // "M0"
+    0x4d41,      // "MA"
+    *b"RKERSETW",
+);
+
 // Application error codes (§4.8).
 pub mod codes {
     pub const UNSUPPORTED_VERSION: u32 = 100;

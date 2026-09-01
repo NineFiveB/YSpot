@@ -72,25 +72,60 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build indexd
+      # Two steps, deliberately: in one pwsh script only the LAST native exit
+      # code decides the step's outcome, so a failed first build would ride a
+      # green second one and resurface later as "probe.exe not found".
+      - name: Build indexd (with probe)
         run: cargo build -p yspot-indexd --release
+
+      - name: Build m0 harness
+        run: cargo build -p yspot-m0 --release
 
       # Runners are NTFS and the job is elevated, so both indexing paths are
       # exercisable here even though a locked-down dev machine cannot run
       # unsigned binaries locally.
-      - name: Walk-mode index + pipe server starts
+      #
+      # A CLIENT CONNECTS in this step, deliberately. The previous shape of
+      # this test — start the service and grep its log — passed while every
+      # search deadlocked (the synchronous-pipe bug found the day a real
+      # client first connected). `probe` speaks the §4 protocol exactly as the
+      # shell does: handshake, IndexStatus, SearchQuery → final SearchResults,
+      # so a service that cannot answer a search fails CI here.
+      - name: Walk-mode index + probe answers over the pipe
         shell: pwsh
+        timeout-minutes: 10
         run: |
           $exe = "target/release/yspot-indexd.exe"
           $proc = Start-Process -FilePath $exe -ArgumentList "--walk", "$env:RUNNER_TEMP" `
             -PassThru -RedirectStandardOutput walk.log -RedirectStandardError walk.err
-          Start-Sleep -Seconds 20
-          if ($proc.HasExited) {
-            Write-Host "indexd exited early with code $($proc.ExitCode)"
-            Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
-            exit 1
+          # Poll for readiness rather than sleeping a flat interval.
+          $deadline = (Get-Date).AddSeconds(60)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            if ($proc.HasExited) {
+              Write-Host "indexd exited early with code $($proc.ExitCode)"
+              Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
+              exit 1
+            }
+            $sofar = @(Get-Content walk.log, walk.err -ErrorAction SilentlyContinue) -join "`n"
+            if ($sofar -match "pipe server listening") { break }
           }
-          Stop-Process -Id $proc.Id -Force
+
+          # Run probe with its own timeout: its reads block with no deadline,
+          # so a service that accepts the connection but never answers — the
+          # exact dd228ee failure class this step exists to catch — would
+          # otherwise stall to the step timeout and skip every diagnostic
+          # below. 124, in the timeout(1) tradition.
+          $probe = Start-Process -FilePath "target/release/probe.exe" `
+            -ArgumentList "--iterations", "20" -PassThru -NoNewWindow
+          if ($probe.WaitForExit(120000)) {
+            $probeExit = $probe.ExitCode
+          } else {
+            Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue
+            $probeExit = 124
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
           # env_logger writes to stderr, so assert against both streams.
           $out = @(Get-Content walk.log, walk.err -ErrorAction SilentlyContinue) -join "`n"
@@ -104,6 +139,20 @@ jobs:
             Write-Host "::error::pipe fell back to DEFAULT security instead of the dev DACL"
             exit 1
           }
+          if ($probeExit -ne 0) {
+            Write-Host "::error::probe could not complete a search round-trip (exit $probeExit)"
+            exit 1
+          }
+
+      # §10 M0 flagged open item #1. Advisory on the first rollout: a shared
+      # runner's clipboard service is not under our control; the dev-machine
+      # run in docs/M0.md is the sign-off signal. Tighten once green history
+      # shows the runner is reliable here.
+      - name: "Clipboard-listener smoke test (advisory)"
+        shell: pwsh
+        timeout-minutes: 2
+        run: target/release/yspot-m0.exe clipboard
+        continue-on-error: true
 
       - name: "MFT enumeration of C: (timing for SPEC §10 M0)"
         shell: pwsh

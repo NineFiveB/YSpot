@@ -286,6 +286,13 @@ fn handle_msg(app: &AppHandle, client: &PipeClient, msg: Message) {
             if gen < client.current_gen.load(Ordering::SeqCst) {
                 return;
             }
+            // §10 M0 harness endpoint, and specifically the §2.5 "results data
+            // available ≤ 20 ms after keydown" one: the frame has crossed the
+            // pipe and been decoded, before any relay or rendering.
+            crate::etw_mark::mark(&format!(
+                "results gen={gen} seq={seq} final={}",
+                u8::from(is_final)
+            ));
             let payload = JsSearchResults {
                 gen,
                 seq,

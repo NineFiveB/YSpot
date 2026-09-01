@@ -6,6 +6,7 @@
 //! Deferred to M1: single-instance mutex + show forwarding (§5.5), tray
 //! icon, hotkey conflict dialog and rebinding UI (§5.1), autostart (§5.4).
 
+mod etw_mark;
 mod focus;
 mod pipe_client;
 mod placement;
@@ -64,6 +65,13 @@ fn show(app: &AppHandle) {
         }
         None => log::warn!("placement computation failed; keeping last position"),
     }
+    // §10 M0 harness endpoint, written BEFORE the window is shown: the
+    // harness takes hotkey→visible as its injected-keydown QPC to the first
+    // DWM composition after this marker, and a marker placed after `show()`
+    // could postdate a fast present — the compositor would already have drawn
+    // the window, the harness would skip that composition, and the gated
+    // number would silently ride the next unrelated one.
+    etw_mark::mark("shown");
     if let Err(e) = window.show() {
         log::error!("window show failed: {e}");
         return;
@@ -92,6 +100,7 @@ fn dismiss(app: &AppHandle) {
     }
     // §5.2 step 3: hand focus back exactly where it was.
     focus::restore_foreground();
+    etw_mark::mark("hidden");
     let _ = app.emit("window:hidden", ());
     // Best effort: stop in-flight work for the current generation (§4.3 Cancel).
     if let Some(pipe) = app.try_state::<Arc<PipeClient>>() {
@@ -115,6 +124,23 @@ fn search(
 #[tauri::command]
 fn hide_window(app: AppHandle) -> Result<(), String> {
     dismiss(&app);
+    Ok(())
+}
+
+/// §10 M0 harness marker relay: the frontend cannot write ETW itself, so its
+/// measurement points (results applied in a rAF; hidden-rAF throttling
+/// observations) arrive here and go out through [`etw_mark::mark`].
+///
+/// Whitelisted by prefix: this is an unauthenticated local IPC surface, and a
+/// page bug must not be able to spray arbitrary strings into a trace someone
+/// is reading measurements off.
+#[tauri::command]
+fn m0_mark(text: String) -> Result<(), String> {
+    const ALLOWED: [&str; 2] = ["applied ", "rafgap "];
+    if !ALLOWED.iter().any(|p| text.starts_with(p)) || text.len() > 128 {
+        return Err("m0_mark: unrecognized marker".to_string());
+    }
+    etw_mark::mark(&text);
     Ok(())
 }
 
@@ -182,6 +208,7 @@ fn shell_open(path: &str) -> Result<(), String> {
 
 pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    etw_mark::init();
 
     let pipe = Arc::new(PipeClient::new());
 
@@ -203,7 +230,8 @@ pub fn run() {
             hide_window,
             frontend_ready,
             execute_action,
-            get_status
+            get_status,
+            m0_mark
         ])
         .setup(move |app| {
             pipe_client::spawn(app.handle().clone(), pipe.clone());

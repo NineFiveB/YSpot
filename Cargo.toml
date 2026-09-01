@@ -5,6 +5,7 @@ members = [
     "crates/yspot-index",
     "crates/yspot-indexd",
     "apps/shell/src-tauri",
+    "crates/yspot-m0",
 ]
 
 [workspace.package]
