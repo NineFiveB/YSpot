@@ -35,14 +35,27 @@
 //! never rebuilt and never sorted. What they replace was a
 //! `(folded_off, slot)` vec rebuilt from scratch and `sort_unstable`d on the
 //! first query after ANY mutation, then binary-searched once per raw hit.
+//!
+//! [`VolumeIndex::initials`] is the third: a fixed
+//! [`crate::matching::INITIALS_STRIDE`]-byte lane per slot, so the camel tier's
+//! hit → slot map is a divide. It replaces a packed arena plus a 12 B/entry
+//! span table that were rebuilt on the same trigger.
+//!
+//! [`VolumeIndex::charclass_bsi`] and the [`VolumeIndex::tri_present`] family
+//! are the last: an 8 B/entry bit-sliced character-class index that generates
+//! the fuzzy tier's candidates, and fixed-size exact membership sets over the
+//! arena's byte uni/bi/trigrams that let a query that cannot possibly hit skip
+//! the arena scan outright. Between them they retire the byte-trigram posting
+//! lists — 96 B/entry measured at 1M, larger than the entry table itself, the
+//! last structure any mutation invalidated, and the single line that held the
+//! index over its §3.4 memory cap.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use unicode_normalization::UnicodeNormalization;
 
-use crate::matching::Accel;
+use crate::matching::{initials_lane, INITIALS_STRIDE};
 use crate::{Hit, UsnEvent};
 
 /// Cycle/depth guard for parent-chain walks. NTFS practical depth is far
@@ -142,6 +155,72 @@ pub(crate) fn has_control_byte(s: &str) -> bool {
     s.bytes().any(|b| b < 0x20)
 }
 
+/// Character classes in [`VolumeIndex::charclass_bsi`]: 64, so one name's set
+/// of classes is a single `u64` mask and the index is 64 bit-slices.
+pub(crate) const BSI_CLASSES: usize = 64;
+
+/// `u64`s each bit-slice of [`VolumeIndex::charclass_bsi`] grows by: 4 KiB
+/// worth, i.e. 32,768 slots.
+///
+/// The 64 slices are laid out end to end, so widening one widens all of them —
+/// a restride that copies the whole array. A fixed chunk bounds both costs that
+/// trade off here: allocator overshoot at `64 × 4 KiB` = 256 KiB whatever the
+/// index's size (against the ~50% a doubling `Vec` carries), and the restride
+/// count at `slots / 32768` — 31 of them across a 1M-entry bulk load.
+const BSI_CHUNK_WORDS: usize = 512;
+
+/// Character class of a folded byte, for [`VolumeIndex::charclass_bsi`].
+///
+/// A pure function of the byte, applied identically to arena records and to the
+/// folded query — which is the entire soundness argument for the fuzzy tier's
+/// prefilter. If `q` is a char-subsequence of a name then every UTF-8 byte of
+/// `q` occurs among that name's bytes, so the name's class mask is a SUPERSET
+/// of the query's: zero false negatives. Survivors are still verified exactly
+/// by `fuzzy_density`, so zero false positives reach a result either.
+///
+/// The 64 classes are spent where folded names actually vary: one each for the
+/// 26 ASCII letters and the 10 digits, one each for the four separators the
+/// segmenter knows, then 8 buckets for the rest of ASCII and 16 for non-ASCII
+/// bytes. A collision only costs selectivity, never correctness.
+#[inline]
+pub(crate) fn class_of(b: u8) -> u8 {
+    match b {
+        b'a'..=b'z' => b - b'a',
+        b'0'..=b'9' => 26 + (b - b'0'),
+        b'-' => 36,
+        b'_' => 37,
+        b'.' => 38,
+        b' ' => 39,
+        0x00..=0x7f => 40 + (b & 7),
+        _ => 48 + (b & 15),
+    }
+}
+
+/// The set of [`class_of`] classes present in `folded`, as a bitmask.
+#[inline]
+pub(crate) fn class_mask(folded: &str) -> u64 {
+    let mut m = 0u64;
+    for &b in folded.as_bytes() {
+        m |= 1u64 << class_of(b);
+    }
+    m
+}
+
+/// `u64`s in [`VolumeIndex::tri_present`]: 2^24 bits, one per byte trigram.
+const TRI_WORDS: usize = 1 << 18;
+/// `u64`s in [`VolumeIndex::bi_present`]: 2^16 bits, one per byte bigram.
+const BI_WORDS: usize = 1 << 10;
+
+#[inline]
+fn bit_test(words: &[u64], v: usize) -> bool {
+    words[v >> 6] >> (v & 63) & 1 != 0
+}
+
+#[inline]
+fn bit_set(words: &mut [u64], v: usize) {
+    words[v >> 6] |= 1u64 << (v & 63);
+}
+
 /// One folded-arena record: where it starts, and the slot that appended it.
 /// 8 B.
 ///
@@ -229,10 +308,14 @@ pub struct RamBreakdown {
     pub arena_recs: u64,
     /// 64-byte-block index into `arena_recs`, 4 B per 64 B of folded arena.
     pub owner: u64,
-    /// Matcher accel: initials arena plus its span table.
+    /// Folded segment initials, [`INITIALS_STRIDE`] B per slot.
     pub initials: u64,
-    /// Matcher accel: byte-trigram postings; zero until the first fuzzy query.
-    pub trigrams: u64,
+    /// Bit-sliced character-class index, 8 B per slot. Replaced the
+    /// byte-trigram postings, which measured 96 B/entry at 1M.
+    pub charclass_bsi: u64,
+    /// Uni/bi/trigram presence sets. FIXED size — 2 MiB + 8 KiB + 32 B — so
+    /// this line does not scale with the index and is charged whole.
+    pub presence: u64,
 }
 
 impl RamBreakdown {
@@ -247,7 +330,8 @@ impl RamBreakdown {
             + self.arena_recs
             + self.owner
             + self.initials
-            + self.trigrams
+            + self.charclass_bsi
+            + self.presence
     }
 }
 
@@ -298,6 +382,63 @@ pub struct VolumeIndex {
     /// scan produces hits in ascending offset order both this array and
     /// `arena_recs` are read sequentially — they stream rather than missing.
     pub(crate) owner: Vec<u32>,
+    /// Folded segment initials, [`INITIALS_STRIDE`] bytes per slot and
+    /// NUL-padded: slot `i`'s lane is `initials[STRIDE·i .. STRIDE·(i+1)]`.
+    /// Indexed by slot, so it is exactly `STRIDE × entries.len()` long.
+    ///
+    /// The fixed stride is the whole point. A hit maps to its slot by one
+    /// divide and its containment test is one remainder, where the packed arena
+    /// this replaces needed a `partition_point` over a parallel
+    /// `(off, len, slot)` table — and that pair, arena and table both, was
+    /// cleared and refilled from a full sweep of the entry table on the first
+    /// query after ANY mutation. Maintained here at the two choke points
+    /// instead, at 8 B/entry flat against 28.2 B/entry measured at 1M.
+    ///
+    /// A tombstone's lane is zeroed, which is what keeps a deleted file out of
+    /// the tier: the column is scanned with no liveness check, and a folded
+    /// query can never contain a NUL (invariant I3) so a zeroed lane is inert.
+    pub(crate) initials: Vec<u8>,
+    /// Bit-sliced character-class index: [`BSI_CLASSES`] slices of
+    /// [`Self::bsi_words`] `u64`s laid end to end, slice `c` starting at
+    /// `c · bsi_words`, its bit `i` set iff slot `i`'s folded name contains a
+    /// byte of class `c` (see [`class_of`]).
+    ///
+    /// This generates the fuzzy tier's candidates, and it is what retired the
+    /// byte-trigram posting lists: 96 B/entry measured at 1M — larger than the
+    /// entry table — rebuilt from a full sweep after every single mutation, and
+    /// a prefilter with FALSE NEGATIVES on top of that (a gapped subsequence
+    /// carries none of the query's trigrams). 8 B/entry flat, maintained at the
+    /// two choke points, and a fuzzy query reads only the 4-8 slices its
+    /// classes name — ~1 MB at 1M — instead of intersecting posting lists.
+    ///
+    /// Bits are CLEARED at [`Self::unregister_slot`]. Not hygiene: slots are
+    /// recycled, so a stale union would accumulate and degrade the prefilter's
+    /// selectivity monotonically for the life of the index — silently, since it
+    /// only ever adds candidates that `fuzzy_density` then rejects.
+    pub(crate) charclass_bsi: Vec<u64>,
+    /// `u64`s per slice of [`Self::charclass_bsi`]; always a multiple of
+    /// [`BSI_CHUNK_WORDS`], and `bsi_words · 64` is the slot count the index
+    /// can currently address.
+    pub(crate) bsi_words: usize,
+    /// EXACT membership over the 2^24 byte trigrams of the folded arena's live
+    /// records (2 MiB, fixed). A query whose every 3-byte window is not in here
+    /// cannot produce a single arena hit, so Pass A is skipped outright.
+    ///
+    /// Set-only: a delete leaves its trigrams behind, so the set is exact for
+    /// the arena's HISTORY and a superset for its live contents. A stale bit
+    /// costs one wasted scan and can never cause a wrong result; compaction
+    /// (§3.7) rebuilds them.
+    ///
+    /// Gates Pass A and NOTHING else. Never the fuzzy pass: fuzzy does not
+    /// require contiguity, so a query with no trigram in the arena can still
+    /// have genuine subsequence matches. Never the initials pass either — the
+    /// column holds segment initials, which are not contiguous in any record.
+    pub(crate) tri_present: Box<[u64]>,
+    /// 2^16 bits over byte bigrams; see [`Self::tri_present`]. 8 KiB.
+    pub(crate) bi_present: Box<[u64]>,
+    /// 256 bits over single bytes; see [`Self::tri_present`]. Answers the
+    /// cheapest form of the same question, out of L1.
+    pub(crate) uni_present: [u64; 4],
     /// When a directory reparent armed the writer-side depth repair, or `None`
     /// if no repair is outstanding. See [`Self::repair_depths_slice`].
     depth_repair_armed: Option<Instant>,
@@ -307,10 +448,6 @@ pub struct VolumeIndex {
     /// sliced sweep stays O(n) in total rather than O(n·depth). Empty
     /// whenever no repair is running.
     depth_repair_state: Vec<u8>,
-    /// Lazily rebuilt matcher acceleration structures (§3.4 prefilters).
-    /// Mutex (not RefCell) so `search(&self)` stays `Sync`-safe behind an
-    /// outer `RwLock` in the service.
-    pub(crate) accel: Mutex<Accel>,
     /// Set by [`VolumeIndex::finalize`]: from then on the entry table and the
     /// arenas grow in fixed [`ENTRY_GROW_CHUNK`]/[`ARENA_GROW_CHUNK`] steps
     /// instead of doubling.
@@ -336,10 +473,15 @@ impl VolumeIndex {
             rank_key: Vec::new(),
             arena_recs: Vec::new(),
             owner: Vec::new(),
+            initials: Vec::new(),
+            charclass_bsi: Vec::new(),
+            bsi_words: 0,
+            tri_present: vec![0u64; TRI_WORDS].into_boxed_slice(),
+            bi_present: vec![0u64; BI_WORDS].into_boxed_slice(),
+            uni_present: [0u64; 4],
             depth_repair_armed: None,
             depth_repair_cursor: 0,
             depth_repair_state: Vec::new(),
-            accel: Mutex::new(Accel::new()),
             settled: false,
             frn_map_buckets: 0,
         }
@@ -374,6 +516,13 @@ impl VolumeIndex {
     /// Every full sweep of the entry table must go through this: a tombstone
     /// keeps its name in both arenas, so a sweep that misses one indexes a
     /// deleted file and returns it as a hit — wrong results, not a crash.
+    // The query path no longer sweeps the entry table at all — every pass now
+    // reads a column the mutations maintain — so this currently has only test
+    // callers (the differential reference sweeps per entry by construction).
+    // Kept, not deleted: step 9's compaction and step 10's invariant checks are
+    // both full sweeps, and this is where the rule they must obey is written
+    // down.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn live_entries(&self) -> impl Iterator<Item = (u32, &Entry)> {
         self.entries
             .iter()
@@ -396,9 +545,33 @@ impl VolumeIndex {
         &self.folded_arena[e.folded_off as usize..e.folded_off as usize + e.folded_len as usize]
     }
 
-    /// Poison-tolerant lock of the matcher acceleration structures.
-    pub(crate) fn accel_lock(&self) -> MutexGuard<'_, Accel> {
-        self.accel.lock().unwrap_or_else(|p| p.into_inner())
+    /// Whether the folded arena can possibly contain `q` — the Pass A skip.
+    ///
+    /// Every byte, every 2-byte window and every 3-byte window of a contiguous
+    /// occurrence of `q` is a byte, bigram and trigram of the record it occurs
+    /// in, so a single miss in [`Self::uni_present`]/[`Self::bi_present`]/
+    /// [`Self::tri_present`] proves the scan would find nothing. Tested
+    /// cheapest-first: 32 B out of L1, then 8 KiB, then the 2 MiB table.
+    ///
+    /// Answers a question about CONTIGUITY, which is why it gates Pass A and
+    /// only Pass A. The fuzzy tier matches subsequences and the initials tier
+    /// matches a column that is not in this arena at all; gating either on this
+    /// would drop genuine results.
+    pub(crate) fn arena_may_contain(&self, q: &[u8]) -> bool {
+        if q.iter().any(|&b| !bit_test(&self.uni_present, b as usize)) {
+            return false;
+        }
+        if q.windows(2)
+            .any(|w| !bit_test(&self.bi_present, (w[0] as usize) << 8 | w[1] as usize))
+        {
+            return false;
+        }
+        !q.windows(3).any(|w| {
+            !bit_test(
+                &self.tri_present,
+                (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+            )
+        })
     }
 
     /// Release bulk-load growth slack (§3.4 memory budget) and switch to
@@ -418,6 +591,10 @@ impl VolumeIndex {
         self.rank_key.shrink_to_fit();
         self.arena_recs.shrink_to_fit();
         self.owner.shrink_to_fit();
+        self.initials.shrink_to_fit();
+        // Length is 64 whole slices either way, so this hands back allocator
+        // overshoot without disturbing the stride.
+        self.charclass_bsi.shrink_to_fit();
         // The one place the map's allocation actually gets smaller, so the one
         // place the monotonic bucket count may be lowered.
         self.frn_map_buckets = 0;
@@ -604,11 +781,73 @@ impl VolumeIndex {
         }
     }
 
-    fn mark_dirty(&mut self) {
-        self.accel
-            .get_mut()
-            .unwrap_or_else(|p| p.into_inner())
-            .dirty = true;
+    /// Widen every [`Self::charclass_bsi`] slice until it addresses `slots`.
+    ///
+    /// The slices share one allocation, so widening is a RESTRIDE: each slice
+    /// has to move up to its new base. Done from the top down so a slice's
+    /// destination never overlaps a lower slice's not-yet-copied source, and
+    /// each slice's new tail is zeroed behind the copy — the bytes there are
+    /// the stale contents of whatever slice used to live at that offset, and
+    /// leaving them would set bits for slots that never claimed them.
+    ///
+    /// [`BSI_CHUNK_WORDS`] is what keeps this affordable: 32,768 slots per
+    /// chunk means 31 restrides across a 1M-entry bulk load, ~250 MB of copying
+    /// in total, and never more than 256 KiB of overshoot held.
+    fn grow_bsi(&mut self, slots: usize) {
+        let old = self.bsi_words;
+        if slots <= old * 64 {
+            return;
+        }
+        let new = slots.div_ceil(64).div_ceil(BSI_CHUNK_WORDS) * BSI_CHUNK_WORDS;
+        let want = BSI_CLASSES * new;
+        self.charclass_bsi
+            .reserve_exact(want - self.charclass_bsi.len());
+        self.charclass_bsi.resize(want, 0);
+        for c in (1..BSI_CLASSES).rev() {
+            self.charclass_bsi
+                .copy_within(c * old..c * old + old, c * new);
+            self.charclass_bsi[c * new + old..(c + 1) * new].fill(0);
+        }
+        self.charclass_bsi[old..new].fill(0); // slice 0 does not move
+        self.bsi_words = new;
+    }
+
+    /// Read `slot`'s class bits back out of the slices, as a mask.
+    ///
+    /// The inverse of [`Self::bsi_apply`], and the only way to observe the
+    /// column's most dangerous failure mode: a stale bit adds a fuzzy candidate
+    /// that `fuzzy_density` then rejects, so it produces no wrong result, no
+    /// crash and no test failure anywhere else — it just degrades the
+    /// prefilter's selectivity, permanently and invisibly.
+    #[cfg(test)]
+    pub(crate) fn bsi_mask_of(&self, slot: u32) -> u64 {
+        let (w, bit) = (slot as usize >> 6, 1u64 << (slot & 63));
+        let mut m = 0u64;
+        for c in 0..BSI_CLASSES {
+            if self.charclass_bsi[c * self.bsi_words + w] & bit != 0 {
+                m |= 1u64 << c;
+            }
+        }
+        m
+    }
+
+    /// Set (or clear) `slot`'s bit in every [`Self::charclass_bsi`] slice named
+    /// by `mask`. ~12 scattered word writes for a typical name.
+    fn bsi_apply(&mut self, slot: u32, mask: u64, set: bool) {
+        debug_assert!((slot as usize) < self.bsi_words * 64, "bsi not grown");
+        let (w, bit) = (slot as usize >> 6, 1u64 << (slot & 63));
+        let wps = self.bsi_words;
+        let mut m = mask;
+        while m != 0 {
+            let c = m.trailing_zeros() as usize;
+            m &= m - 1;
+            let word = &mut self.charclass_bsi[c * wps + w];
+            if set {
+                *word |= bit;
+            } else {
+                *word &= !bit;
+            }
+        }
     }
 
     /// NFC-normalize + fold `name` and append both forms to the arenas.
@@ -710,6 +949,14 @@ impl VolumeIndex {
         };
         let penalized = u8::from(flags & (crate::flags::HIDDEN | crate::flags::SYSTEM) != 0);
         let key = depth | (penalized * RANK_PENALIZED);
+        // Built from the ORIGINAL-case name, because the segmentation rule
+        // splits on camel transitions and the folded arena has thrown the case
+        // away. Staged into a `[u8; STRIDE]` before either column is touched:
+        // it borrows the name arena, and it is the one part of a `register_slot`
+        // that can be O(|name|).
+        let lane = initials_lane(
+            &self.name_arena[name_off as usize..name_off as usize + name_len as usize],
+        );
         let e = Entry {
             frn,
             parent_frn,
@@ -732,14 +979,55 @@ impl VolumeIndex {
                 if self.rank_key.len() == self.rank_key.capacity() {
                     self.rank_key.reserve_exact(ENTRY_GROW_CHUNK);
                 }
+                // Spare, not `len == capacity`: this column grows by whole
+                // lanes, so a capacity a few bytes short of the next lane would
+                // pass a `len == capacity` test and then double.
+                if self.initials.capacity() - self.initials.len() < INITIALS_STRIDE {
+                    self.initials
+                        .reserve_exact(ENTRY_GROW_CHUNK * INITIALS_STRIDE);
+                }
             }
             self.entries.push(e);
             self.rank_key.push(key);
+            self.initials.extend_from_slice(&lane);
         } else {
             self.entries[slot as usize] = e;
             self.rank_key[slot as usize] = key;
+            let off = slot as usize * INITIALS_STRIDE;
+            self.initials[off..off + INITIALS_STRIDE].copy_from_slice(&lane);
         }
         debug_assert_eq!(self.rank_key.len(), self.entries.len());
+        debug_assert_eq!(self.initials.len(), self.entries.len() * INITIALS_STRIDE);
+        // Character classes and arena n-grams, both read off the record
+        // `intern` has just appended. Disjoint field borrows, so the folded
+        // arena is read while the sets it feeds are written.
+        let mask = {
+            let folded =
+                &self.folded_arena[folded_off as usize..folded_off as usize + folded_len as usize];
+            let fb = folded.as_bytes();
+            let (uni, bi, tri) = (
+                &mut self.uni_present,
+                &mut self.bi_present,
+                &mut self.tri_present,
+            );
+            for &b in fb {
+                bit_set(uni, b as usize);
+            }
+            for w in fb.windows(2) {
+                bit_set(bi, (w[0] as usize) << 8 | w[1] as usize);
+            }
+            // Per RECORD, so no n-gram spans a delimiter and the sets answer
+            // only about text that is actually a name.
+            for w in fb.windows(3) {
+                bit_set(
+                    tri,
+                    (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+                );
+            }
+            class_mask(folded)
+        };
+        self.grow_bsi(slot as usize + 1);
+        self.bsi_apply(slot, mask, true);
         self.push_arena_rec(folded_off, slot);
         self.frn_map.insert(frn, slot);
         self.live_count += 1;
@@ -822,6 +1110,35 @@ impl VolumeIndex {
         // because a new occupant's depth is derived through `frn_map`, which
         // never holds a tombstone.
         self.rank_key[slot as usize] = RANK_DEPTH_MAX | RANK_PENALIZED;
+        // Zeroing the lane is what removes the entry from the initials tier —
+        // behavior, not hygiene. Pass B scans the column with no liveness check
+        // by design, and a folded query can never carry a NUL (invariant I3),
+        // so an all-NUL lane cannot produce a hit. Leaving it would answer
+        // camel queries with a deleted file until the slot was recycled.
+        let lane = slot as usize * INITIALS_STRIDE;
+        self.initials[lane..lane + INITIALS_STRIDE].fill(FOLDED_DELIM);
+        // ORDER IS LOAD-BEARING: the class mask is read from the STILL-LIVE
+        // record, so it must be taken before `erase_folded` NUL-fills it.
+        // Reversed, every clear would compute the mask of a run of NULs — one
+        // class, cleared for every slot — and the real bits would survive the
+        // slot they described. Slots are recycled, so that stale union
+        // accumulates and degrades the fuzzy prefilter's selectivity
+        // monotonically. It produces no wrong result and no crash (survivors
+        // are still verified), which is exactly why it needs an assertion and
+        // a test rather than a comment.
+        let mask = {
+            let folded = &self.folded_arena[folded_off..folded_off + folded_len];
+            debug_assert!(
+                folded.as_bytes().iter().any(|&b| b != FOLDED_DELIM),
+                "slot {slot}'s folded record was erased before its class bits were cleared"
+            );
+            class_mask(folded)
+        };
+        self.bsi_apply(slot, mask, false);
+        // The presence sets are deliberately NOT cleared: they are shared
+        // across records, so clearing one record's n-grams would unset n-grams
+        // other live names still carry. Set-only makes them a superset of the
+        // live arena, which is sound — a stale bit costs one wasted scan.
         self.erase_folded(folded_off, folded_len);
         self.dead_bytes += bytes;
         self.live_count -= 1;
@@ -880,7 +1197,6 @@ impl VolumeIndex {
             None => self.free_slots.pop().unwrap_or(self.entries.len() as u32),
         };
         self.register_slot(slot, frn, parent_frn, interned, flags);
-        self.mark_dirty();
     }
 
     /// Arm the depth repair if `slot` is a directory that is about to change
@@ -912,7 +1228,6 @@ impl VolumeIndex {
         // The slot keeps its place in the table and its (now dead) arena bytes
         // until rebuild (§3.7); the next create takes it back.
         self.free_slots.push(idx);
-        self.mark_dirty();
     }
 
     fn rename_entry(&mut self, frn: u64, new_parent_frn: u64, new_name: &str) {
@@ -930,7 +1245,6 @@ impl VolumeIndex {
         self.note_reparent(idx, new_parent_frn);
         self.unregister_slot(idx);
         self.register_slot(idx, frn, new_parent_frn, interned, flags);
-        self.mark_dirty();
     }
 
     /// Apply one decoded USN journal event (§3.3).
@@ -1022,8 +1336,9 @@ impl VolumeIndex {
         depth
     }
 
-    /// Approximate resident bytes per structure: vec/arena capacities, the
-    /// FRN map, and the lazily built matcher structures.
+    /// Approximate resident bytes per structure: vec/arena capacities, the FRN
+    /// map, and the matcher's own columns. Nothing here is built lazily any
+    /// more, so a cold index and a queried one report the same totals.
     ///
     /// `frn_map` is charged per hashbrown BUCKET, not per reported capacity.
     /// The table allocates a 16 B `(u64, u32)` payload (8 B key + 4 B value +
@@ -1045,7 +1360,8 @@ impl VolumeIndex {
         // direction for a hard cap. `frn_map_buckets` is therefore tracked
         // monotonically and only reset where the map actually shrinks.
         let frn_map = (self.frn_map_buckets * (std::mem::size_of::<(u64, u32)>() + 1)) as u64;
-        let accel = self.accel_lock().ram_parts();
+        let presence =
+            ((self.tri_present.len() + self.bi_present.len() + self.uni_present.len()) * 8) as u64;
         RamBreakdown {
             entries: (self.entries.capacity() * std::mem::size_of::<Entry>()) as u64,
             name_arena: self.name_arena.capacity() as u64,
@@ -1055,8 +1371,9 @@ impl VolumeIndex {
             rank_key: self.rank_key.capacity() as u64,
             arena_recs: (self.arena_recs.capacity() * std::mem::size_of::<ArenaRec>()) as u64,
             owner: (self.owner.capacity() * std::mem::size_of::<u32>()) as u64,
-            initials: accel.initials,
-            trigrams: accel.trigrams,
+            initials: self.initials.capacity() as u64,
+            charclass_bsi: (self.charclass_bsi.capacity() * std::mem::size_of::<u64>()) as u64,
+            presence,
         }
     }
 
@@ -1659,10 +1976,91 @@ mod tests {
         assert!(v.ram_bytes() > before);
     }
 
+    /// A delete must clear the slot's class bits, and it must read them off the
+    /// STILL-LIVE record to do it.
+    ///
+    /// This is the ordering trap in [`VolumeIndex::unregister_slot`]: the same
+    /// function NUL-fills the folded record, and computing the mask after that
+    /// erase would clear the single class NUL belongs to and leave every real
+    /// bit set. Nothing else would notice — a stale bit only adds a fuzzy
+    /// candidate, which `fuzzy_density` rejects — so the index would keep
+    /// answering correctly while its prefilter got monotonically worse for the
+    /// life of the process. Slots are recycled, so the stale union accumulates
+    /// rather than merely lingering.
+    #[test]
+    fn delete_clears_class_bits_before_the_record_is_erased() {
+        let mut v = ix();
+        v.add(1, 999, "zebra", 0);
+        let slot = v.frn_map[&1];
+        assert_eq!(v.bsi_mask_of(slot), class_mask("zebra"));
+
+        v.apply(UsnEvent::Delete { frn: 1 });
+        // Erase-then-mask would leave `class_mask("zebra")` minus NUL's class
+        // standing here.
+        assert_eq!(v.bsi_mask_of(slot), 0, "dead slot kept its class bits");
+
+        // And the recycled slot inherits nothing: `mud` shares no letter with
+        // `zebra`, so any survivor is a leftover.
+        v.add(2, 999, "mud", 0);
+        assert_eq!(v.frn_map[&2], slot, "slot was not recycled");
+        assert_eq!(v.bsi_mask_of(slot), class_mask("mud"));
+    }
+
+    /// A rename is a delete plus a create on ONE slot, so the same ordering
+    /// applies to the name it is renamed away from.
+    #[test]
+    fn rename_replaces_class_bits_rather_than_unioning_them() {
+        let mut v = ix();
+        v.add(1, 999, "zebra", 0);
+        let slot = v.frn_map[&1];
+        v.apply(UsnEvent::Rename {
+            frn: 1,
+            new_parent_frn: 999,
+            new_name: "mud".to_string(),
+        });
+        assert_eq!(v.frn_map[&1], slot, "rename must keep the slot");
+        assert_eq!(v.bsi_mask_of(slot), class_mask("mud"));
+    }
+
+    /// Widening the bit-slices moves all 64 of them inside one allocation.
+    /// Every slot's mask must survive that restride unchanged — a copy in the
+    /// wrong direction, or a tail left unzeroed, silently mixes one class's
+    /// bits into another's.
+    #[test]
+    fn bsi_restride_preserves_every_slots_classes() {
+        let mut v = ix();
+        // Past one BSI_CHUNK_WORDS' worth of slots (512 words × 64), so at
+        // least one restride has to have happened.
+        const N: u64 = 40_000;
+        for i in 0..N {
+            v.add(i + 1, 999, &format!("n{i}"), 0);
+        }
+        assert!(v.bsi_words > BSI_CHUNK_WORDS, "no restride was exercised");
+        assert_eq!(v.charclass_bsi.len(), BSI_CLASSES * v.bsi_words);
+        for i in 0..N {
+            let slot = v.frn_map[&(i + 1)];
+            let e = v.entries[slot as usize];
+            assert_eq!(
+                v.bsi_mask_of(slot),
+                class_mask(v.folded_of_entry(&e)),
+                "slot {slot}"
+            );
+        }
+    }
+
     #[test]
     fn ram_breakdown_sums_and_charges_hash_control_bytes() {
         let mut v = ix();
-        assert_eq!(v.ram_breakdown(), RamBreakdown::default()); // nothing allocated yet
+        // Nothing per-entry is allocated yet; the presence sets are fixed-size
+        // and exist from construction, which is exactly why they are their own
+        // line rather than folded into a per-entry one.
+        assert_eq!(
+            v.ram_breakdown(),
+            RamBreakdown {
+                presence: ((TRI_WORDS + BI_WORDS + 4) * 8) as u64,
+                ..RamBreakdown::default()
+            }
+        );
         for i in 0..1000u64 {
             v.add(i + 1, 999, &format!("file-{i}.txt"), 0);
         }
@@ -1681,10 +2079,26 @@ mod tests {
         // is charged before any search has run.
         assert!(b.arena_recs >= (1000 * std::mem::size_of::<ArenaRec>()) as u64);
         assert!(b.owner >= (v.folded_arena.len() / OWNER_BLOCK * 4) as u64);
-        // Accel is untouched until the first search.
-        assert_eq!((b.initials, b.trigrams), (0, 0));
-        assert!(!v.search("file-7", 4, &|| false).is_empty());
-        assert!(v.ram_breakdown().initials > 0);
+        // So is the initials column, as of the fixed stride: exactly one lane
+        // per slot, written by the mutation that minted the slot.
+        assert_eq!(b.initials, v.initials.capacity() as u64);
+        assert!(b.initials >= (1000 * INITIALS_STRIDE) as u64);
+        // The fuzzy prefilter is a column now, not a posting map a query
+        // builds: charged whole before any search runs, and 64 slices wide.
+        assert_eq!(
+            b.charclass_bsi,
+            (v.charclass_bsi.capacity() * 8) as u64,
+            "bsi charged at capacity"
+        );
+        assert_eq!(v.charclass_bsi.len(), BSI_CLASSES * v.bsi_words);
+        assert!(v.bsi_words * 64 >= 1000, "bsi must address every slot");
+        // Fixed-size sets: 2 MiB + 8 KiB + 32 B whatever the index holds.
+        assert_eq!(b.presence, ((TRI_WORDS + BI_WORDS + 4) * 8) as u64);
+        // Nothing is lazy any more, so a query that reaches every tier moves
+        // no line of the breakdown at all.
+        let before = v.ram_breakdown();
+        assert!(!v.search("ile-777", 4, &|| false).is_empty());
+        assert_eq!(v.ram_breakdown(), before);
     }
 
     #[test]

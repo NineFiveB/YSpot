@@ -24,20 +24,22 @@
 //! bytes fencing a hit give its tier outright and a delimiter-free query can
 //! only ever match inside a single record (hits are mapped to slots in O(1)
 //! through the index's `owner`/`arena_recs` pair, see [`slot_at`]);
-//! initials are substring-scanned in their own small arena; fuzzy candidates
-//! come from byte-trigram posting-list intersection, capped at
+//! initials are scanned in the index's fixed-stride [`INITIALS_STRIDE`]-byte
+//! column, where a hit maps to its slot by a divide and needs no table at all;
+//! fuzzy candidates come from byte-trigram posting-list intersection, capped at
 //! [`FUZZY_CAP`] scored candidates per query.
 //!
 //! `match_ranges` are UTF-16 code-unit ranges into the ORIGINAL (NFC) name
 //! (§5.13), computed only for the final top-K page via [`fold_with_map`].
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 use memchr::memmem;
 
 use crate::index::{
-    fold, has_control_byte, ArenaRec, Entry, VolumeIndex, DEPTH_PEN, FOLDED_DELIM, OWNER_SHIFT,
+    class_mask, fold, has_control_byte, ArenaRec, Entry, VolumeIndex, BSI_CLASSES, DEPTH_PEN,
+    FOLDED_DELIM, OWNER_SHIFT, RANK_DEPTH_MAX,
 };
 use crate::Hit;
 
@@ -62,122 +64,27 @@ fn is_sep_char(c: char) -> bool {
     matches!(c, '-' | '_' | '.' | ' ')
 }
 
-/// Matcher acceleration structures, owned by the index behind a `Mutex` and
-/// rebuilt lazily on the first search after any mutation (`dirty`).
-///
-/// Shrinking: the hit → slot map used to live here as a sorted
-/// `(folded_off, slot)` vec that was rebuilt and re-sorted on the first query
-/// after ANY mutation. It is now the index's own append-only
-/// `arena_recs`/`owner` pair, maintained at the mutation choke points and never
-/// rebuilt. Step 6 takes the initials arena the same way, and step 7 the
-/// trigrams — at which point this type and its mutex go away entirely.
-pub(crate) struct Accel {
-    /// Set by index mutations; cleared by [`Accel::ensure_basic`].
-    pub(crate) dirty: bool,
-    /// First char of each name segment (folded), all entries back to back.
-    initials_arena: String,
-    /// Per-entry span of `initials_arena`, in ascending offset order.
-    initials_spans: Vec<InitialsSpan>,
-    /// Byte-trigram posting lists over folded names; entry indices ascending.
-    /// Built lazily on the first fuzzy query after changes.
-    trigrams: Option<HashMap<[u8; 3], Vec<u32>>>,
+/// Longest folded query the fuzzy pass verifies from a stack buffer. Past it
+/// the query chars are collected once per SEARCH — never per candidate, which
+/// is the whole point of [`fuzzy_density`]'s signature.
+const FUZZY_QBUF: usize = 64;
+
+// Count of Pass A arena scans actually started, for the tests that assert a
+// presence-set miss returns without touching the arena. Thread-local, so the
+// test harness's parallel threads cannot see each other's scans.
+#[cfg(test)]
+thread_local! {
+    static ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[derive(Debug, Clone, Copy)]
-struct InitialsSpan {
-    off: u32,
-    len: u32,
-    entry: u32,
+#[cfg(test)]
+fn note_arena_scan() {
+    ARENA_SCANS.with(|c| c.set(c.get() + 1));
 }
 
-impl Accel {
-    pub(crate) fn new() -> Self {
-        Self {
-            dirty: true,
-            initials_arena: String::new(),
-            initials_spans: Vec::new(),
-            trigrams: None,
-        }
-    }
-
-    /// Rebuild the initials arena. Live entries only: a tombstoned slot keeps
-    /// its ORIGINAL-case name in the name arena, so a dead slot left in the
-    /// span table would map a hit back to a deleted file.
-    fn ensure_basic(&mut self, ix: &VolumeIndex) {
-        if !self.dirty {
-            return;
-        }
-        self.initials_arena.clear();
-        self.initials_spans.clear();
-        self.initials_spans.reserve(ix.len());
-        for (slot, e) in ix.live_entries() {
-            let name = ix.name_of_entry(e);
-            let off = self.initials_arena.len() as u32;
-            for (seg_start, _) in segment_spans(name) {
-                if let Some(c) = name[seg_start..].chars().next() {
-                    for lc in c.to_lowercase() {
-                        self.initials_arena.push(lc);
-                    }
-                }
-            }
-            let len = self.initials_arena.len() as u32 - off;
-            self.initials_spans.push(InitialsSpan {
-                off,
-                len,
-                entry: slot,
-            });
-        }
-
-        self.trigrams = None; // rebuilt lazily on the next fuzzy query
-        self.dirty = false;
-    }
-
-    fn ensure_trigrams(&mut self, ix: &VolumeIndex) {
-        if self.trigrams.is_some() {
-            return;
-        }
-        let mut map: HashMap<[u8; 3], Vec<u32>> = HashMap::new();
-        // Live entries only (see `ensure_basic`), and ascending slot order —
-        // the postings are intersected by binary search.
-        for (slot, e) in ix.live_entries() {
-            let bytes = ix.folded_of_entry(e).as_bytes();
-            for w in bytes.windows(3) {
-                let list = map.entry([w[0], w[1], w[2]]).or_default();
-                if list.last().copied() != Some(slot) {
-                    list.push(slot);
-                }
-            }
-        }
-        self.trigrams = Some(map);
-    }
-
-    /// Resident bytes per structure. Kept split rather than summed because
-    /// the trigram postings are the largest single line in the whole index
-    /// and a single total hides that (§4.3 attribution).
-    pub(crate) fn ram_parts(&self) -> AccelRam {
-        let trigrams = match &self.trigrams {
-            // key + bucket + Vec header per posting list, plus list payloads.
-            Some(tg) => {
-                (tg.len() * (3 + 8 + std::mem::size_of::<Vec<u32>>())
-                    + tg.values().map(|v| v.capacity() * 4).sum::<usize>()) as u64
-            }
-            None => 0,
-        };
-        AccelRam {
-            initials: (self.initials_arena.capacity()
-                + self.initials_spans.capacity() * std::mem::size_of::<InitialsSpan>())
-                as u64,
-            trigrams,
-        }
-    }
-}
-
-/// Per-structure resident bytes of [`Accel`]; folded into the index's
-/// [`crate::index::RamBreakdown`].
-pub(crate) struct AccelRam {
-    pub initials: u64,
-    pub trigrams: u64,
-}
+#[cfg(not(test))]
+#[inline(always)]
+fn note_arena_scan() {}
 
 /// Count folded-arena hits for `needle` — Pass 1's `memmem` scan with nothing
 /// attached to it: no hit→entry mapping, no tier classification, no ranking.
@@ -199,23 +106,47 @@ pub(crate) fn arena_scan_probe(ix: &VolumeIndex, needle: &str) -> usize {
     memmem::find_iter(ix.folded_arena.as_bytes(), fq.as_bytes()).count()
 }
 
-/// Byte spans of name segments in the ORIGINAL (NFC, original-case) name:
-/// maximal runs of non-separator chars (`-`, `_`, `.`, space), additionally
-/// split at lower→upper camel transitions (`FooBar` → `Foo`, `Bar`).
-pub(crate) fn segment_spans(name: &str) -> Vec<(usize, usize)> {
-    let mut spans = Vec::new();
+/// Width of one slot's lane in the index's initials column, in bytes.
+///
+/// A slot's folded segment initials occupy
+/// `initials[INITIALS_STRIDE·slot .. INITIALS_STRIDE·(slot+1)]`, NUL-padded, so
+/// a hit maps to its slot by one divide and its containment test is one
+/// remainder — no span table, no `partition_point`, and a flat 8 B/entry in
+/// place of a packed arena plus a 12 B/entry `(off, len, slot)` record.
+///
+/// The price is behavior change 2: initials past the eighth byte are LOST and a
+/// query wider than a lane cannot reach the tier at all (see
+/// [`initials_lane`]). Real names carry 2-4 segments; widening the tier is this
+/// one constant and 4 more B/entry.
+pub(crate) const INITIALS_STRIDE: usize = 8;
+
+/// Visit each segment of the ORIGINAL (NFC, original-case) `name`: maximal runs
+/// of non-separator chars (`-`, `_`, `.`, space), additionally split at
+/// lower→upper camel transitions (`FooBar` → `Foo`, `Bar`).
+///
+/// Allocation-free, and the single definition of the segmentation rule: `f`
+/// receives each segment's START (which is all the initials column and
+/// [`initials_ranges`] want) together with its end, so the allocating
+/// [`segment_spans`] is a wrapper over this same walk rather than a second copy
+/// of it. Returning `false` from `f` stops the walk — that is what lets a full
+/// initials lane abandon the rest of a long name instead of segmenting it.
+pub(crate) fn for_each_segment_start(name: &str, mut f: impl FnMut(usize, usize) -> bool) {
     let mut start: Option<usize> = None;
     let mut prev: Option<char> = None;
     for (i, c) in name.char_indices() {
         if is_sep_char(c) {
             if let Some(s) = start.take() {
-                spans.push((s, i));
+                if !f(s, i) {
+                    return;
+                }
             }
         } else {
             let camel = matches!(prev, Some(p) if p.is_lowercase() && c.is_uppercase());
             if camel {
                 if let Some(s) = start.take() {
-                    spans.push((s, i));
+                    if !f(s, i) {
+                        return;
+                    }
                 }
                 start = Some(i);
             } else if start.is_none() {
@@ -225,9 +156,68 @@ pub(crate) fn segment_spans(name: &str) -> Vec<(usize, usize)> {
         prev = Some(c);
     }
     if let Some(s) = start {
-        spans.push((s, name.len()));
+        f(s, name.len());
     }
+}
+
+/// Byte spans of `name`'s segments, collected. The allocating wrapper over
+/// [`for_each_segment_start`], kept for the final-page [`initials_ranges`] —
+/// which needs every segment's UTF-16 offset anyway — and for the tests that
+/// pin the segmentation rule down.
+pub(crate) fn segment_spans(name: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for_each_segment_start(name, |s, e| {
+        spans.push((s, e));
+        true
+    });
     spans
+}
+
+/// One slot's lane in the initials column: the folded first char of each of
+/// `name`'s segments, packed and NUL-padded to [`INITIALS_STRIDE`].
+///
+/// Allocation-free — this runs on the mutation path for every create, rename
+/// and same-FRN re-create.
+///
+/// **Truncation is per INITIAL, and it stops the walk.** An initial whose
+/// folded form does not fit is dropped whole and nothing after it is
+/// considered. Writing a partial UTF-8 sequence would leave bytes in the lane
+/// that spell no character; skipping a wide initial to fit a later narrow one
+/// would put initials in an order the name does not have, and a query matching
+/// that order would be a wrong result rather than a missing one. A missing
+/// result is the failure this tier is allowed to have (behavior change 2).
+pub(crate) fn initials_lane(name: &str) -> [u8; INITIALS_STRIDE] {
+    // Padded with the same byte the folded arena fences records with, for the
+    // same reason: invariant I3 keeps it out of every folded query, so padding
+    // is inert and a short lane cannot be matched into.
+    let mut lane = [FOLDED_DELIM; INITIALS_STRIDE];
+    let mut len = 0usize;
+    for_each_segment_start(name, |start, _| {
+        let Some(c) = name[start..].chars().next() else {
+            return true;
+        };
+        // `char::to_lowercase` is the same fold `fold` applies, and it can
+        // expand one char into several (U+0130 → `i` + U+0307), so the initial
+        // is staged whole before any of it is committed to the lane. The buffer
+        // is that iterator's own bound: at most 3 chars of at most 4 bytes.
+        let mut buf = [0u8; 3 * 4];
+        let mut n = 0usize;
+        for lc in c.to_lowercase() {
+            let need = lc.len_utf8();
+            if n + need > buf.len() {
+                return false;
+            }
+            lc.encode_utf8(&mut buf[n..n + need]);
+            n += need;
+        }
+        if len + n > INITIALS_STRIDE {
+            return false;
+        }
+        lane[len..len + n].copy_from_slice(&buf[..n]);
+        len += n;
+        true
+    });
+    lane
 }
 
 /// Fold an already-NFC name char-wise (same fold as [`fold`] given NFC input)
@@ -403,56 +393,105 @@ fn slot_at(
     Some(rec.slot)
 }
 
-fn initials_entry_at(spans: &[InitialsSpan], hit: usize, qlen: usize) -> Option<u32> {
-    let pos = spans.partition_point(|s| (s.off as usize) <= hit);
-    if pos == 0 {
-        return None;
+/// Visit every slot whose character-class set is a SUPERSET of `qmask`, in
+/// ascending slot order, stopping early if `f` returns `false`.
+///
+/// This is the fuzzy tier's whole candidate generator. It ANDs one bit-slice
+/// per class the query needs — 4-8 of them for a real query, ~1 MB of
+/// sequential reads at 1M entries — and pulls survivors out of the result with
+/// `trailing_zeros`. What it replaces is a `HashMap<[u8;3], Vec<u32>>` of
+/// posting lists: 96 B/entry resident, rebuilt from a full sweep of the entry
+/// table after every mutation, intersected by binary search, and UNSOUND as a
+/// subsequence prefilter (a gapped query carries none of its own trigrams).
+///
+/// A dead slot cannot survive: `unregister_slot` clears its bits, and a
+/// non-empty query names at least one class. Slots past the entry table cannot
+/// either — no bit is ever set for them.
+fn for_each_class_superset(
+    bsi: &[u64],
+    words_per_slice: usize,
+    words: usize,
+    qmask: u64,
+    mut f: impl FnMut(u32) -> bool,
+) {
+    // The class indices, once, so the inner loop is a walk over a short slice
+    // rather than a bit-scan per word.
+    let mut classes = [0u8; BSI_CLASSES];
+    let mut n = 0usize;
+    let mut m = qmask;
+    while m != 0 {
+        classes[n] = m.trailing_zeros() as u8;
+        m &= m - 1;
+        n += 1;
     }
-    let s = spans[pos - 1];
-    if hit + qlen <= s.off as usize + s.len as usize {
-        Some(s.entry)
-    } else {
-        None
+    let classes = &classes[..n];
+    for w in 0..words {
+        let mut acc = u64::MAX;
+        for &c in classes {
+            acc &= bsi[c as usize * words_per_slice + w];
+            if acc == 0 {
+                break;
+            }
+        }
+        while acc != 0 {
+            let b = acc.trailing_zeros();
+            acc &= acc - 1;
+            if !f((w * 64) as u32 + b) {
+                return;
+            }
+        }
     }
 }
 
-/// Subsequence match density of folded query `q` in folded `name`:
+/// Subsequence match density of the folded query `q` in the folded `name`:
 /// `matched_len / span` in chars, using the earliest-end window tightened
-/// backward (bounded two-pass, O(|name|)). `None` if `q` is not a
-/// subsequence of `name`.
-fn fuzzy_density(name: &str, q: &str) -> Option<f32> {
-    let nchars: Vec<char> = name.chars().collect();
-    let qchars: Vec<char> = q.chars().collect();
-    if qchars.is_empty() || qchars.len() > nchars.len() {
+/// backward (bounded two-pass, O(|name|)). `None` if `q` is not a subsequence
+/// of `name`.
+///
+/// **Allocation-free, and that is the reason for the `&[char]` query.** This is
+/// the fuzzy tier's verifier: it runs once per surviving candidate, up to
+/// [`FUZZY_CAP`] times per query. It used to `collect()` the name AND the query
+/// into a `Vec<char>` on every call — 40,000 allocations per query at the cap,
+/// paid to re-derive the same query each time. The query is now collected once
+/// per search by the caller (into a stack buffer where it fits) and the name is
+/// walked through `char_indices` in place.
+///
+/// The backward pass indexes chars while iterating bytes, so it tracks the char
+/// index down alongside `char_indices().rev()`; `span` is in CHARS either way,
+/// which is what keeps the density identical to the collecting version.
+fn fuzzy_density(name: &str, q: &[char]) -> Option<f32> {
+    if q.is_empty() {
         return None;
     }
     // Forward: earliest end of a subsequence match.
     let mut qi = 0usize;
-    let mut end = None;
-    for (i, &c) in nchars.iter().enumerate() {
-        if c == qchars[qi] {
+    let mut hit: Option<(usize, usize)> = None; // (char index, byte end)
+    for (ci, (bi, c)) in name.char_indices().enumerate() {
+        if c == q[qi] {
             qi += 1;
-            if qi == qchars.len() {
-                end = Some(i);
+            if qi == q.len() {
+                hit = Some((ci, bi + c.len_utf8()));
                 break;
             }
         }
     }
-    let end = end?;
+    let (end_char, end_byte) = hit?;
     // Backward from that end: latest start covering the query.
-    let mut qj = qchars.len();
-    let mut start = end;
-    for i in (0..=end).rev() {
-        if qj > 0 && nchars[i] == qchars[qj - 1] {
+    let mut qj = q.len();
+    let mut start_char = end_char;
+    let mut idx = end_char;
+    for (_, c) in name[..end_byte].char_indices().rev() {
+        if qj > 0 && c == q[qj - 1] {
             qj -= 1;
-            start = i;
+            start_char = idx;
             if qj == 0 {
                 break;
             }
         }
+        idx = idx.wrapping_sub(1);
     }
-    let span = (end - start + 1) as f32;
-    Some(qchars.len() as f32 / span)
+    let span = (end_char - start_char + 1) as f32;
+    Some(q.len() as f32 / span)
 }
 
 /// Per-tier §5.13 UTF-16 ranges into the ORIGINAL name, computed only for
@@ -707,9 +746,6 @@ pub(crate) fn search(
         return Vec::new();
     }
 
-    let mut accel = ix.accel_lock();
-    accel.ensure_basic(ix);
-
     let rank_key = &ix.rank_key;
     let mut sel = Selector::new(max_results, ix.entries.len());
     let finder = memmem::Finder::new(fq.as_bytes());
@@ -725,7 +761,14 @@ pub(crate) fn search(
     // as well as per hit, and hits have to be groupable by record. Advancing by
     // `qlen` after every hit reproduces `find_iter`'s non-overlapping matches
     // exactly, so nothing about which hits are seen changes here.
-    if !cancelled {
+    //
+    // Skipped outright when the presence sets prove the arena cannot contain
+    // the query — a few L1/L2 probes in place of a 24 MB scan, and the reason
+    // a query that matches nothing costs microseconds. It gates THIS pass and
+    // no other: the sets answer a question about contiguity, which neither the
+    // initials column nor the fuzzy tier asks.
+    if !cancelled && ix.arena_may_contain(fq.as_bytes()) {
+        note_arena_scan();
         let arena = ix.folded_arena.as_bytes();
         // Hoisted out of the hit loop: three slices read in ascending order,
         // so the mapping streams instead of chasing a `Vec` header per hit.
@@ -811,10 +854,20 @@ pub(crate) fn search(
         }
     }
 
-    // Pass B: camel/initials — substring scan of the initials arena.
-    if !cancelled && !sel.rejects(tier_upper_bound(Tier::Initials)) {
+    // Pass B: camel/initials — one scan of the fixed-stride initials column.
+    //
+    // Skipped outright for a query wider than a lane: such a needle can never
+    // satisfy the containment test below, so scanning for it is pure cost. That
+    // skip is what keeps the `exact` class off this array — at
+    // `INITIALS_STRIDE` B/entry it is several times the packed arena it
+    // replaces, and exact-match queries are exactly the long ones.
+    if !cancelled && qlen <= INITIALS_STRIDE && !sel.rejects(tier_upper_bound(Tier::Initials)) {
+        let lanes = &ix.initials[..];
+        debug_assert_eq!(lanes.len(), ix.entries.len() * INITIALS_STRIDE);
         let mut pend: Option<u32> = None;
-        for hit in finder.find_iter(accel.initials_arena.as_bytes()) {
+        let mut cursor = 0usize;
+        while let Some(rel) = finder.find(&lanes[cursor..]) {
+            let hit = cursor + rel;
             processed += 1;
             if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
                 cancelled = true;
@@ -824,9 +877,21 @@ pub(crate) fn search(
             if sel.rejects(tier_upper_bound(Tier::Initials)) {
                 break;
             }
-            let Some(slot) = initials_entry_at(&accel.initials_spans, hit, qlen) else {
+            if hit % INITIALS_STRIDE + qlen > INITIALS_STRIDE {
+                // Straddles two lanes, so it spells no name. Resume ONE byte
+                // on, not `qlen` on: a full lane has no NUL padding to fence
+                // it, so `…a | aab…` produces a straddling `aa` at the lane
+                // boundary whose rejection would otherwise skip the genuine
+                // `aa` starting the next lane — the same shape as the arena
+                // straddle SPEC DECISION 8 retired. Rejected hits are rare
+                // (they need a lane packed to all 8 bytes), so the byte-at-a-
+                // time resume costs nothing measurable.
+                cursor = hit + 1;
                 continue;
-            };
+            }
+            cursor = hit + qlen;
+            // The whole point of the fixed stride: no table, no search.
+            let slot = (hit / INITIALS_STRIDE) as u32;
             match pend {
                 Some(prev) if prev == slot => {}
                 Some(prev) => {
@@ -841,49 +906,120 @@ pub(crate) fn search(
         }
     }
 
-    // Pass C: fuzzy subsequence over trigram-intersection candidates.
+    // Pass C: fuzzy subsequence over character-class superset candidates.
     // Queries shorter than 3 bytes skip the tier entirely (§3.4), and so does
     // a page already filled above the fuzzy ceiling.
+    //
+    // Deliberately NOT gated on the presence sets, unlike Pass A. Fuzzy matches
+    // a SUBSEQUENCE, so a query whose trigrams appear nowhere in the arena can
+    // still have genuine matches — `abcd` against `a_b_c_d` is the canonical
+    // one, and it is precisely what the old trigram-intersection prefilter
+    // dropped (behavior change 1: this pass now returns strictly more).
     if !cancelled && qlen >= 3 && !sel.rejects(tier_upper_bound(Tier::Fuzzy)) {
-        accel.ensure_trigrams(ix);
-        let tg = accel.trigrams.as_ref().expect("just built");
-        let qb = fq.as_bytes();
-        let mut lists: Vec<&[u32]> = Vec::with_capacity(qb.len() - 2);
-        let mut all_present = true;
-        for w in qb.windows(3) {
-            match tg.get(&[w[0], w[1], w[2]]) {
-                Some(l) => lists.push(l.as_slice()),
-                None => {
-                    all_present = false;
+        // Collected ONCE per search, not once per candidate. Stack-resident for
+        // every query a human types; the `Vec` is the correctness fallback for
+        // a pipe-sized one, and is still a single allocation for the search
+        // rather than two per verified candidate.
+        let mut qbuf = ['\0'; FUZZY_QBUF];
+        let mut qvec: Vec<char> = Vec::new();
+        let qn = fq.chars().count();
+        let qchars: &[char] = if qn <= FUZZY_QBUF {
+            for (slot, c) in qbuf.iter_mut().zip(fq.chars()) {
+                *slot = c;
+            }
+            &qbuf[..qn]
+        } else {
+            qvec.extend(fq.chars());
+            &qvec
+        };
+
+        // Depth ceiling implied by the running floor. A fuzzy candidate's base
+        // is at most `tier_upper_bound(Fuzzy)` whatever its density, so at
+        // cached depth `d` it tops out at `0.5 · DEPTH_PEN[d]` — the
+        // unpenalized entry of the table, which bounds the hidden/system case
+        // too since that only multiplies by 0.85. Derived by walking the same
+        // table the scorer reads rather than from the closed form, so the
+        // comparison is bit-identical to the one `offer` would make. STRICT, as
+        // everywhere: on equality the candidate still has the `eidx` tie-break.
+        // `sel.floor` is `NEG_INFINITY` until the heap fills and never falls
+        // afterwards, so it needs no `full()` guard: before the page is full
+        // nothing compares below it and `d_max` stays wide open.
+        let mut d_max = RANK_DEPTH_MAX;
+        while d_max > 0 && tier_upper_bound(Tier::Fuzzy) * DEPTH_PEN[d_max as usize] < sel.floor {
+            d_max -= 1;
+        }
+
+        let (bsi, wps) = (&ix.charclass_bsi[..], ix.bsi_words);
+        let words = ix.entries.len().div_ceil(64).min(wps);
+        let qmask = class_mask(&fq);
+        // Whether a survivor is worth verifying at all, before it is counted or
+        // scored: already claimed by a strictly better tier, or too deep to
+        // reach the page.
+        let admits = |sel: &Selector, slot: u32| {
+            !sel.is_seen(slot) && rank_key[slot as usize] & RANK_DEPTH_MAX <= d_max
+        };
+
+        // Two passes over the slices rather than one pass into a candidate
+        // vector: the AND is ~1 MB of streaming reads at 1M, where the vector
+        // would be up to 4 MB of transient allocation on a query whose classes
+        // are common. The first pass only counts, by depth.
+        let mut by_depth = [0u32; RANK_DEPTH_MAX as usize + 1];
+        let mut survivors = 0usize;
+        for_each_class_superset(bsi, wps, words, qmask, |slot| {
+            if admits(&sel, slot) {
+                by_depth[(rank_key[slot as usize] & RANK_DEPTH_MAX) as usize] += 1;
+                survivors += 1;
+            }
+            true
+        });
+
+        // The FUZZY_CAP drain, SHALLOWEST FIRST (behavior change 9). Fuzzy base
+        // is ≤ 0.5 regardless of density, so `score = base · DEPTH_PEN[depth]`
+        // means a shallow candidate dominates a deep one whatever they contain:
+        // the candidates the cap drops are exactly the ones least able to reach
+        // the page. What it replaces was "the first 20,000 in arena order",
+        // which is an arbitrary subset. `cut` is the depth the budget runs out
+        // at and `quota` is how many of that depth still fit.
+        let mut cut = RANK_DEPTH_MAX as usize;
+        let mut quota = FUZZY_CAP;
+        if survivors > FUZZY_CAP {
+            let mut acc = 0usize;
+            for (d, &n) in by_depth.iter().enumerate() {
+                if acc + n as usize >= FUZZY_CAP {
+                    cut = d;
+                    quota = FUZZY_CAP - acc;
                     break;
                 }
+                acc += n as usize;
             }
         }
-        if all_present && !lists.is_empty() {
-            lists.sort_unstable_by_key(|l| l.len());
-            let (first, rest) = lists.split_first().expect("non-empty");
-            let mut scored = 0usize;
-            for &cand in first.iter() {
-                if sel.is_seen(cand) {
-                    continue; // already offered by a higher tier (fuzzy max 0.5 < 0.55)
-                }
-                if !rest.iter().all(|l| l.binary_search(&cand).is_ok()) {
-                    continue;
-                }
-                scored += 1;
-                if scored > FUZZY_CAP {
-                    break;
-                }
-                if scored.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
-                    cancelled = true;
-                    break;
-                }
-                let e = &ix.entries[cand as usize];
-                if let Some(density) = fuzzy_density(ix.folded_of_entry(e), &fq) {
-                    sel.offer(rank_key, cand, Tier::Fuzzy, 0.3 + 0.2 * density);
-                }
+
+        let mut scored = 0usize;
+        for_each_class_superset(bsi, wps, words, qmask, |slot| {
+            if !admits(&sel, slot) {
+                return true;
             }
-        }
+            let d = (rank_key[slot as usize] & RANK_DEPTH_MAX) as usize;
+            if d > cut {
+                return true;
+            }
+            if d == cut {
+                if quota == 0 {
+                    return true;
+                }
+                quota -= 1;
+            }
+            scored += 1;
+            if scored.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
+                cancelled = true;
+                return false;
+            }
+            let e = &ix.entries[slot as usize];
+            if let Some(density) = fuzzy_density(ix.folded_of_entry(e), qchars) {
+                sel.offer(rank_key, slot, Tier::Fuzzy, 0.3 + 0.2 * density);
+            }
+            true
+        });
     }
     if cancelled {
         log::trace!("search cancelled early; returning partial results");
@@ -922,6 +1058,20 @@ mod tests {
 
     fn approx(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-5
+    }
+
+    /// [`fuzzy_density`] with the query collected for you. The real caller
+    /// collects once per SEARCH into a stack buffer, which is the whole reason
+    /// the function takes `&[char]`; tests want to write the query as a
+    /// literal.
+    fn density(name: &str, q: &str) -> Option<f32> {
+        let qc: Vec<char> = q.chars().collect();
+        fuzzy_density(name, &qc)
+    }
+
+    /// Pass A arena scans started since the last call, and reset.
+    fn arena_scans_since() -> usize {
+        ARENA_SCANS.with(|c| c.replace(0))
     }
 
     #[test]
@@ -1049,6 +1199,90 @@ mod tests {
         assert_eq!(hits[0].match_ranges, vec![(0, 3), (7, 8)]);
     }
 
+    /// SPEC DECISION 1 / behavior change 1: a genuinely gapped subsequence now
+    /// reaches the fuzzy tier.
+    ///
+    /// **This fails on the prefilter it replaces.** Trigram intersection asks
+    /// for postings on `abc` and `bcd`; `abxcxd` carries neither, so the
+    /// lookup missed and the tier returned nothing — a false NEGATIVE in a
+    /// prefilter, and the exact reason bench.rs has to SYNTHESIZE
+    /// `plant_fuzzy_name` corpus members before the fuzzy class measures the
+    /// tier rather than the early-out. A character-class mask cannot have one:
+    /// every byte of a subsequence is a byte of the name, so the name's mask is
+    /// a superset by construction.
+    ///
+    /// The name is deliberately unsegmented. `a_b_c_d` — the shape the design
+    /// document quotes — would answer this query from the INITIALS tier at 0.7
+    /// whatever the fuzzy prefilter did, and would prove nothing.
+    #[test]
+    fn gapped_subsequence_reaches_the_fuzzy_tier() {
+        let mut v = ix();
+        v.add(1, 999, "abxcxd", 0);
+        // One segment, so its lane is "a" — the initials tier cannot answer.
+        assert_eq!(&initials_lane("abxcxd")[..1], b"a");
+        let hits = v.search("abcd", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 1);
+        // 4 chars matched over a span of 6.
+        assert!(approx(hits[0].score, 0.3 + 0.2 * (4.0 / 6.0)));
+        assert_eq!(hits[0].match_ranges, vec![(0, 2), (3, 4), (5, 6)]);
+    }
+
+    /// A presence-set miss must answer without touching the arena at all.
+    ///
+    /// The corpus is built so ONLY `tri_present` can decide: every byte and
+    /// every bigram of `abc` is in the arena, split across two names, and the
+    /// trigram is in neither. That is the case `byte_hist`-style filters
+    /// provably cannot catch, and it is why the set is exact rather than a
+    /// histogram.
+    #[test]
+    fn presence_miss_returns_empty_without_scanning_the_arena() {
+        let mut v = ix();
+        v.add(1, 999, "qab", 0);
+        v.add(2, 999, "bcq", 0);
+        for b in *b"abc" {
+            assert!(v.arena_may_contain(&[b]), "unigram {b} should be present");
+        }
+        assert!(v.arena_may_contain(b"ab") && v.arena_may_contain(b"bc"));
+        assert!(
+            !v.arena_may_contain(b"abc"),
+            "trigram must be the only miss"
+        );
+
+        arena_scans_since();
+        assert!(v.search("abc", 10, &no_cancel).is_empty());
+        assert_eq!(arena_scans_since(), 0, "the arena must not be scanned");
+
+        // Control, so the counter is proved to count: a query the arena does
+        // hold scans exactly once.
+        assert!(!v.search("qab", 10, &no_cancel).is_empty());
+        assert_eq!(arena_scans_since(), 1);
+    }
+
+    /// …and the same miss must NOT take the fuzzy tier down with it.
+    ///
+    /// The presence sets answer a question about CONTIGUITY. Fuzzy matches a
+    /// subsequence, so gating Pass C on them would delete exactly the results
+    /// behavior change 1 exists to add — silently, and only for queries whose
+    /// trigrams happen to be absent, which is the common case for a gapped
+    /// query. Same corpus as above plus one name that `abc` reaches by gap.
+    #[test]
+    fn presence_miss_does_not_suppress_a_fuzzy_hit() {
+        let mut v = ix();
+        v.add(1, 999, "qab", 0);
+        v.add(2, 999, "bcq", 0);
+        v.add(3, 999, "azbzc", 0);
+        assert!(!v.arena_may_contain(b"abc"));
+
+        arena_scans_since();
+        let hits = v.search("abc", 10, &no_cancel);
+        assert_eq!(arena_scans_since(), 0, "Pass A must still be skipped");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 3);
+        // 3 chars matched over a span of 5.
+        assert!(approx(hits[0].score, 0.3 + 0.2 * (3.0 / 5.0)));
+    }
+
     #[test]
     fn fuzzy_skipped_below_three_bytes() {
         let mut v = ix();
@@ -1170,6 +1404,166 @@ mod tests {
         assert_eq!(v.search("abc", 10, &no_cancel).len(), 1);
     }
 
+    /// BEHAVIOR CHANGE 2, asserted as a decision rather than discovered as a
+    /// surprise: the initials tier lives in a fixed [`INITIALS_STRIDE`]-byte
+    /// lane, so a name with more initials than fit LOSES the trailing ones, and
+    /// a query wider than a lane cannot reach the tier at all.
+    ///
+    /// Nine segments, nine initials, eight bytes of lane. The name is built so
+    /// none of the queries below can be answered by any other tier — its folded
+    /// form is `"al be ce de ee fe ge he ie"`, which contains none of `gh`,
+    /// `hi`, `abcdefgh` or `abcdefghi` — so every assertion is about Pass B
+    /// alone.
+    ///
+    /// What is NOT observable, and deliberately so: `search`'s
+    /// `qlen ≤ INITIALS_STRIDE` skip. A query wider than a lane could never
+    /// satisfy the containment test either, so the skip is a cost saving with
+    /// no result attached — which is exactly why it is safe to make.
+    #[test]
+    fn initials_past_the_eight_byte_lane_are_truncated() {
+        let mut v = ix();
+        v.add(1, 999, "Al Be Ce De Ee Fe Ge He Ie", 0);
+        assert_eq!(segment_spans("Al Be Ce De Ee Fe Ge He Ie").len(), 9);
+
+        // The lane holds the first eight initials, and only those.
+        let slot = v.frn_map[&1] as usize;
+        assert_eq!(
+            &v.initials[slot * INITIALS_STRIDE..(slot + 1) * INITIALS_STRIDE],
+            b"abcdefgh"
+        );
+
+        // Eight fit, and the tier answers for them.
+        let hits = v.search("abcdefgh", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert!(approx(hits[0].score, 0.7));
+        assert_eq!(v.search("gh", 10, &no_cancel).len(), 1);
+
+        // The ninth is gone: no query that needs it can reach the 0.7 tier.
+        // The nine-initial query does still come back — as a 0.372 FUZZY row,
+        // because those nine letters are a genuine gapped subsequence of the
+        // name and the class-mask prefilter no longer loses it (behavior
+        // change 1; trigram intersection returned nothing here). That is a
+        // different tier at half the score, so the initials truncation being
+        // signed off is unchanged.
+        let hits = v.search("abcdefghi", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].score < tier_base(Tier::Initials),
+            "must not reach the initials tier: {}",
+            hits[0].score
+        );
+        assert!(approx(hits[0].score, 0.3 + 0.2 * (9.0 / 25.0)));
+        // Two bytes: below the fuzzy floor (§3.4), so nothing at all.
+        assert!(v.search("hi", 10, &no_cancel).is_empty());
+    }
+
+    /// A rejected lane-straddling hit must not HIDE a real one — the initials
+    /// column's version of the arena straddle SPEC DECISION 8 retired.
+    ///
+    /// A lane packed to all eight bytes has no NUL padding to fence it, so a
+    /// needle can match across two lanes. That hit spells no name and is
+    /// rejected, but resuming `qlen` bytes on (what `find_iter` would do) skips
+    /// the byte after the boundary — and that byte is where the next lane, and
+    /// a genuine match, starts. Pass B therefore resumes ONE byte on after a
+    /// rejection.
+    ///
+    /// The arrangement is forced, not chosen: for a 2-byte needle the straddle
+    /// sits at lane byte 7, so the hidden match starts at the next lane's byte
+    /// 0, which requires `q[0] == q[1]`. Hence `"aa"`, a full lane ending in
+    /// `a`, and a next lane beginning `aa`.
+    #[test]
+    fn a_straddling_initials_hit_cannot_hide_a_real_one() {
+        let mut v = ix();
+        // Slot 0: eight segments → a full lane, last initial 'a'.
+        v.add(1, 999, "Zz Zz Zz Zz Zz Zz Zz Ab", 0);
+        // Slot 1: initials "aab", so "aa" starts its lane.
+        v.add(2, 999, "Ax Ay Bz", 0);
+        let (s0, s1) = (v.frn_map[&1] as usize, v.frn_map[&2] as usize);
+        assert_eq!(
+            &v.initials[s0 * INITIALS_STRIDE..(s0 + 1) * INITIALS_STRIDE],
+            b"zzzzzzza",
+            "slot 0's lane must be FULL for the straddle to form"
+        );
+        assert_eq!(
+            &v.initials[s1 * INITIALS_STRIDE..(s1 + 1) * INITIALS_STRIDE],
+            b"aab\0\0\0\0\0"
+        );
+        assert_eq!(s1, s0 + 1, "the lanes must be adjacent");
+        // Neither folded name contains "aa", so only the initials tier can
+        // answer — and it must, for the slot whose lane genuinely starts "aa".
+        let hits = v.search("aa", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 2);
+        assert!(approx(hits[0].score, 0.7));
+    }
+
+    /// A tombstoned slot's lane is zeroed, so the tier stops answering for it
+    /// immediately — Pass B scans the column with no liveness check, and NUL
+    /// can never appear in a folded query (invariant I3).
+    #[test]
+    fn a_deleted_entry_leaves_the_initials_tier() {
+        let mut v = ix();
+        v.add(1, 999, "Foo Bar.txt", 0);
+        v.add(2, 999, "Foo Qux.txt", 0);
+        assert_eq!(v.search("fb", 10, &no_cancel).len(), 1);
+        let slot = v.frn_map[&1] as usize;
+        v.apply(crate::UsnEvent::Delete { frn: 1 });
+        assert_eq!(
+            &v.initials[slot * INITIALS_STRIDE..(slot + 1) * INITIALS_STRIDE],
+            &[0u8; INITIALS_STRIDE]
+        );
+        assert!(v.search("fb", 10, &no_cancel).is_empty());
+        // The survivor is untouched, and a recycled slot answers for its new
+        // occupant only.
+        assert_eq!(v.search("fq", 10, &no_cancel).len(), 1);
+        v.add(3, 999, "Ping Pong.txt", 0);
+        assert_eq!(v.frn_map[&3] as usize, slot, "the slot must be recycled");
+        assert!(v.search("fb", 10, &no_cancel).is_empty());
+        assert_eq!(v.search("pp", 10, &no_cancel)[0].frn, 3);
+    }
+
+    /// A rename rewrites the lane in place, so the old initials stop matching
+    /// and the new ones start — no rebuild, and the same slot throughout.
+    #[test]
+    fn a_rename_rewrites_the_initials_lane_in_place() {
+        let mut v = ix();
+        v.add(1, 999, "Foo Bar.txt", 0);
+        let slot = v.frn_map[&1];
+        v.apply(crate::UsnEvent::Rename {
+            frn: 1,
+            new_parent_frn: 999,
+            new_name: "Quux Zed.txt".into(),
+        });
+        assert_eq!(v.frn_map[&1], slot);
+        assert!(v.search("fb", 10, &no_cancel).is_empty());
+        let hits = v.search("qz", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 1);
+        assert!(approx(hits[0].score, 0.7));
+    }
+
+    /// The lane packs FOLDED initials and never a partial character: an initial
+    /// whose folded form does not fit is dropped whole, and the walk stops
+    /// there rather than pulling a later, narrower initial into its place.
+    #[test]
+    fn initials_lane_is_folded_nul_padded_and_never_half_a_char() {
+        assert_eq!(&initials_lane("FooBar.txt"), b"fbt\0\0\0\0\0");
+        assert_eq!(&initials_lane("my-file.txt"), b"mft\0\0\0\0\0");
+        assert_eq!(&initials_lane("..."), &[0u8; INITIALS_STRIDE]);
+        // Exactly full, no padding.
+        assert_eq!(&initials_lane("a b c d e f g h"), b"abcdefgh");
+        // Two 3-byte CJK initials fit; a third would need 9 bytes of 8, so it
+        // is dropped WHOLE — never truncated to the two bytes that are free,
+        // which would leave the lane spelling no character at all.
+        let mut cjk = [0u8; INITIALS_STRIDE];
+        cjk[.."汉语".len()].copy_from_slice("汉语".as_bytes());
+        assert_eq!(initials_lane("汉 语 手 册"), cjk);
+        // …and the walk STOPS there: the one-byte 'z' that follows must not
+        // slide into the free bytes, which would spell an order of initials the
+        // name has not got and answer a query it should not.
+        assert_eq!(initials_lane("汉 语 手 z"), cjk);
+    }
+
     #[test]
     fn segment_spans_camel_and_separators() {
         assert_eq!(segment_spans("FooBar.txt"), vec![(0, 3), (3, 6), (7, 10)]);
@@ -1209,10 +1603,15 @@ mod tests {
 
     #[test]
     fn fuzzy_density_basics() {
-        assert!(approx(fuzzy_density("abcd", "abcd").unwrap(), 1.0));
-        assert!(approx(fuzzy_density("abcx_bcd", "abcd").unwrap(), 0.5));
-        assert_eq!(fuzzy_density("abc", "abd"), None);
-        assert_eq!(fuzzy_density("ab", "abc"), None);
+        assert!(approx(density("abcd", "abcd").unwrap(), 1.0));
+        assert!(approx(density("abcx_bcd", "abcd").unwrap(), 0.5));
+        assert_eq!(density("abc", "abd"), None);
+        assert_eq!(density("ab", "abc"), None);
+        assert_eq!(density("abc", ""), None);
+        // The verifier is allocation-free over multi-byte chars too: the
+        // backward pass counts CHARS while iterating bytes, so a name whose
+        // chars are 3 bytes wide must still score by char span, not byte span.
+        assert!(approx(density("汉x语", "汉语").unwrap(), 2.0 / 3.0));
     }
 
     // -----------------------------------------------------------------
@@ -1457,46 +1856,48 @@ mod tests {
             }
         }
 
-        // Pass B, over the initials arena as `Accel::ensure_basic` lays it out,
-        // straddle rejection included — this is the tier's candidate set as it
-        // stands today, not as step 6 will rebuild it.
-        let mut arena = String::new();
-        let mut spans: Vec<(usize, usize, u32)> = Vec::new();
-        for (slot, e) in ix.live_entries() {
-            let name = ix.name_of_entry(e);
-            let off = arena.len();
-            for (seg, _) in segment_spans(name) {
-                if let Some(c) = name[seg..].chars().next() {
-                    arena.extend(c.to_lowercase());
-                }
-            }
-            spans.push((off, arena.len() - off, slot));
-        }
-        for hit in memmem::find_iter(arena.as_bytes(), fq.as_bytes()) {
-            if let Some(&(off, len, slot)) = spans.iter().rev().find(|s| s.0 <= hit) {
-                if hit + fq.len() <= off + len {
+        // Pass B, per entry rather than over the column: a query wider than a
+        // lane cannot reach the tier at all (behavior change 2), and otherwise
+        // a slot matches exactly when the folded query occurs inside its own
+        // lane. That equivalence is what the real pass's byte-at-a-time resume
+        // on a straddling hit buys — without it a rejected hit at a lane
+        // boundary could skip a genuine match starting the next lane, and this
+        // reference would be wrong rather than merely simpler.
+        if fq.len() <= INITIALS_STRIDE {
+            for (slot, e) in ix.live_entries() {
+                let lane = initials_lane(ix.name_of_entry(e));
+                if memmem::find(&lane, fq.as_bytes()).is_some() {
                     upgrade_ref(&mut best, slot, Tier::Initials, tier_base(Tier::Initials));
                 }
             }
         }
 
-        // Pass C. The trigram prefilter is modelled directly: a posting list
-        // for a trigram holds exactly the live slots whose folded name contains
-        // it, so the intersection is "contains every 3-byte window".
+        // Pass C, with NO prefilter at all — every live slot the higher tiers
+        // did not claim is verified directly.
+        //
+        // That is the reference precisely because the real pass has one. The
+        // class-mask prefilter is SOUND: if `fq` is a char-subsequence of a
+        // folded name then every byte of `fq` occurs in it, so its class mask
+        // is a superset and the slot survives the AND. So "survivors, verified"
+        // and "everything, verified" have to agree exactly, and any class-map
+        // or bit-slice bug — a bit set for the wrong slot, a bit not cleared on
+        // delete, a restride that lost a slice — shows up here as a missing
+        // row. Modelling the filter instead would only re-assert it.
+        //
+        // The trigram intersection this replaced could NOT be dropped from the
+        // reference, because it had false negatives (behavior change 1): the
+        // reference had to reproduce which genuine subsequences the prefilter
+        // silently lost. That it can now be dropped is the change.
+        //
+        // `FUZZY_CAP` cannot bind at this corpus size, so the depth-bucketed
+        // drain is a no-op here and the reference needs no notion of it.
         if fq.len() >= 3 {
+            let qc: Vec<char> = fq.chars().collect();
             for (slot, e) in ix.live_entries() {
                 if best.contains_key(&slot) {
                     continue;
                 }
-                let rec = ix.folded_of_entry(e);
-                if !fq
-                    .as_bytes()
-                    .windows(3)
-                    .all(|w| memmem::find(rec.as_bytes(), w).is_some())
-                {
-                    continue;
-                }
-                if let Some(density) = fuzzy_density(rec, &fq) {
+                if let Some(density) = fuzzy_density(ix.folded_of_entry(e), &qc) {
                     upgrade_ref(&mut best, slot, Tier::Fuzzy, 0.3 + 0.2 * density);
                 }
             }

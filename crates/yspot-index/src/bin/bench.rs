@@ -321,7 +321,13 @@ const FUZZY_STEMS: &[(&str, &str)] = &[
 ];
 
 /// Nothing in the vocabulary produces these, so they exercise the "query
-/// matched nothing" path (and, at ≥ 3 bytes, the trigram early-out).
+/// matched nothing" path — and, at ≥ 3 bytes, the `tri_present` early-out that
+/// skips the whole arena scan.
+///
+/// They must miss the WIDENED fuzzy prefilter too, not just contiguous
+/// matching: each is six rare letters, so a hit would need all six as an
+/// in-order subsequence of one name. `every_query_class_hits_the_corpus`
+/// asserts that on a 30k corpus.
 const NO_MATCH_QUERIES: &[&str] = &["zqxjvw", "qzzxwv", "jjqxzv", "xkqvzz", "wvzqxj", "zzqjxv"];
 
 /// Very common 4-byte substrings for the candidate-volume worst case. Every
@@ -516,14 +522,21 @@ fn join(out: &mut String, words: &[&str], sep: char, title: bool) {
 
 /// Build one member of the planted fuzzy family, returning `(name, query)`.
 ///
-/// The fuzzy tier's prefilter (§3.4) keeps only entries whose folded name
-/// contains **every** trigram of the query. Organic corpora almost never
-/// satisfy that for a genuinely gapped subsequence, so without planting, the
-/// fuzzy class degenerates into "trigram lookup misses, return nothing" and
-/// measures the early-out instead of the tier. These names are built so the
-/// query's trigrams all occur while the query itself does not occur
-/// contiguously: `stem + "_" + last3(stem) + tail` against query `stem + tail`.
-/// Example: `telemetry_tryagg.log` vs query `telemetryagg`.
+/// These names exist because the fuzzy tier's prefilter USED to keep only
+/// entries whose folded name contained **every trigram** of the query. Organic
+/// corpora almost never satisfy that for a genuinely gapped subsequence, so
+/// without planting, the class degenerated into "trigram lookup misses, return
+/// nothing" and measured the early-out instead of the tier. So the family is
+/// built to carry every trigram while not carrying the query contiguously:
+/// `stem + "_" + last3(stem) + tail` against query `stem + tail`, e.g.
+/// `telemetry_tryagg.log` vs `telemetryagg`.
+///
+/// The prefilter is now a character-class superset test, which has no false
+/// negatives, so the planting is no longer NEEDED for the class to fire — that
+/// the harness ever had to do this is the evidence behavior change 1 rests on.
+/// It is kept because it pins the class to a known family with a known density,
+/// which is what makes the tier's timings comparable across runs; an organic
+/// gapped query would now match, but a different set of names on every seed.
 fn plant_fuzzy_name(rng: &mut Rng, which: usize) -> (String, String) {
     let (stem, tail) = FUZZY_STEMS[which % FUZZY_STEMS.len()];
     let bridge = &stem[stem.len() - 3..];
@@ -1018,9 +1031,9 @@ struct Report {
     ram_pass: bool,
 
     cold_basic_us: f64,
-    cold_trigram_us: f64,
+    cold_fuzzy_us: f64,
     mutation_basic_us: f64,
-    mutation_trigram_us: f64,
+    mutation_fuzzy_us: f64,
     scan_probe_stats: Stats,
     scan_probe_hits: usize,
     path_of_stats: Stats,
@@ -1037,7 +1050,11 @@ const RAM_ACCOUNTING_NOTE: &str = "\
               and capacity() reports only 7/8 of the buckets. That line is ~21% larger than the
               capacity()*16 it replaced, so totals RISE against pre-fix runs: a corrected
               accounting bug, not a memory regression. finish() then pulls them back down by
-              handing back bulk-load doubling slack, which IS a real reduction.";
+              handing back bulk-load doubling slack, which IS a real reduction.
+              NOTE: accel:trigrams is gone. The byte-trigram posting lists measured 96 B/entry
+              warm at 1M — larger than the entry table — and are replaced by charclass_bsi at a
+              flat 8 B/entry plus a fixed 2.1 MB of presence sets. That IS a real reduction, and
+              it is the line that decides the §3.4 cap.";
 
 /// Printed with the isolated Pass-A probe; see [`SCAN_PROBE_NEEDLE`].
 const SCAN_PROBE_NOTE: &str = "\
@@ -1054,7 +1071,7 @@ M0 sign-off requires numbers from reference Machine A and Machine B.";
 
 /// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
 /// object cannot drift apart.
-fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 10] {
+fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 11] {
     [
         ("entries", b.entries),
         ("name_arena", b.name_arena),
@@ -1064,8 +1081,9 @@ fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 10] {
         ("rank_key", b.rank_key),
         ("arena_recs", b.arena_recs),
         ("owner", b.owner),
-        ("accel:initials", b.initials),
-        ("accel:trigrams", b.trigrams),
+        ("initials", b.initials),
+        ("charclass_bsi", b.charclass_bsi),
+        ("presence", b.presence),
     ]
 }
 
@@ -1095,7 +1113,9 @@ impl Report {
     /// have been built, which is where the trigram postings appear.
     fn print_ram_table(&self) {
         println!(
-            "ram_bytes by structure — cold = after finish(), warm = after the accel is built:"
+            "ram_bytes by structure — cold = after finish(); warm = after the probe queries and
+the one UsnEvent::Create below. Nothing is built lazily any more, so the two differ
+only by that one entry — the trigram postings that used to appear between them are gone:"
         );
         println!(
             "{:<20} {:>14} {:>14} {:>10} {:>12}",
@@ -1176,25 +1196,31 @@ impl Report {
         println!("{}", "-".repeat(96));
         self.print_ram_table();
         println!("{}", "-".repeat(96));
-        println!("lazy accel-structure rebuild cost (§3.4 prefilters build on first use):");
         println!(
-            "  cold first query (2-char, builds the initials arena)            : {:>12.1} µs",
+            "first-query and post-mutation cost (§3.4 prefilters used to build on first use):"
+        );
+        // Every prefilter is now a column the mutations maintain — the initials
+        // lane, the hit → slot map, the character-class slices, the presence
+        // sets. NOTHING is built on the query path, so all four rows are
+        // steady-state latency and the pair below is the tripwire that says so:
+        // a mutation row well above its cold row means something started
+        // rebuilding again. The 3-char rows were 286 ms and 310 ms at 1M while
+        // the trigram postings still existed.
+        println!(
+            "  cold first query (2-char; below the fuzzy floor)                : {:>12.1} µs",
             self.cold_basic_us
         );
-        // The 3-char rows no longer imply a trigram build: a full page above the
-        // 0.5 fuzzy ceiling now skips the whole fuzzy pass, postings included.
-        // `ram_warm` is measured after a query that does reach the tier.
         println!(
-            "  cold first query (3-char; trigrams only if the fuzzy tier runs) : {:>12.1} µs",
-            self.cold_trigram_us
+            "  cold first query (3-char; can reach the fuzzy tier)             : {:>12.1} µs",
+            self.cold_fuzzy_us
         );
         println!(
-            "  after ONE UsnEvent::Create, next 2-char query (initials rebuild): {:>12.1} µs",
+            "  after ONE UsnEvent::Create, next 2-char query (nothing rebuilt) : {:>12.1} µs",
             self.mutation_basic_us
         );
         println!(
-            "  after ONE UsnEvent::Create, next 3-char query (initials rebuild): {:>12.1} µs",
-            self.mutation_trigram_us
+            "  after ONE UsnEvent::Create, next 3-char query (nothing rebuilt) : {:>12.1} µs",
+            self.mutation_fuzzy_us
         );
         println!(
             "  path_of() for {} results (p50/p95)                              : {:>12.1} / \
@@ -1338,12 +1364,9 @@ impl Report {
         );
         let _ = write!(
             s,
-            ",\"lazy_rebuild_us\":{{\"cold_basic\":{:.1},\"cold_trigrams\":{:.1},\
-             \"after_one_usn_event_basic\":{:.1},\"after_one_usn_event_trigrams\":{:.1}}}",
-            self.cold_basic_us,
-            self.cold_trigram_us,
-            self.mutation_basic_us,
-            self.mutation_trigram_us
+            ",\"lazy_rebuild_us\":{{\"cold_basic\":{:.1},\"cold_fuzzy\":{:.1},\
+             \"after_one_usn_event_basic\":{:.1},\"after_one_usn_event_fuzzy\":{:.1}}}",
+            self.cold_basic_us, self.cold_fuzzy_us, self.mutation_basic_us, self.mutation_fuzzy_us
         );
         let _ = write!(
             s,
@@ -1485,11 +1508,12 @@ fn run(cfg: &Config) -> Report {
     let (corpus_dirs, corpus_files, gen_ms) = (corpus.dirs, corpus.files, corpus.gen_ms);
     drop(corpus);
 
-    // --- Lazy accel-structure cost, measured before anything is warm. -------
-    // First search ever: pays Accel::ensure_basic (the initials arena; the
-    // hit → slot map is NOT built here any more — `arena_recs`/`owner` are
-    // maintained at the mutation choke points). A 2-char query stops there —
-    // the fuzzy tier is skipped below 3 bytes (§3.4).
+    // --- First-query cost, measured before anything is warm. ----------------
+    // The first search this index has ever served. Nothing lazy is left at any
+    // query length: the initials column, the hit → slot map, the character-
+    // class slices and the presence sets are all maintained at the mutation
+    // choke points, so both rows are steady-state latency now. They are kept
+    // because the mutation pair below is only readable against them.
     let cold2 = queries
         .initials2
         .first()
@@ -1505,12 +1529,14 @@ fn run(cfg: &Config) -> Report {
     let cold_basic_us = us(t);
     let t = Instant::now();
     std::hint::black_box(ix.search(&cold3, cfg.max_results, &|| false));
-    let cold_trigram_us = us(t);
+    let cold_fuzzy_us = us(t);
 
-    // One USN create marks the accel dirty, which discards the initials arena
-    // and the trigram postings. This is the per-keystroke-after-a-file-change
-    // worst case and a §2.5 risk in its own right — it shrinks with every
-    // structure that moves out of `Accel` into incremental maintenance.
+    // A USN create now discards NOTHING. This is the
+    // per-keystroke-after-a-file-change worst case and it was the headline §2.5
+    // failure: 167 ms at 300k, 310 ms at 1M, all of it rebuilding trigram
+    // postings a single event had thrown away. These two rows should now read
+    // as the two above them, and any gap between the pairs means a structure
+    // started being rebuilt on the query path again.
     ix.apply(UsnEvent::Create {
         frn: frn_of(corpus_generated + 1),
         parent_frn: ROOT_FRN,
@@ -1522,19 +1548,16 @@ fn run(cfg: &Config) -> Report {
     let mutation_basic_us = us(t);
     let t = Instant::now();
     std::hint::black_box(ix.search(&cold3, cfg.max_results, &|| false));
-    let mutation_trigram_us = us(t);
+    let mutation_fuzzy_us = us(t);
 
-    // One query that actually REACHES the fuzzy tier, so `ram_warm` charges the
-    // trigram postings.
-    //
-    // It stopped being automatic once the matcher gained a floor: the 3-char
-    // probes above fill a 32-result page from the initials tier, the floor
-    // climbs past the 0.5 fuzzy ceiling, and the whole fuzzy pass — including
-    // building the postings — is skipped. That is the intended latency win, but
-    // it would leave the largest single structure in the index reported as 0 B
-    // while a fuzzy query still builds it. Warm has to mean every structure a
-    // served index can hold, or the §3.4 memory budget is measured against a
-    // number that is simply not the index.
+    // One query that actually reaches the fuzzy tier before `ram_warm` is
+    // taken. It no longer changes the number — the tier's prefilter is a column
+    // charged from the moment the entry is interned — and that is precisely
+    // what this now checks: cold and warm should differ ONLY by the one
+    // `UsnEvent::Create` above. A gap means something is being allocated on the
+    // query path again, which is what `ram_warm` existed to catch when the
+    // trigram postings (96 B/entry, the largest line in the whole index) were
+    // built by whichever keystroke first reached 3 bytes.
     if let Some(q) = fuzzy_queries.first() {
         std::hint::black_box(ix.search(q, cfg.max_results, &|| false));
     }
@@ -1597,7 +1620,7 @@ fn run(cfg: &Config) -> Report {
         measure_class(
             &ix,
             "initials-3",
-            "tier 0.7; §10 M0 3-char worst case (single trigram → widest posting list)",
+            "tier 0.7; §10 M0 3-char worst case (shortest query that reaches the fuzzy tier)",
             queries.initials3,
             it,
             mr,
@@ -1622,7 +1645,7 @@ fn run(cfg: &Config) -> Report {
         measure_class(
             &ix,
             "no-match",
-            "trigram early-out",
+            "tri_present early-out: Pass A skipped entirely",
             NO_MATCH_QUERIES.iter().map(|s| s.to_string()).collect(),
             it,
             mr,
@@ -1658,9 +1681,9 @@ fn run(cfg: &Config) -> Report {
         ram_budget_cap,
         ram_pass,
         cold_basic_us,
-        cold_trigram_us,
+        cold_fuzzy_us,
         mutation_basic_us,
-        mutation_trigram_us,
+        mutation_fuzzy_us,
         scan_probe_stats: stats(scan_samples),
         scan_probe_hits,
         path_of_stats: stats(path_samples),
