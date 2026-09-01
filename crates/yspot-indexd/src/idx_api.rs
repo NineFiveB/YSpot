@@ -39,15 +39,6 @@ pub fn path_of(idx: &VolumeIndex, frn: u64) -> Option<String> {
     idx.path_of(frn)
 }
 
-pub fn search(
-    idx: &VolumeIndex,
-    query: &str,
-    max_results: usize,
-    is_cancelled: &dyn Fn() -> bool,
-) -> Vec<yspot_index::Hit> {
-    idx.search(query, max_results, is_cancelled)
-}
-
 pub fn apply_usn(idx: &mut VolumeIndex, ev: UsnEvent) {
     idx.apply(ev);
 }
@@ -102,4 +93,16 @@ pub fn is_access_denied(e: &anyhow::Error) -> bool {
             .downcast_ref::<std::io::Error>()
             .is_some_and(|io| io.raw_os_error() == Some(5))
     })
+}
+
+/// [`search`] with a name predicate applied during ranking rather than after,
+/// so a filtered page fills with `max_results` ACCEPTED hits (§4.3 filters).
+pub fn search_filtered(
+    idx: &VolumeIndex,
+    query: &str,
+    max_results: usize,
+    is_cancelled: &dyn Fn() -> bool,
+    accept: &dyn Fn(&str) -> bool,
+) -> Vec<yspot_index::Hit> {
+    idx.search_filtered(query, max_results, is_cancelled, accept)
 }

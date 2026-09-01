@@ -643,8 +643,14 @@ impl Ord for Scored {
 /// the current 2K-th. `≥`/`≤` rules would discard those tie-break winners —
 /// a wrong-results bug that changes nothing an existing test asserts, which is
 /// why the differential test in this module's tests exists.
-struct Selector {
+struct Selector<'a> {
     heap: BinaryHeap<Reverse<Scored>>,
+    /// Caller-supplied acceptance test on a slot, applied BEFORE the offer is
+    /// scored. Pushing a filter in here rather than discarding rows afterwards
+    /// is what lets a filtered query fetch exactly `max_results`: post-filtering
+    /// has to over-fetch a guessed multiple and still silently under-returns
+    /// when the filter is selective enough that the guess was wrong.
+    accept: &'a dyn Fn(u32) -> bool,
     /// `2·max_results`.
     cap: usize,
     /// Score of the current 2K-th best offer. Meaningful only once the heap is
@@ -656,10 +662,11 @@ struct Selector {
     seen: Vec<u64>,
 }
 
-impl Selector {
-    fn new(max_results: usize, slots: usize) -> Self {
+impl<'a> Selector<'a> {
+    fn new(max_results: usize, slots: usize, accept: &'a dyn Fn(u32) -> bool) -> Self {
         let cap = max_results.saturating_mul(2).max(1);
         Self {
+            accept,
             heap: BinaryHeap::with_capacity(cap),
             cap,
             floor: f32::NEG_INFINITY,
@@ -688,7 +695,12 @@ impl Selector {
     /// Score `slot` and admit it. `rank_key` supplies depth and the
     /// hidden/system penalty in one byte — no entry read, no parent walk.
     fn offer(&mut self, rank_key: &[u8], slot: u32, tier: Tier, base: f32) {
+        // Marked seen either way: a slot the filter rejects stays rejected, so
+        // recording it here also stops later passes re-testing it.
         self.seen[slot as usize >> 6] |= 1 << (slot & 63);
+        if !(self.accept)(slot) {
+            return;
+        }
         let s = Scored {
             score: base * DEPTH_PEN[rank_key[slot as usize] as usize],
             eidx: slot,
@@ -727,6 +739,7 @@ pub(crate) fn search(
     query: &str,
     max_results: usize,
     is_cancelled: &dyn Fn() -> bool,
+    accept: &dyn Fn(&str) -> bool,
 ) -> Vec<Hit> {
     let fq = fold(query);
     // `ix.is_empty()`, not `entries.is_empty()`: an index whose every entry has
@@ -747,7 +760,10 @@ pub(crate) fn search(
     }
 
     let rank_key = &ix.rank_key;
-    let mut sel = Selector::new(max_results, ix.entries.len());
+    // Slot -> name, so callers express the filter over names rather than over
+    // the index's internal numbering.
+    let accept_slot = |slot: u32| accept(ix.name_of_entry(&ix.entries[slot as usize]));
+    let mut sel = Selector::new(max_results, ix.entries.len(), &accept_slot);
     let finder = memmem::Finder::new(fq.as_bytes());
     let qlen = fq.len();
     let mut processed = 0usize;

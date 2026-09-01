@@ -325,9 +325,13 @@ fn run_search(
     if filters.kind.is_some() {
         log::debug!("kind filter ignored in M0");
     }
-    let filtered = !exts.is_empty() || path_needle.is_some();
-    // Over-fetch when filtering so the page can still fill after rejections.
-    let fetch = if filtered {
+    // The ext filter is a test on the NAME, so it goes into the matcher and the
+    // page fills with `max` accepted rows. A path filter needs `path_of` per
+    // candidate — a parent-chain walk — which is far too expensive to run while
+    // ranking, so it stays a post-filter and still has to over-fetch. That
+    // over-fetch is a guess: a path filter selective enough to reject more than
+    // `fetch` rows returns short, which is why only the ext half moved.
+    let fetch = if path_needle.is_some() {
         max.saturating_mul(8).clamp(max, 4096)
     } else {
         max
@@ -337,7 +341,9 @@ fn run_search(
     let mut items: Vec<ResultItem> = Vec::new();
     {
         let idx = state.index_read();
-        let hits = idx_api::search(&idx, &text, fetch, &is_cancelled);
+        let hits = idx_api::search_filtered(&idx, &text, fetch, &is_cancelled, &|name| {
+            exts.is_empty() || ext_matches(name, &exts)
+        });
         match_ms = t0.elapsed().as_secs_f64() * 1e3;
         for h in hits {
             if items.len() >= max {
@@ -347,10 +353,6 @@ fn run_search(
                 Some(n) => n,
                 None => continue, // entry vanished between match and assembly
             };
-            // ext filter: case-insensitive suffix match on the name (§4.3).
-            if !exts.is_empty() && !ext_matches(&name, &exts) {
-                continue;
-            }
             let path = match idx_api::path_of(&idx, h.frn) {
                 Some(p) => p,
                 None => continue,

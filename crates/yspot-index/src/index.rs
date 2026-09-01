@@ -1620,7 +1620,28 @@ impl VolumeIndex {
         max_results: usize,
         is_cancelled: &dyn Fn() -> bool,
     ) -> Vec<Hit> {
-        crate::matching::search(self, query, max_results, is_cancelled)
+        crate::matching::search(self, query, max_results, is_cancelled, &|_| true)
+    }
+
+    /// [`Self::search`] with a name predicate applied while candidates are
+    /// still being ranked, so the page fills with `max_results` ACCEPTED hits.
+    ///
+    /// The alternative — search then discard — cannot do that. It has to guess
+    /// an over-fetch multiple, pays the matcher for every row it will throw
+    /// away, and still returns short whenever the filter is more selective
+    /// than the guess: a `.rs` filter over a corpus of `.txt` returns whatever
+    /// survived the first N hits rather than the best N `.rs` files. Callers
+    /// whose predicate is cheap on the NAME (an extension test, a prefix)
+    /// should use this; a predicate needing the full path is better left to
+    /// post-filtering, since `path_of` walks the parent chain per candidate.
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        max_results: usize,
+        is_cancelled: &dyn Fn() -> bool,
+        accept: &dyn Fn(&str) -> bool,
+    ) -> Vec<Hit> {
+        crate::matching::search(self, query, max_results, is_cancelled, accept)
     }
 }
 
@@ -2600,5 +2621,75 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].frn, 5_000);
         assert_eq!(v.path_of(5_000).as_deref(), Some("C:\\fresh-start.txt"));
+    }
+
+    /// A selective filter must still fill the page.
+    ///
+    /// This is the bug the predicate exists to kill. Post-filtering searched
+    /// for `fetch` rows and discarded the rejects, so with the wanted extension
+    /// rare enough the page came back short — not because there were too few
+    /// matching files, but because none of them were in the first `fetch` hits.
+    /// Here 1 file in 50 is `.rs`, so a 32-row page needs the matcher to look
+    /// past 1,600 rows it will reject; the old `max * 8` over-fetch of 256
+    /// could not.
+    #[test]
+    fn a_selective_ext_filter_still_fills_the_page() {
+        let mut v = VolumeIndex::new(0, "C:\\".to_string());
+        for i in 0..4_000u64 {
+            let ext = if i % 50 == 0 { "rs" } else { "txt" };
+            v.add(i + 1, 9_999_999, &format!("report-{i}.{ext}"), 0);
+        }
+        v.finalize();
+
+        let accept = |name: &str| name.to_ascii_lowercase().ends_with(".rs");
+        let hits = v.search_filtered("report", 32, &|| false, &accept);
+
+        assert_eq!(hits.len(), 32, "page came back short");
+        // Pin the regression: the old post-filter fetched `max * 8` = 256 rows
+        // and filtered afterwards. Assert directly that those 256 rows do NOT
+        // contain a full page of `.rs`, so a reviewer can see the over-fetch
+        // was not merely wasteful but wrong.
+        let old_fetch = v.search("report", 32 * 8, &|| false);
+        let survivors = old_fetch
+            .iter()
+            .filter(|h| v.name_of(h.frn).is_some_and(|n| n.ends_with(".rs")))
+            .count();
+        assert!(
+            survivors < 32,
+            "corpus is not selective enough to demonstrate the bug ({survivors} survivors)"
+        );
+        for h in &hits {
+            let name = v.name_of(h.frn).expect("hit must resolve");
+            assert!(name.ends_with(".rs"), "filter leaked {name:?}");
+        }
+
+        // The filter must not change ranking among the rows it accepts: the
+        // same query with the filter applied afterwards has to agree.
+        let unfiltered = v.search("report", 4_000, &|| false);
+        let want: Vec<u64> = unfiltered
+            .iter()
+            .filter(|h| v.name_of(h.frn).is_some_and(|n| n.ends_with(".rs")))
+            .map(|h| h.frn)
+            .take(32)
+            .collect();
+        let got: Vec<u64> = hits.iter().map(|h| h.frn).collect();
+        assert_eq!(got, want, "filtered ranking diverged from unfiltered order");
+    }
+
+    /// A filter that accepts nothing returns nothing rather than looping or
+    /// falling back to unfiltered results.
+    #[test]
+    fn a_filter_that_accepts_nothing_returns_nothing() {
+        let mut v = VolumeIndex::new(0, "C:\\".to_string());
+        for i in 0..200u64 {
+            v.add(i + 1, 9_999_999, &format!("note-{i}.txt"), 0);
+        }
+        v.finalize();
+        assert!(v
+            .search_filtered("note", 16, &|| false, &|_| false)
+            .is_empty());
+        // And the unfiltered query over the same corpus still works, so the
+        // emptiness is the filter's doing and not a broken index.
+        assert_eq!(v.search("note", 16, &|| false).len(), 16);
     }
 }
