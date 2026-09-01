@@ -52,6 +52,7 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use yspot_index::index::{RamBreakdown, VolumeIndex};
+use yspot_index::matching::FUZZY_CAP;
 use yspot_index::{flags, EntrySink, UsnEvent};
 
 /// §2.5: service first batch (in-memory match + rank + trimming) ≤ 10 ms p95.
@@ -874,6 +875,15 @@ struct ClassResult {
     stats: Stats,
     mean_hits: f64,
     pass: bool,
+    /// Widest fuzzy-prefilter candidate set any query in this class produces,
+    /// and how many of the class's queries the §3.4 candidate cap truncates.
+    /// Issue #7: the class-superset prefilter is deliberately wider than the
+    /// trigram intersection it replaced, so on a query whose character classes
+    /// are common the CAP rather than the prefilter decides what is missed —
+    /// which shows up as missing results, not as latency, and so is invisible
+    /// to every other number this harness prints.
+    max_survivors: usize,
+    capped_queries: usize,
 }
 
 /// Time `iterations` searches, cycling through `queries`, after a warm-up that
@@ -894,6 +904,8 @@ fn measure_class(
             stats: stats(Vec::new()),
             mean_hits: 0.0,
             pass: false,
+            max_survivors: 0,
+            capped_queries: 0,
         };
     }
 
@@ -913,6 +925,12 @@ fn measure_class(
         total_hits += std::hint::black_box(&hits).len();
     }
 
+    // One probe per DISTINCT query, not per iteration: it is a property of the
+    // query and the corpus, not a timing.
+    let probes: Vec<_> = queries.iter().map(|q| ix.fuzzy_survivor_probe(q)).collect();
+    let max_survivors = probes.iter().map(|p| p.survivors).max().unwrap_or(0);
+    let capped_queries = probes.iter().filter(|p| p.capped()).count();
+
     let s = stats(samples);
     ClassResult {
         name,
@@ -921,6 +939,8 @@ fn measure_class(
         pass: s.p95 <= BUDGET_P95_US,
         mean_hits: total_hits as f64 / iterations as f64,
         stats: s,
+        max_survivors,
+        capped_queries,
     }
 }
 
@@ -1058,6 +1078,18 @@ const RAM_ACCOUNTING_NOTE: &str = "\
               warm at 1M — larger than the entry table — and are replaced by charclass_bsi at a
               flat 8 B/entry plus a fixed 2.11 MB of presence sets. That IS a real reduction, and
               it is the line that decides the §3.4 cap.";
+
+/// Printed with the fuzzy survivor table.
+const SURVIVOR_NOTE: &str = "\
+fuzzy prefilter selectivity — candidates the class-superset filter admits, against the §3.4
+cap on how many the density scorer will verify. This is the one failure mode the latency table
+above CANNOT show: when the cap binds, the excess candidates are never scored, so the cost is a
+MISSING RESULT rather than a slow one, and every class still passes its budget. `capped` counts
+the class's distinct queries whose candidate set the cap truncated. Tracked as issue #7.
+Measured with an EMPTY page, so it is the prefilter's own selectivity and an UPPER BOUND on what
+a real search truncates: mid-search the tier also skips slots a better tier already claimed and
+those below the running score floor's depth ceiling. A zero row means the tier never runs for
+that class — queries under 3 bytes (§3.4), or no name carrying every one of the query's classes.";
 
 /// Printed with the isolated Pass-A probe; see [`SCAN_PROBE_NEEDLE`].
 const SCAN_PROBE_NOTE: &str = "\
@@ -1282,6 +1314,31 @@ only by that one entry — the trigram postings that used to appear between them
             println!("  {:<16} queries: {}", c.name, c.queries.join(", "));
         }
         println!("{}", "-".repeat(96));
+        println!("{SURVIVOR_NOTE}");
+        println!(
+            "{:<18} {:>14} {:>12} {:>9}  worst-case unverified",
+            "class", "max survivors", "cap", "capped"
+        );
+        println!("{}", "-".repeat(96));
+        for c in &self.classes {
+            let unverified = c.max_survivors.saturating_sub(FUZZY_CAP);
+            let pct = if c.max_survivors > 0 {
+                unverified as f64 / c.max_survivors as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "{:<18} {:>14} {:>12} {:>4}/{:<4}  {} ({:.0}%)",
+                c.name,
+                c.max_survivors,
+                FUZZY_CAP,
+                c.capped_queries,
+                c.queries.len(),
+                unverified,
+                pct
+            );
+        }
+        println!("{}", "-".repeat(96));
         println!(
             "OVERALL: {}  (advisory{})",
             verdict(self.overall_pass),
@@ -1401,7 +1458,9 @@ only by that one entry — the trigram postings that used to appear between them
             let _ = write!(
                 s,
                 "],\"iterations\":{},\"min_us\":{:.1},\"p50_us\":{:.1},\"p95_us\":{:.1},\
-                 \"p99_us\":{:.1},\"max_us\":{:.1},\"mean_hits\":{:.3},\"pass\":{}}}",
+                 \"p99_us\":{:.1},\"max_us\":{:.1},\"mean_hits\":{:.3},\
+                 \"fuzzy_max_survivors\":{},\"fuzzy_cap\":{},\"fuzzy_capped_queries\":{},\
+                 \"pass\":{}}}",
                 self.iterations,
                 c.stats.min,
                 c.stats.p50,
@@ -1409,6 +1468,9 @@ only by that one entry — the trigram postings that used to appear between them
                 c.stats.p99,
                 c.stats.max,
                 c.mean_hits,
+                c.max_survivors,
+                FUZZY_CAP,
+                c.capped_queries,
                 c.pass
             );
         }

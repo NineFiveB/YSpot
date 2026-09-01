@@ -54,7 +54,63 @@ const CANCEL_STRIDE: usize = 4096;
 const SCAN_POLL_CHUNK: usize = 1 << 20;
 
 /// Max fuzzy candidates scored per query (§3.4 prefilter bound).
-const FUZZY_CAP: usize = 20_000;
+pub const FUZZY_CAP: usize = 20_000;
+
+/// Where the [`FUZZY_CAP`] budget runs out: the depth it is exhausted at, and
+/// how many candidates of exactly that depth still fit. Deeper candidates, and
+/// the ones past `quota` at `cut`, are never verified.
+///
+/// The drain is SHALLOWEST FIRST (behavior change 9). Fuzzy base is ≤ 0.5
+/// regardless of density, so `score = base · DEPTH_PEN[depth]` means a shallow
+/// candidate dominates a deep one whatever they contain: the candidates the cap
+/// drops are exactly the ones least able to reach the page. What it replaces
+/// was "the first 20,000 in arena order", which is an arbitrary subset.
+///
+/// Shared with [`fuzzy_survivor_probe`] rather than restated there, so the
+/// truncation the bench reports is the one the query path actually applies.
+fn fuzzy_cap_cut(
+    by_depth: &[u32; RANK_DEPTH_MAX as usize + 1],
+    survivors: usize,
+) -> (usize, usize) {
+    if survivors <= FUZZY_CAP {
+        return (RANK_DEPTH_MAX as usize, FUZZY_CAP);
+    }
+    let mut acc = 0usize;
+    for (d, &n) in by_depth.iter().enumerate() {
+        if acc + n as usize >= FUZZY_CAP {
+            return (d, FUZZY_CAP - acc);
+        }
+        acc += n as usize;
+    }
+    (RANK_DEPTH_MAX as usize, FUZZY_CAP)
+}
+
+/// What the fuzzy prefilter admits for one query, and how much of it
+/// [`FUZZY_CAP`] lets the scorer actually look at.
+///
+/// Instrumentation for the bench harness (§10 M0), not a query API — the same
+/// role [`arena_scan_probe`] plays for the arena scan, and isolated the same
+/// way: it runs the prefilter with an EMPTY page, so what it reports is the
+/// prefilter's own selectivity rather than whatever the other tiers happened to
+/// claim first. In a real search `admits` also skips slots already taken by a
+/// better tier, so these counts are the upper bound on what Pass C considers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FuzzySurvivors {
+    /// Slots whose character-class set is a superset of the query's.
+    pub survivors: usize,
+    /// Of those, how many the cap leaves room to verify. Equal to `survivors`
+    /// whenever the cap does not bind.
+    pub verified: usize,
+}
+
+impl FuzzySurvivors {
+    /// Whether [`FUZZY_CAP`] truncated this query's candidate set — i.e. some
+    /// genuine subsequence match may be missing from the page rather than
+    /// merely ranked below it.
+    pub fn capped(&self) -> bool {
+        self.verified < self.survivors
+    }
+}
 
 fn is_sep_byte(b: u8) -> bool {
     matches!(b, b'-' | b'_' | b'.' | b' ')
@@ -96,6 +152,43 @@ fn note_initials_scan() {
 #[cfg(not(test))]
 #[inline(always)]
 fn note_initials_scan() {}
+
+/// Count what the fuzzy prefilter admits for `query`, and how much of it
+/// [`FUZZY_CAP`] leaves room to verify. See [`FuzzySurvivors`].
+///
+/// Runs the same class-superset sweep and the same [`fuzzy_cap_cut`] the query
+/// path runs, with no `seen` set and no depth ceiling, so it reports the
+/// prefilter's own selectivity. Queries the tier would not run at all — under 3
+/// bytes (§3.4), empty, or carrying a reserved byte — report zero survivors,
+/// which is what the tier does with them.
+pub(crate) fn fuzzy_survivor_probe(ix: &VolumeIndex, query: &str) -> FuzzySurvivors {
+    let fq = fold(query);
+    if fq.len() < 3 || has_control_byte(&fq) {
+        return FuzzySurvivors::default();
+    }
+    let (bsi, wps) = (&ix.charclass_bsi[..], ix.bsi_words);
+    let words = ix.entries.len().div_ceil(64).min(wps);
+    let qmask = class_mask(&fq);
+    let rank_key = &ix.rank_key;
+
+    let mut by_depth = [0u32; RANK_DEPTH_MAX as usize + 1];
+    let mut survivors = 0usize;
+    for_each_class_superset(bsi, wps, words, qmask, |slot| {
+        by_depth[(rank_key[slot as usize] & RANK_DEPTH_MAX) as usize] += 1;
+        survivors += 1;
+        true
+    });
+
+    // Replay the drain's accounting rather than its scoring: everything
+    // shallower than `cut` is verified in full, plus `quota` of `cut` itself.
+    let (cut, quota) = fuzzy_cap_cut(&by_depth, survivors);
+    let verified = by_depth[..cut].iter().map(|&n| n as usize).sum::<usize>()
+        + (by_depth[cut] as usize).min(quota);
+    FuzzySurvivors {
+        survivors,
+        verified,
+    }
+}
 
 /// Count folded-arena hits for `needle` — Pass 1's `memmem` scan with nothing
 /// attached to it: no hit→entry mapping, no tier classification, no ranking.
@@ -1043,26 +1136,7 @@ pub(crate) fn search(
             true
         });
 
-        // The FUZZY_CAP drain, SHALLOWEST FIRST (behavior change 9). Fuzzy base
-        // is ≤ 0.5 regardless of density, so `score = base · DEPTH_PEN[depth]`
-        // means a shallow candidate dominates a deep one whatever they contain:
-        // the candidates the cap drops are exactly the ones least able to reach
-        // the page. What it replaces was "the first 20,000 in arena order",
-        // which is an arbitrary subset. `cut` is the depth the budget runs out
-        // at and `quota` is how many of that depth still fit.
-        let mut cut = RANK_DEPTH_MAX as usize;
-        let mut quota = FUZZY_CAP;
-        if survivors > FUZZY_CAP {
-            let mut acc = 0usize;
-            for (d, &n) in by_depth.iter().enumerate() {
-                if acc + n as usize >= FUZZY_CAP {
-                    cut = d;
-                    quota = FUZZY_CAP - acc;
-                    break;
-                }
-                acc += n as usize;
-            }
-        }
+        let (cut, mut quota) = fuzzy_cap_cut(&by_depth, survivors);
 
         let mut scored = 0usize;
         for_each_class_superset(bsi, wps, words, qmask, |slot| {
@@ -1365,6 +1439,51 @@ mod tests {
         // "ab" is a subsequence of "axbx", but 2-byte queries skip fuzzy and
         // nothing else matches.
         assert!(v.search("ab", 10, &no_cancel).is_empty());
+    }
+
+    /// The survivor probe reports the prefilter's own selectivity, and the
+    /// tier's own preconditions.
+    #[test]
+    fn fuzzy_survivor_probe_counts_the_prefilter() {
+        let mut v = ix();
+        v.add(1, 999, "abc", 0);
+        v.add(2, 999, "axbxc", 0);
+        // No `c` at all, so its class set is not a superset of `abc`'s.
+        v.add(3, 999, "abab", 0);
+
+        let p = v.fuzzy_survivor_probe("abc");
+        assert_eq!(p.survivors, 2, "only the two names carrying a, b and c");
+        assert_eq!(p.verified, 2, "far below the cap, so nothing is truncated");
+        assert!(!p.capped());
+
+        // The tier's preconditions, reported as the tier applies them.
+        assert_eq!(v.fuzzy_survivor_probe("ab"), FuzzySurvivors::default());
+        assert_eq!(v.fuzzy_survivor_probe(""), FuzzySurvivors::default());
+        assert_eq!(v.fuzzy_survivor_probe("a\u{0}c"), FuzzySurvivors::default());
+    }
+
+    /// Issue #7, made measurable: once the prefilter admits more than
+    /// `FUZZY_CAP`, the cap decides what is missed and the probe says so.
+    ///
+    /// Every name here carries the same classes and sits at the same depth, so
+    /// the shallowest-first drain has no depth to discriminate on and the cut
+    /// falls exactly at the cap.
+    #[test]
+    fn the_fuzzy_cap_truncation_is_visible() {
+        const N: u64 = (FUZZY_CAP as u64) + 5_000;
+        let mut v = ix();
+        for i in 0..N {
+            v.add(i + 1, 999, &format!("abc{i}"), 0);
+        }
+        v.finalize();
+
+        let p = v.fuzzy_survivor_probe("abc");
+        assert_eq!(p.survivors as u64, N, "every name is a class superset");
+        assert_eq!(p.verified, FUZZY_CAP, "the cap binds at exactly its budget");
+        assert!(p.capped());
+        // The number this makes visible: what fraction never reaches the
+        // density scorer at all.
+        assert!(p.survivors - p.verified == 5_000);
     }
 
     #[test]

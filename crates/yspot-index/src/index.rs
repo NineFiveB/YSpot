@@ -1850,6 +1850,20 @@ impl VolumeIndex {
     /// Number of folded-arena hits for `needle`, with none of the mapping,
     /// tiering or ranking [`Self::search`] does — the isolated Pass 1 scan.
     /// Instrumentation for the bench harness (§10 M0), not a query API.
+    /// What the fuzzy prefilter admits for `query` and how much of it the
+    /// §3.4 candidate cap leaves room to verify — see
+    /// [`crate::matching::FuzzySurvivors`]. Instrumentation for the bench
+    /// harness (§10 M0), not a query API.
+    ///
+    /// This is the measurement issue #7 is about: the class-superset prefilter
+    /// is deliberately wider than the trigram intersection it replaced, so a
+    /// query whose character classes are common can admit more candidates than
+    /// the cap will verify, and the cap rather than the prefilter then decides
+    /// what is missed.
+    pub fn fuzzy_survivor_probe(&self, query: &str) -> crate::matching::FuzzySurvivors {
+        crate::matching::fuzzy_survivor_probe(self, query)
+    }
+
     pub fn arena_scan_probe(&self, needle: &str) -> usize {
         crate::matching::arena_scan_probe(self, needle)
     }
