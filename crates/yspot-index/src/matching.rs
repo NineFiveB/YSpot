@@ -645,11 +645,12 @@ impl Ord for Scored {
 /// why the differential test in this module's tests exists.
 struct Selector<'a> {
     heap: BinaryHeap<Reverse<Scored>>,
-    /// Caller-supplied acceptance test on a slot, applied BEFORE the offer is
-    /// scored. Pushing a filter in here rather than discarding rows afterwards
-    /// is what lets a filtered query fetch exactly `max_results`: post-filtering
-    /// has to over-fetch a guessed multiple and still silently under-returns
-    /// when the filter is selective enough that the guess was wrong.
+    /// Caller-supplied acceptance test on a slot, consulted only for an offer
+    /// that would otherwise be ADMITTED — see [`Selector::offer`]. Pushing a
+    /// filter in here rather than discarding rows afterwards is what lets a
+    /// filtered query fetch exactly `max_results`: post-filtering has to
+    /// over-fetch a guessed multiple and still silently under-returns when the
+    /// filter is selective enough that the guess was wrong.
     accept: &'a dyn Fn(u32) -> bool,
     /// `2·max_results`.
     cap: usize,
@@ -694,19 +695,38 @@ impl<'a> Selector<'a> {
 
     /// Score `slot` and admit it. `rank_key` supplies depth and the
     /// hidden/system penalty in one byte — no entry read, no parent walk.
+    ///
+    /// **The filter is consulted LAST, and only for an offer that has already
+    /// beaten the heap.** Scoring is a `rank_key` byte and a table lookup, both
+    /// sequential; `accept` is a closure the caller supplies over the NAME, and
+    /// the one `search` builds (`accept(ix.name_of_entry(&ix.entries[slot]))`)
+    /// costs two dependent RANDOM reads — into the 32 MB entry table, then into
+    /// the 24 MB name arena — to materialize a `&str`. Testing it first meant
+    /// paying that for every candidate a pass produced, including the ~20,000 a
+    /// 2-char initials query offers, and including the unfiltered case where
+    /// `accept` is the `|_| true` [`crate::VolumeIndex::search`] passes: 19,950
+    /// calls for one query, ~215 ns each, ~75% of that pass's cost spent
+    /// building strings for a closure that ignores them.
+    ///
+    /// Result-preserving, which is the whole reason it is safe to move: the
+    /// admission tests below decide membership on `(score, eidx, tier)` alone,
+    /// so a candidate they reject is absent from the page whatever `accept`
+    /// would have said. Consulting it only on the admission path evaluates it
+    /// strictly less often and never changes an answer. `seen` is still marked
+    /// unconditionally, so which slots later passes re-offer is untouched.
     fn offer(&mut self, rank_key: &[u8], slot: u32, tier: Tier, base: f32) {
-        // Marked seen either way: a slot the filter rejects stays rejected, so
-        // recording it here also stops later passes re-testing it.
+        // Marked before any test, so a slot dropped here still stops later
+        // passes re-offering it — the bit means OFFERED, not accepted.
         self.seen[slot as usize >> 6] |= 1 << (slot & 63);
-        if !(self.accept)(slot) {
-            return;
-        }
         let s = Scored {
             score: base * DEPTH_PEN[rank_key[slot as usize] as usize],
             eidx: slot,
             tier,
         };
         if self.heap.len() < self.cap {
+            if !(self.accept)(slot) {
+                return;
+            }
             self.heap.push(Reverse(s));
             if self.heap.len() == self.cap {
                 self.floor = self.heap.peek().expect("full").0.score;
@@ -714,6 +734,9 @@ impl<'a> Selector<'a> {
         } else if s.cmp(&self.heap.peek().expect("full").0) == Ordering::Greater {
             // Equal here means same score AND same slot, i.e. a duplicate
             // offer, which drain-dedup would collapse anyway.
+            if !(self.accept)(slot) {
+                return;
+            }
             self.heap.pop();
             self.heap.push(Reverse(s));
             self.floor = self.heap.peek().expect("full").0.score;

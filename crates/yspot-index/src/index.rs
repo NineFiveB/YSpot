@@ -2765,6 +2765,69 @@ mod tests {
         assert_eq!(got, want, "filtered ranking diverged from unfiltered order");
     }
 
+    /// The name filter is consulted once per ADMISSION, never once per
+    /// candidate.
+    ///
+    /// `search` builds its slot filter as
+    /// `accept(name_of_entry(&entries[slot]))`, so every call is two dependent
+    /// random reads — entry table, then name arena — to materialize a `&str`.
+    /// A 2-char initials query offers one candidate per matching entry, and
+    /// the 2K heap discards almost all of them on score alone; evaluating the
+    /// filter before scoring paid the two reads for every one of them, which
+    /// measured ~75% of that pass's cost. Since admission is decided on
+    /// `(score, eidx, tier)` alone, moving the test onto the admission path is
+    /// result-preserving — that part is pinned by
+    /// `a_selective_ext_filter_still_fills_the_page` above and by the
+    /// differential tests in `matching`.
+    ///
+    /// Every name here has initials `ab` and the same depth, so all `ENTRIES`
+    /// score identically and Pass B offers every one of them in slot order.
+    /// The heap fills at `2 · MAX`, and from then on an equal score with a
+    /// higher `eidx` loses `Scored::cmp` — so nothing after the first `2 · MAX`
+    /// can be admitted, and nothing after it may reach the filter.
+    #[test]
+    fn the_filter_is_consulted_only_for_candidates_that_can_be_admitted() {
+        const ENTRIES: u64 = 1_000;
+        const MAX: usize = 4;
+
+        let mut v = VolumeIndex::new(0, "C:\\".to_string());
+        for i in 0..ENTRIES {
+            // Space-separated, so the two segments give initials `ab`. The
+            // folded name never contains `ab` contiguously, which keeps Pass A
+            // out of it and makes the count attributable to Pass B alone.
+            v.add(i + 1, 9_999_999, &format!("alpha{i} beta"), 0);
+        }
+        v.finalize();
+
+        let calls = std::cell::Cell::new(0usize);
+        let counting = |_: &str| {
+            calls.set(calls.get() + 1);
+            true
+        };
+        let hits = v.search_filtered("ab", MAX, &|| false, &counting);
+
+        // The filter accepts everything, so the page must be exactly what the
+        // unfiltered query returns: counting must not perturb ranking.
+        assert_eq!(hits.len(), MAX);
+        let unfiltered: Vec<u64> = v
+            .search("ab", MAX, &|| false)
+            .iter()
+            .map(|h| h.frn)
+            .collect();
+        assert_eq!(
+            hits.iter().map(|h| h.frn).collect::<Vec<_>>(),
+            unfiltered,
+            "filtered page diverged from the unfiltered one"
+        );
+        assert!(
+            calls.get() <= 2 * MAX,
+            "filter ran {} times for {ENTRIES} equal-scoring candidates; it must \
+             run once per admission ({} at most), not once per candidate",
+            calls.get(),
+            2 * MAX
+        );
+    }
+
     /// A filter that accepts nothing returns nothing rather than looping or
     /// falling back to unfiltered results.
     #[test]
