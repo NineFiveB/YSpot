@@ -301,6 +301,10 @@ pub struct RamBreakdown {
     /// Tombstoned slots awaiting reuse; grows with delete churn and drains
     /// back to zero as creates recycle them.
     pub free_slots: u64,
+    /// Scratch state for the sliced depth repair: one byte per slot while a
+    /// repair is outstanding, empty otherwise. Transient, but 1 MB at 1M
+    /// entries, so it is charged rather than hidden.
+    pub depth_repair_state: u64,
     /// Packed depth + hidden/system ranking column, 1 B per slot.
     pub rank_key: u64,
     /// Folded-arena record table, 8 B per record (≥ 1 per live entry; renames
@@ -326,6 +330,7 @@ impl RamBreakdown {
             + self.folded_arena
             + self.frn_map
             + self.free_slots
+            + self.depth_repair_state
             + self.rank_key
             + self.arena_recs
             + self.owner
@@ -1368,6 +1373,7 @@ impl VolumeIndex {
             folded_arena: self.folded_arena.capacity() as u64,
             frn_map,
             free_slots: (self.free_slots.capacity() * std::mem::size_of::<u32>()) as u64,
+            depth_repair_state: self.depth_repair_state.capacity() as u64,
             rank_key: self.rank_key.capacity() as u64,
             arena_recs: (self.arena_recs.capacity() * std::mem::size_of::<ArenaRec>()) as u64,
             owner: (self.owner.capacity() * std::mem::size_of::<u32>()) as u64,

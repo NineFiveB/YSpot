@@ -23,6 +23,15 @@ use yspot_proto::{
 use crate::idx_api;
 use crate::state::ServiceState;
 
+/// Longest query the matcher will accept, bytes.
+///
+/// An NTFS name is at most 255 UTF-16 units, so a filename fragment cannot
+/// legitimately need more than this once folded. The 1 MiB frame cap is not a
+/// useful bound here: folding expands (U+0130 -> 3 bytes), and the matcher's
+/// preflight - class mask, presence probes, the char-vector fallback - is
+/// O(query) work that polls no cancellation.
+const MAX_QUERY_BYTES: usize = 1024;
+
 pub fn run(mut reader: File, state: Arc<ServiceState>) {
     // One duplicated handle for writes: reads stay on the connection thread,
     // search threads write through the mutex (byte-mode duplex pipe).
@@ -73,6 +82,30 @@ pub fn run(mut reader: File, state: Arc<ServiceState>) {
                 latest_gen.fetch_max(gen, Ordering::SeqCst);
                 if !scopes.is_empty() {
                     log::debug!("scopes ignored in M0: {scopes:?}");
+                }
+                // A query is a filename fragment; nothing legitimate is longer
+                // than an NTFS name. The frame cap (1 MiB) is not a bound on
+                // its own, and folding EXPANDS (U+0130 -> 3 bytes), so an
+                // oversized query buys a caller a multiple of that in
+                // uninterruptible preflight - class-mask and presence probes
+                // that poll no cancellation. Reject it here rather than let it
+                // reach the matcher (SPEC 8.1: pipe input is untrusted).
+                if text.len() > MAX_QUERY_BYTES {
+                    log::debug!(
+                        "query of {} bytes rejected (cap {})",
+                        text.len(),
+                        MAX_QUERY_BYTES
+                    );
+                    let empty = Message::SearchResults {
+                        gen,
+                        seq: 0,
+                        is_final: true,
+                        items: Vec::new(),
+                    };
+                    if !send(&writer, &empty) {
+                        return;
+                    }
+                    continue;
                 }
                 if text.is_empty() {
                     // Empty query ⇒ empty final batch, no index work.
