@@ -108,6 +108,44 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 /// nothing to do is one atomic-free read-lock acquisition and a compare.
 const HOUSEKEEPING_TICK: Duration = Duration::from_millis(250);
 
+/// Compact the index when it has accumulated enough dead weight (§3.7).
+///
+/// Gated on machine idle (§3.6) because compaction takes the write lock for
+/// its whole run — every structure is renumbered at once, so unlike the depth
+/// repair it cannot be sliced. `must_compact` is the escape hatch: past 40%
+/// dead bytes the index is wasting more than idleness is worth waiting for, so
+/// it runs regardless.
+fn maybe_compact(state: &ServiceState) {
+    let (should, must) = {
+        let idx = state.index_read();
+        (idx.should_compact(), idx.must_compact())
+    };
+    if !should && !must {
+        return;
+    }
+    if !must && !state.machine_idle() {
+        return; // a session is interactive; wait for a quiet window
+    }
+
+    let previous = state.vol_state.load(Ordering::SeqCst);
+    state.set_vol_state(VS_REBUILDING);
+    let t0 = Instant::now();
+    let (reclaimed, entries) = {
+        let mut idx = state.index_write();
+        (idx.compact(), idx.len())
+    };
+    state.set_vol_state(previous);
+    log::info!(
+        "compacted: reclaimed {reclaimed} bytes over {entries} entries in {} ms{}",
+        t0.elapsed().as_millis(),
+        if must {
+            " (forced: past the hard threshold)"
+        } else {
+            ""
+        }
+    );
+}
+
 /// Deferred writer-side maintenance, on a clock of its own.
 ///
 /// This exists because the USN tail thread is NOT a clock. `read_batch` blocks
@@ -130,6 +168,7 @@ fn spawn_housekeeping(state: Arc<ServiceState>) {
             // §3.6 pause suspends index maintenance, not just tailing.
             if !state.is_paused() {
                 repair_depths(&state);
+                maybe_compact(&state);
             }
         })
         .expect("spawning housekeeping thread");

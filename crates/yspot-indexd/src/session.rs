@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use yspot_proto::{
-    codes, read_msg, write_msg, Filters, Message, ProtoError, ResultId, ResultItem, MAX_FRAME_C2S,
-    PROTO_VERSION,
+    codes, read_msg, write_msg, Filters, Message, ProtoError, ResultId, ResultItem,
+    SessionActivity, MAX_FRAME_C2S, PROTO_VERSION,
 };
 
 use crate::idx_api;
@@ -31,6 +31,23 @@ use crate::state::ServiceState;
 /// preflight - class mask, presence probes, the char-vector fallback - is
 /// O(query) work that polls no cancellation.
 const MAX_QUERY_BYTES: usize = 1024;
+
+/// Withdraws this connection's "active" vote however the session ends.
+///
+/// §3.6 makes the machine idle only when every session reports idle, so a
+/// session that drops while active would hold heavy maintenance off forever.
+/// `run` returns from several places (protocol error, EOF, write failure), so
+/// this is a guard rather than bookkeeping at each exit.
+struct ActivityVote {
+    state: Arc<ServiceState>,
+    active: bool,
+}
+
+impl Drop for ActivityVote {
+    fn drop(&mut self) {
+        self.state.set_session_active(self.active, false);
+    }
+}
 
 pub fn run(mut reader: File, state: Arc<ServiceState>) {
     // One duplicated handle for writes: reads stay on the connection thread,
@@ -50,6 +67,11 @@ pub fn run(mut reader: File, state: Arc<ServiceState>) {
     // Per-connection generation watermark (§4.4): queries and cancels only
     // ever raise it; a search is dead once latest_gen exceeds its gen.
     let latest_gen = Arc::new(AtomicU64::new(0));
+    // What this connection last reported; the guard withdraws it on exit.
+    let mut activity = ActivityVote {
+        state: state.clone(),
+        active: false,
+    };
 
     loop {
         let msg = match read_msg(&mut reader, MAX_FRAME_C2S) {
@@ -153,9 +175,15 @@ pub fn run(mut reader: File, state: Arc<ServiceState>) {
                     return;
                 }
             }
-            Message::SessionState { state: activity } => {
-                // Fire-and-forget (§4.3): no id, nothing to Ack.
-                log::info!("session activity: {activity:?}");
+            Message::SessionState { state: reported } => {
+                // Fire-and-forget (§4.3): no id, nothing to Ack. Tracked
+                // rather than merely logged because §3.6 gates heavy
+                // maintenance on EVERY session being idle, so one active
+                // session has to hold it off for the whole machine.
+                let now_active = matches!(reported, SessionActivity::Active);
+                state.set_session_active(activity.active, now_active);
+                activity.active = now_active;
+                log::info!("session activity: {reported:?}");
             }
             Message::PauseIndexing { id } => {
                 state.paused.store(true, Ordering::SeqCst);

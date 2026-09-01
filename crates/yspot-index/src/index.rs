@@ -870,6 +870,207 @@ impl VolumeIndex {
     /// Nothing is written to either arena until every rejection test has
     /// passed: a half-interned name would leave orphan bytes that the next
     /// record's offsets sit after and that no entry claims.
+    /// Reclaim tombstoned slots and dead arena bytes (§3.7).
+    ///
+    /// Deletes and renames leave their bytes behind — a rename appends the new
+    /// name and abandons the old — so a long-lived index grows with churn even
+    /// though `len()` does not. This is the only thing that hands those bytes
+    /// back.
+    ///
+    /// **Never build-and-swap.** The obvious implementation — assemble fresh
+    /// arenas beside the live ones and swap — doubles the two largest
+    /// structures at the moment of peak use. At 1M entries that is a transient
+    /// of ~24 MB folded plus ~18 MB name on top of a budget whose entire cap is
+    /// 200 B/entry, i.e. it would breach §3.4 exactly when the index is already
+    /// under enough memory pressure to want compacting. Everything here is
+    /// therefore in place:
+    ///
+    /// * Live records ascend in `arena_recs` order in BOTH arenas, and
+    ///   compaction only ever drops records, so the write cursor never passes
+    ///   the read cursor and `copy_within` needs no transient at all.
+    /// * `charclass_bsi` and the presence sets are zeroed and refilled rather
+    ///   than reallocated.
+    /// * `frn_map` keeps its keys, so only its VALUES are rewritten through
+    ///   `remap`. Rebuilding the table would rehash every key to no purpose.
+    ///
+    /// Returns the bytes reclaimed.
+    pub fn compact(&mut self) -> u64 {
+        const DEAD_SLOT: u32 = u32::MAX;
+        let before = self.ram_bytes();
+
+        // Pass 1: old slot -> new slot, in slot order, so the entry table and
+        // every slot-keyed column compact leftward together.
+        let mut remap = vec![DEAD_SLOT; self.entries.len()];
+        let mut kept = 0u32;
+        for (old, e) in self.entries.iter().enumerate() {
+            if !e.is_dead() {
+                remap[old] = kept;
+                kept += 1;
+            }
+        }
+        let new_len = kept as usize;
+
+        // Pass 2: the slot-keyed columns. The read cursor is always ahead of
+        // the write cursor, so these are pure leftward moves.
+        // Indexed rather than iterated on purpose: each step READS slot
+        // `old` and WRITES slot `ns`, which no single iterator expresses.
+        #[allow(clippy::needless_range_loop)]
+        for old in 0..self.entries.len() {
+            let ns = remap[old];
+            if ns == DEAD_SLOT {
+                continue;
+            }
+            let ns = ns as usize;
+            self.entries[ns] = self.entries[old];
+            self.rank_key[ns] = self.rank_key[old];
+            let (from, to) = (old * INITIALS_STRIDE, ns * INITIALS_STRIDE);
+            self.initials.copy_within(from..from + INITIALS_STRIDE, to);
+        }
+        self.entries.truncate(new_len);
+        self.rank_key.truncate(new_len);
+        self.initials.truncate(new_len * INITIALS_STRIDE);
+
+        // Pass 3: the arenas, walked in `arena_recs` order so both ascend. A
+        // record is live iff its slot survived AND the slot still points at it
+        // — a rename leaves the superseded record behind, and that comparison
+        // is the only thing telling the two apart.
+        let recs = std::mem::take(&mut self.arena_recs);
+        let mut fresh: Vec<ArenaRec> = Vec::with_capacity(new_len);
+        let (mut fw, mut nw) = (1usize, 0usize); // folded starts past its fence
+        {
+            let folded = unsafe { self.folded_arena.as_mut_vec() };
+            let names = unsafe { self.name_arena.as_mut_vec() };
+            for rec in &recs {
+                let ns = remap[rec.slot as usize];
+                if ns == DEAD_SLOT {
+                    continue;
+                }
+                let e = self.entries[ns as usize];
+                if e.folded_off != rec.off {
+                    continue; // superseded by a rename
+                }
+                let (fo, fl) = (e.folded_off as usize, e.folded_len as usize);
+                folded.copy_within(fo..fo + fl, fw);
+                let (no, nl) = (e.name_off as usize, e.name_len as usize);
+                names.copy_within(no..no + nl, nw);
+
+                let entry = &mut self.entries[ns as usize];
+                entry.folded_off = fw as u32;
+                entry.name_off = nw as u32;
+                fresh.push(ArenaRec {
+                    off: fw as u32,
+                    slot: ns,
+                });
+                fw += fl;
+                folded[fw] = FOLDED_DELIM;
+                fw += 1;
+                nw += nl;
+            }
+            // An index with nothing live carries no opening fence either;
+            // `intern` lays one down again on the next insert.
+            folded.truncate(if fresh.is_empty() { 0 } else { fw });
+            names.truncate(nw);
+        }
+        self.arena_recs = fresh;
+
+        // `owner` maps arena blocks to records, so it follows the arenas.
+        self.owner.clear();
+        for (ri, rec) in self.arena_recs.iter().enumerate() {
+            while self.owner.len() * OWNER_BLOCK <= rec.off as usize {
+                self.owner.push(ri as u32);
+            }
+        }
+        let last_rec = self.arena_recs.len().saturating_sub(1) as u32;
+        while self.owner.len() * OWNER_BLOCK < self.folded_arena.len() {
+            self.owner.push(last_rec);
+        }
+
+        // Zeroed and refilled rather than reallocated. This is also the one
+        // place the presence sets stop being a superset of the live arena and
+        // become exact again: they are set-only during normal operation.
+        self.charclass_bsi.iter_mut().for_each(|w| *w = 0);
+        self.tri_present.iter_mut().for_each(|w| *w = 0);
+        self.bi_present.iter_mut().for_each(|w| *w = 0);
+        self.uni_present = [0; 4];
+        for slot in 0..new_len {
+            let e = self.entries[slot];
+            let (off, len) = (e.folded_off as usize, e.folded_len as usize);
+            let mask = {
+                let folded = &self.folded_arena[off..off + len];
+                let fb = folded.as_bytes();
+                let (uni, bi, tri) = (
+                    &mut self.uni_present,
+                    &mut self.bi_present,
+                    &mut self.tri_present,
+                );
+                for &b in fb {
+                    bit_set(uni, b as usize);
+                }
+                for w in fb.windows(2) {
+                    bit_set(bi, (w[0] as usize) << 8 | w[1] as usize);
+                }
+                for w in fb.windows(3) {
+                    bit_set(
+                        tri,
+                        (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+                    );
+                }
+                class_mask(folded)
+            };
+            self.bsi_apply(slot as u32, mask, true);
+        }
+
+        // Keys are unchanged, so the table's hash positions are too: only the
+        // slot each key points at has moved.
+        for slot in self.frn_map.values_mut() {
+            let ns = remap[*slot as usize];
+            debug_assert_ne!(ns, DEAD_SLOT, "frn_map pointed at a tombstone");
+            *slot = ns;
+        }
+
+        self.free_slots.clear();
+        self.dead_bytes = 0;
+        // Depth is slot-derived, so it has to be recomputed against the new
+        // numbering. This also cancels any outstanding sliced repair.
+        self.depth_repair_armed = None;
+        self.depth_repair_cursor = 0;
+        self.depth_repair_state = Vec::new();
+        self.sweep_all_depths();
+
+        self.entries.shrink_to_fit();
+        self.rank_key.shrink_to_fit();
+        self.initials.shrink_to_fit();
+        self.arena_recs.shrink_to_fit();
+        self.owner.shrink_to_fit();
+        self.name_arena.shrink_to_fit();
+        self.folded_arena.shrink_to_fit();
+        self.frn_map.shrink_to_fit();
+        self.frn_map_buckets = 0;
+        self.note_frn_map_buckets();
+        self.settled = true;
+
+        before.saturating_sub(self.ram_bytes())
+    }
+
+    /// Whether enough dead weight has accumulated to be worth compacting
+    /// (§3.7). Cheap enough to ask on every housekeeping tick.
+    pub fn should_compact(&self) -> bool {
+        let live_bytes = self.name_arena.len() + self.folded_arena.len();
+        let dead_frac = self.dead_bytes as f64 / live_bytes.max(1) as f64;
+        let stale_recs = self.arena_recs.len().saturating_sub(self.live_count);
+        let stale_frac = stale_recs as f64 / self.arena_recs.len().max(1) as f64;
+        let dead_slots = self.entries.len().saturating_sub(self.live_count);
+        let slot_frac = dead_slots as f64 / self.entries.len().max(1) as f64;
+        dead_frac > 0.25 || stale_frac > 0.25 || slot_frac > 0.125
+    }
+
+    /// Dead weight far enough past the [`Self::should_compact`] line to be
+    /// worth compacting even outside a machine-idle window (§3.6).
+    pub fn must_compact(&self) -> bool {
+        let live_bytes = self.name_arena.len() + self.folded_arena.len();
+        self.dead_bytes as f64 / live_bytes.max(1) as f64 > 0.40
+    }
+
     fn intern(&mut self, name: &str) -> Option<(u32, u16, u32, u16)> {
         let nfc: String = name.nfc().collect();
         let nfc = truncate_to_boundary(&nfc, u16::MAX as usize);
@@ -2256,5 +2457,148 @@ mod tests {
 
         let guard = index.read().unwrap_or_else(|p| p.into_inner());
         assert_eq!(guard.len(), guard.frn_map.len());
+    }
+
+    /// Step 9's gate: compaction is invisible to callers and actually reclaims.
+    ///
+    /// Every structure is renumbered or rewritten here — the entry table, both
+    /// arenas, `arena_recs`, `owner`, the initials lanes, the BSI, the presence
+    /// sets and the FRN map's values — so the failure mode is not a crash but a
+    /// result set that quietly shifts. The assertion is therefore equality of
+    /// the FULL result vector, scores included, before and after.
+    #[test]
+    fn compaction_preserves_results_and_reclaims_bytes() {
+        const QUERIES: [&str; 6] = ["report", "draft", "rd", "eport", "final", "zzqx"];
+
+        let mut v = ix();
+        for i in 0..3_000u64 {
+            v.add(i + 1, ABSENT_PARENT, &format!("report-{i}-draft.txt"), 0);
+        }
+        v.finalize();
+
+        // Churn hard enough to trip the trigger: delete a third outright, and
+        // rename another third so their old records are superseded rather than
+        // tombstoned. Those are two different kinds of dead weight.
+        for i in (0..3_000u64).step_by(3) {
+            v.apply(crate::UsnEvent::Delete { frn: i + 1 });
+        }
+        for i in (1..3_000u64).step_by(3) {
+            v.apply(crate::UsnEvent::Rename {
+                frn: i + 1,
+                new_parent_frn: ABSENT_PARENT,
+                new_name: format!("report-{i}-final.txt"),
+            });
+        }
+        assert!(v.should_compact(), "churn did not trip the trigger");
+
+        let before: Vec<Vec<Hit>> = QUERIES.iter().map(|q| v.search(q, 32, &|| false)).collect();
+        let live_before = v.len();
+        let ram_before = v.ram_bytes();
+        let paths_before: Vec<Option<String>> =
+            before.iter().flatten().map(|h| v.path_of(h.frn)).collect();
+
+        let reclaimed = v.compact();
+
+        assert_eq!(v.len(), live_before, "compaction changed the live count");
+        assert!(!v.should_compact(), "still wants compacting afterwards");
+        assert!(
+            v.ram_bytes() < ram_before,
+            "no bytes reclaimed: {} -> {}",
+            ram_before,
+            v.ram_bytes()
+        );
+        assert_eq!(reclaimed, ram_before - v.ram_bytes());
+
+        for (q, want) in QUERIES.iter().zip(&before) {
+            let got = v.search(q, 32, &|| false);
+            assert_eq!(got.len(), want.len(), "query {q:?}: result count");
+            // Scores are fully determined by the corpus, so the SCORE vector
+            // must be identical. The FRN at a given row need not be: compaction
+            // renumbers slots, and `Scored::cmp` breaks exactly-equal scores by
+            // entry index, so tied rows may swap — behavior change 6, which is
+            // signed off. Anything beyond a tie shows up as a score mismatch.
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert_eq!(
+                    g.score.to_bits(),
+                    w.score.to_bits(),
+                    "query {q:?} row {i}: score"
+                );
+                if g.frn != w.frn {
+                    assert_eq!(
+                        g.score.to_bits(),
+                        w.score.to_bits(),
+                        "query {q:?} row {i}: rows differ at DIFFERENT scores"
+                    );
+                }
+                assert!(
+                    v.name_of(g.frn).is_some(),
+                    "query {q:?} row {i}: unresolvable"
+                );
+            }
+        }
+
+        // Paths are reconstructed from the parent chain and the name arena, so
+        // they exercise the renumbering and the arena move together.
+        let paths_after: Vec<Option<String>> =
+            before.iter().flatten().map(|h| v.path_of(h.frn)).collect();
+        assert_eq!(
+            paths_before, paths_after,
+            "a path changed across compaction"
+        );
+
+        // Everything live must survive, and nothing dead may come back.
+        for i in (0..3_000u64).step_by(3) {
+            assert!(v.name_of(i + 1).is_none(), "deleted frn resurfaced");
+        }
+        for i in (2..3_000u64).step_by(3) {
+            assert!(v.name_of(i + 1).is_some(), "untouched frn vanished");
+        }
+        for i in (1..3_000u64).step_by(3) {
+            assert_eq!(
+                v.name_of(i + 1),
+                Some(format!("report-{i}-final.txt").as_str())
+            );
+        }
+
+        // A compacted index must still accept writes, and the arena's opening
+        // fence has to survive the truncate for the matcher's unchecked
+        // `arena[hit - 1]` read to stay in bounds.
+        v.apply(crate::UsnEvent::Create {
+            frn: 900_001,
+            parent_frn: ABSENT_PARENT,
+            name: "report-after-compaction.txt".into(),
+            flags: 0,
+        });
+        assert!(!v.search("after-compaction", 4, &|| false).is_empty());
+    }
+
+    /// Compacting an index whose every entry is gone must leave a structure
+    /// that still works, not a half-truncated arena. The empty case is the one
+    /// the fence bookkeeping is easiest to get wrong on.
+    #[test]
+    fn compaction_of_an_emptied_index_still_accepts_writes() {
+        let mut v = ix();
+        for i in 0..64u64 {
+            v.add(i + 1, ABSENT_PARENT, &format!("gone-{i}.txt"), 0);
+        }
+        v.finalize();
+        for i in 0..64u64 {
+            v.apply(crate::UsnEvent::Delete { frn: i + 1 });
+        }
+        v.compact();
+
+        assert_eq!(v.len(), 0);
+        assert!(v.search("gone", 8, &|| false).is_empty());
+
+        v.apply(crate::UsnEvent::Create {
+            frn: 5_000,
+            parent_frn: ABSENT_PARENT,
+            name: "fresh-start.txt".into(),
+            flags: 0,
+        });
+        let hits = v.search("fresh", 8, &|| false);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 5_000);
+        assert_eq!(v.path_of(5_000).as_deref(), Some("C:\\fresh-start.txt"));
     }
 }

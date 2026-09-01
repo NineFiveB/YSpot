@@ -1,7 +1,7 @@
 //! Shared service state: the hosted index plus the volume-level status bits
 //! reported through `IndexStatus` (SPEC §4.3).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use yspot_proto::{RamBytes, VolumeState, VolumeStatus};
@@ -41,6 +41,12 @@ pub struct ServiceState {
     pub index_epoch: AtomicU64,
     /// Root with trailing backslash (`C:\` or the walk root).
     pub root_path: String,
+    /// Sessions currently reporting themselves interactive (§4.3 `SessionState`).
+    ///
+    /// §3.6 defines the machine as idle only when EVERY connected session says
+    /// so, which is why this is a count rather than a flag: one active session
+    /// must be able to hold heavy maintenance off for all of them.
+    pub active_sessions: AtomicUsize,
     pub mode: Mode,
 }
 
@@ -51,6 +57,7 @@ impl ServiceState {
             vol_state: AtomicU8::new(VS_ENUMERATING),
             paused: AtomicBool::new(false),
             index_epoch: AtomicU64::new(1),
+            active_sessions: AtomicUsize::new(0),
             root_path,
             mode,
         }
@@ -71,6 +78,26 @@ impl ServiceState {
         self.vol_state.store(s, Ordering::SeqCst);
     }
 
+    /// §3.6: the machine counts as idle only when every connected session
+    /// reports idle. Heavy maintenance — compaction, merges — waits for this.
+    pub fn machine_idle(&self) -> bool {
+        self.active_sessions.load(Ordering::SeqCst) == 0
+    }
+
+    /// Move one session between the active and idle sets. Idempotent per
+    /// session: the caller passes what it previously reported, so a repeated
+    /// `Active` cannot double-count and a disconnect cannot under-count.
+    pub fn set_session_active(&self, was_active: bool, now_active: bool) {
+        match (was_active, now_active) {
+            (false, true) => {
+                self.active_sessions.fetch_add(1, Ordering::SeqCst);
+            }
+            (true, false) => {
+                self.active_sessions.fetch_sub(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+    }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::SeqCst)
     }
