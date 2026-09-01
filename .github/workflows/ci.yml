@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  rust:
+    name: Rust (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The shell crate embeds the built frontend via generate_context!, so
+      # dist/ must exist before anything in the workspace is compiled.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/shell/package-lock.json
+
+      - name: Build frontend
+        working-directory: apps/shell
+        run: |
+          npm ci
+          npm run build
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  smoke:
+    name: Indexer smoke test (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build indexd
+        run: cargo build -p yspot-indexd --release
+
+      # Runners are NTFS and the job is elevated, so both indexing paths are
+      # exercisable here even though a locked-down dev machine cannot run
+      # unsigned binaries locally.
+      - name: Walk-mode index + pipe server starts
+        shell: pwsh
+        run: |
+          $exe = "target/release/yspot-indexd.exe"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--walk", "$env:RUNNER_TEMP" `
+            -PassThru -RedirectStandardOutput walk.log -RedirectStandardError walk.err
+          Start-Sleep -Seconds 20
+          if ($proc.HasExited) {
+            Write-Host "indexd exited early with code $($proc.ExitCode)"
+            Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Stop-Process -Id $proc.Id -Force
+          Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
+          if (-not (Select-String -Path walk.log -Pattern "walk complete" -Quiet)) {
+            Write-Host "::error::indexd never logged 'walk complete'"
+            exit 1
+          }
+
+      - name: MFT enumeration of C: (timing for SPEC §10 M0)
+        shell: pwsh
+        run: |
+          $exe = "target/release/yspot-indexd.exe"
+          $proc = Start-Process -FilePath $exe -ArgumentList "--mft", "C:" `
+            -PassThru -RedirectStandardOutput mft.log -RedirectStandardError mft.err
+          Start-Sleep -Seconds 60
+          if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
+          Get-Content mft.log, mft.err -ErrorAction SilentlyContinue
+          # Informational: CI runners are shared VMs, so timings here are an
+          # upper bound, not the SPEC §10 reference-machine measurement.
+        continue-on-error: true

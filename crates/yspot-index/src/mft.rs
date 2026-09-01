@@ -34,6 +34,11 @@ use crate::{EntrySink, UsnCursor};
 pub(crate) const FRN_FILE_NUMBER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// MFT file number of the volume root directory (`.`), always record 5.
 pub(crate) const ROOT_FILE_NUMBER: u64 = 5;
+/// File numbers below this are reserved NTFS metafiles ($MFT, $LogFile,
+/// $Bitmap, $Secure, …) plus the root directory — none is user-openable
+/// content, so enumeration skips them all (§3.8).
+pub(crate) const FIRST_USER_FILE_NUMBER: u64 = 16;
+const _: () = assert!(ROOT_FILE_NUMBER < FIRST_USER_FILE_NUMBER);
 
 /// Fixed part of `USN_RECORD_V2` before the inline `FileName` array, bytes.
 const USN_RECORD_V2_HEADER: usize = 60;
@@ -130,7 +135,7 @@ pub fn enumerate<S: EntrySink>(volume_root: &str, sink: &mut S) -> anyhow::Resul
             // File numbers 0–15 are reserved NTFS metafiles ($MFT, $LogFile,
             // $Bitmap, …, and record 5 = the volume root directory). None of
             // them is user-openable content; indexing them is pure noise (§3.8).
-            if rec.frn & FRN_FILE_NUMBER_MASK < 16 {
+            if rec.frn & FRN_FILE_NUMBER_MASK < FIRST_USER_FILE_NUMBER {
                 return;
             }
             sink.add(
