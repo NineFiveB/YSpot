@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+# SPEC §10 M0 latency evidence for the §3.4 matching path. Deliberately
+# dependency-free (seeded PRNG inline) so it adds nothing to the service build.
+#   cargo build -p yspot-index --bin bench --release
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 yspot-proto = { path = "../yspot-proto" }
 thiserror.workspace = true

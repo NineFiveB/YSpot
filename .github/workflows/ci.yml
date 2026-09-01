@@ -47,6 +47,23 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # SPEC §10 M0 wants measured evidence for the §3.4 matching path before
+      # feature work proceeds. Advisory on purpose — no --strict yet: a shared,
+      # throttled runner is not reference Machine A/B, so this is a regression
+      # tripwire, not M0 sign-off. Flip to --strict once the numbers are stable.
+      - name: "Matching benchmark (advisory)"
+        shell: bash
+        run: |
+          cargo build -p yspot-index --bin bench --release
+          ./target/release/bench.exe --entries 300000 --iterations 100 --json-out bench.json
+
+      - name: Upload benchmark metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: matching-bench
+          path: bench.json
+          if-no-files-found: error
+
   smoke:
     name: Indexer smoke test (windows-latest)
     runs-on: windows-latest
@@ -94,7 +111,14 @@ jobs:
           $exe = "target/release/yspot-indexd.exe"
           $proc = Start-Process -FilePath $exe -ArgumentList "--mft", "C:" `
             -PassThru -RedirectStandardOutput mft.log -RedirectStandardError mft.err
-          Start-Sleep -Seconds 60
+          # Enumeration reports every 2 s, so a partial run still yields a rate.
+          # Poll for completion rather than sleeping a flat interval.
+          $deadline = (Get-Date).AddSeconds(240)
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            $sofar = @(Get-Content mft.log, mft.err -ErrorAction SilentlyContinue) -join "`n"
+            if ($sofar -match "enumerated C:") { break }
+          }
           if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force }
           Get-Content mft.log, mft.err -ErrorAction SilentlyContinue
           # Informational: CI runners are shared VMs, so timings here are an
