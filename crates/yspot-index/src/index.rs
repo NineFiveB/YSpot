@@ -129,6 +129,17 @@ const DEPTH_REPAIR_SLICE: usize = 64 * 1024;
 /// its size, which is the 4.19 B/entry line of the §3.4 memory budget.
 const ENTRY_GROW_CHUNK: usize = 64 * 1024;
 const ARENA_GROW_CHUNK: usize = 1024 * 1024;
+/// Floors for the same steps, and the reason they are proportional at all.
+///
+/// A flat step sized for a 1M-entry volume is absurd on a 20k-entry one: the
+/// first insert after `finalize` reserved a chunk in EVERY column at once —
+/// 64 Ki entries, 1 MiB per arena, and a matching step in each derived column —
+/// about 5.4 MB to admit a single file, i.e. 270 B/entry of pure reservation
+/// against a 200 B/entry cap. So each step is an eighth of what the structure
+/// already holds, clamped into these bounds: bounded overshoot on a large
+/// index, proportionate on a small one.
+const ENTRY_GROW_MIN: usize = 1024;
+const ARENA_GROW_MIN: usize = 64 * 1024;
 
 /// Folded-arena bytes covered by one [`VolumeIndex::owner`] slot.
 ///
@@ -208,6 +219,17 @@ pub(crate) fn class_mask(folded: &str) -> u64 {
 
 /// `u64`s in [`VolumeIndex::tri_present`]: 2^24 bits, one per byte trigram.
 const TRI_WORDS: usize = 1 << 18;
+/// Folded-arena size at which [`VolumeIndex::tri_present`] starts paying for
+/// itself, in bytes — its own size.
+///
+/// The set is a FIXED 2 MiB whatever the index holds, so on a small volume it
+/// costs more than the arena it indexes and dwarfs the §3.4 per-entry budget:
+/// 105 B/entry at 20k entries, against a 200 B/entry cap. What it buys also
+/// shrinks with the arena, because the scan it skips is proportional to it —
+/// at 380 KB the scan it avoids is single-digit microseconds. So it is
+/// allocated only once it is smaller than the data it accelerates, and
+/// `bi_present` (8 KiB) carries the gate alone below that.
+const TRI_PRESENT_MIN_ARENA: usize = TRI_WORDS * 8;
 /// `u64`s in [`VolumeIndex::bi_present`]: 2^16 bits, one per byte bigram.
 const BI_WORDS: usize = 1 << 10;
 
@@ -571,6 +593,11 @@ impl VolumeIndex {
         {
             return false;
         }
+        // Absent below the arena-size threshold, in which case the bigram gate
+        // above is the whole test.
+        if self.tri_present.is_empty() {
+            return true;
+        }
         !q.windows(3).any(|w| {
             !bit_test(
                 &self.tri_present,
@@ -604,6 +631,9 @@ impl VolumeIndex {
         // place the monotonic bucket count may be lowered.
         self.frn_map_buckets = 0;
         self.note_frn_map_buckets();
+        // Bulk load is over, so the arena is now its settled size: this is the
+        // first point at which the trigram set can be sized against it.
+        self.resize_tri_present(true);
         self.settled = true;
         self.sweep_all_depths();
     }
@@ -758,16 +788,27 @@ impl VolumeIndex {
         false
     }
 
+    /// Growth step for the slot-keyed columns: an eighth of the entry table,
+    /// clamped to [`ENTRY_GROW_MIN`]..=[`ENTRY_GROW_CHUNK`].
+    fn entry_chunk(&self) -> usize {
+        (self.entries.len() / 8).clamp(ENTRY_GROW_MIN, ENTRY_GROW_CHUNK)
+    }
+
+    /// Growth step for the arenas, on the same rule.
+    fn arena_chunk(&self) -> usize {
+        (self.folded_arena.len() / 8).clamp(ARENA_GROW_MIN, ARENA_GROW_CHUNK)
+    }
+
     /// Make room for `need` more arena bytes in whole [`ARENA_GROW_CHUNK`]s.
     /// `reserve_exact` counts from `len`, so the current spare is asked for
     /// again — otherwise the reservation would shrink the arena's headroom.
-    fn reserve_arena(arena: &mut String, need: usize) {
+    fn reserve_arena(arena: &mut String, need: usize, chunk: usize) {
         let spare = arena.capacity() - arena.len();
         if spare >= need {
             return;
         }
-        let chunks = (need - spare).div_ceil(ARENA_GROW_CHUNK);
-        arena.reserve_exact(spare + chunks * ARENA_GROW_CHUNK);
+        let chunks = (need - spare).div_ceil(chunk);
+        arena.reserve_exact(spare + chunks * chunk);
     }
 
     /// Keep [`Self::owner`] able to index every byte the folded arena can
@@ -989,6 +1030,10 @@ impl VolumeIndex {
         // place the presence sets stop being a superset of the live arena and
         // become exact again: they are set-only during normal operation.
         self.charclass_bsi.iter_mut().for_each(|w| *w = 0);
+        // Compaction is where the arena changes size, so it is also where the
+        // trigram set is (de)allocated — before the refill below, which must
+        // not write into a set this just dropped.
+        self.resize_tri_present(false);
         self.tri_present.iter_mut().for_each(|w| *w = 0);
         self.bi_present.iter_mut().for_each(|w| *w = 0);
         self.uni_present = [0; 4];
@@ -1009,11 +1054,13 @@ impl VolumeIndex {
                 for w in fb.windows(2) {
                     bit_set(bi, (w[0] as usize) << 8 | w[1] as usize);
                 }
-                for w in fb.windows(3) {
-                    bit_set(
-                        tri,
-                        (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
-                    );
+                if !tri.is_empty() {
+                    for w in fb.windows(3) {
+                        bit_set(
+                            tri,
+                            (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+                        );
+                    }
                 }
                 class_mask(folded)
             };
@@ -1050,6 +1097,44 @@ impl VolumeIndex {
         self.settled = true;
 
         before.saturating_sub(self.ram_bytes())
+    }
+
+    /// Allocate or drop [`Self::tri_present`] according to whether the arena is
+    /// now big enough to be worth indexing (see [`TRI_PRESENT_MIN_ARENA`]).
+    ///
+    /// Called only from the two places that already sweep everything —
+    /// [`Self::finalize`] and [`Self::compact`] — so an index that grows past
+    /// the threshold between them simply runs without the trigram gate until
+    /// the next one. That is a performance difference and never a correctness
+    /// one: an absent set means Pass A always runs, which is exactly what the
+    /// set exists to sometimes skip.
+    ///
+    /// `populate` says whether this call is responsible for filling a set it
+    /// allocates. `compact` refills every presence set immediately afterwards,
+    /// so it passes `false` and saves the duplicate sweep.
+    fn resize_tri_present(&mut self, populate: bool) {
+        let want = self.folded_arena.len() >= TRI_PRESENT_MIN_ARENA;
+        let have = !self.tri_present.is_empty();
+        if want == have {
+            return;
+        }
+        if !want {
+            self.tri_present = Vec::new().into_boxed_slice();
+            return;
+        }
+        let mut set = vec![0u64; TRI_WORDS].into_boxed_slice();
+        if populate {
+            for (_, e) in self.live_entries() {
+                let (off, len) = (e.folded_off as usize, e.folded_len as usize);
+                for w in self.folded_arena.as_bytes()[off..off + len].windows(3) {
+                    bit_set(
+                        &mut set,
+                        (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+                    );
+                }
+            }
+        }
+        self.tri_present = set;
     }
 
     /// Whether enough dead weight has accumulated to be worth compacting
@@ -1096,8 +1181,9 @@ impl VolumeIndex {
             return None;
         }
         if self.settled {
-            Self::reserve_arena(&mut self.name_arena, nfc.len());
-            Self::reserve_arena(&mut self.folded_arena, folded.len() + fences);
+            let chunk = self.arena_chunk();
+            Self::reserve_arena(&mut self.name_arena, nfc.len(), chunk);
+            Self::reserve_arena(&mut self.folded_arena, folded.len() + fences, chunk);
             Self::reserve_owner(&mut self.owner, self.folded_arena.capacity());
         }
         let name_off = self.name_arena.len() as u32;
@@ -1179,18 +1265,18 @@ impl VolumeIndex {
             // geometric doubling — the behavior Step 1 exists to remove. Every
             // column added later needs this same shape.
             if self.settled {
+                let chunk = self.entry_chunk();
                 if self.entries.len() == self.entries.capacity() {
-                    self.entries.reserve_exact(ENTRY_GROW_CHUNK);
+                    self.entries.reserve_exact(chunk);
                 }
                 if self.rank_key.len() == self.rank_key.capacity() {
-                    self.rank_key.reserve_exact(ENTRY_GROW_CHUNK);
+                    self.rank_key.reserve_exact(chunk);
                 }
                 // Spare, not `len == capacity`: this column grows by whole
                 // lanes, so a capacity a few bytes short of the next lane would
                 // pass a `len == capacity` test and then double.
                 if self.initials.capacity() - self.initials.len() < INITIALS_STRIDE {
-                    self.initials
-                        .reserve_exact(ENTRY_GROW_CHUNK * INITIALS_STRIDE);
+                    self.initials.reserve_exact(chunk * INITIALS_STRIDE);
                 }
             }
             self.entries.push(e);
@@ -1223,12 +1309,15 @@ impl VolumeIndex {
                 bit_set(bi, (w[0] as usize) << 8 | w[1] as usize);
             }
             // Per RECORD, so no n-gram spans a delimiter and the sets answer
-            // only about text that is actually a name.
-            for w in fb.windows(3) {
-                bit_set(
-                    tri,
-                    (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
-                );
+            // only about text that is actually a name. Skipped entirely when
+            // the arena is too small to warrant the 2 MiB set.
+            if !tri.is_empty() {
+                for w in fb.windows(3) {
+                    bit_set(
+                        tri,
+                        (w[0] as usize) << 16 | (w[1] as usize) << 8 | w[2] as usize,
+                    );
+                }
             }
             class_mask(folded)
         };
@@ -1269,7 +1358,7 @@ impl VolumeIndex {
         );
         // Each structure is guarded on its OWN capacity — see `register_slot`.
         if self.settled && self.arena_recs.len() == self.arena_recs.capacity() {
-            self.arena_recs.reserve_exact(ENTRY_GROW_CHUNK);
+            self.arena_recs.reserve_exact(self.entry_chunk());
         }
         self.arena_recs.push(ArenaRec { off, slot });
         // `owner`'s capacity was taken with the arena's, in `intern`.
@@ -2691,5 +2780,86 @@ mod tests {
         // And the unfiltered query over the same corpus still works, so the
         // emptiness is the filter's doing and not a broken index.
         assert_eq!(v.search("note", 16, &|| false).len(), 16);
+    }
+
+    /// A small volume must fit its §3.4 budget, which a fixed-size structure
+    /// makes impossible however cheap it is per entry.
+    ///
+    /// The trigram set is 2 MiB whatever the index holds: at 20k entries that
+    /// alone was 105 B/entry of a 200 B/entry cap, and the whole index measured
+    /// 502 B/entry. A USB stick or a small partition is a real deployment, so
+    /// the set is now allocated only once the arena it accelerates is larger
+    /// than the set itself.
+    #[test]
+    fn a_small_volume_fits_its_budget() {
+        const SMALL: u64 = 20_000;
+        const CAP_PER_ENTRY: u64 = 200;
+
+        let mut v = ix();
+        for i in 0..SMALL {
+            v.add(i + 1, ABSENT_PARENT, &format!("report-{i}-draft.txt"), 0);
+        }
+        v.finalize();
+
+        assert!(
+            v.folded_arena.len() < TRI_PRESENT_MIN_ARENA,
+            "corpus is too large to exercise the small-volume path"
+        );
+        assert!(
+            v.tri_present.is_empty(),
+            "trigram set should not be allocated below the arena threshold"
+        );
+
+        // Measured AFTER a mutation, not just after finalize. The first insert
+        // past `finalize` is what takes a growth step in every column at once,
+        // and a flat step sized for a 1M-entry index put ~5.4 MB behind a
+        // single file here — 270 B/entry of reservation on its own. A cold-only
+        // assertion would have missed that entirely.
+        v.apply(crate::UsnEvent::Create {
+            frn: 900_001,
+            parent_frn: ABSENT_PARENT,
+            name: "one-more-file.txt".into(),
+            flags: 0,
+        });
+        let per_entry = v.ram_bytes() / SMALL;
+        assert!(
+            per_entry < CAP_PER_ENTRY,
+            "{per_entry} B/entry exceeds the {CAP_PER_ENTRY} B/entry cap at {SMALL} entries"
+        );
+
+        // Dropping the set must not cost results: the bigram gate still rejects
+        // impossible queries, and real ones still match.
+        assert_eq!(v.search("zzqxjv", 8, &|| false).len(), 0);
+        // A full page, not one row: "report-7-draft" is also a SUBSEQUENCE of
+        // "report-70-draft.txt" and its siblings, so the fuzzy tier fills the
+        // rest. What matters is that the exact prefix still ranks first.
+        let hits = v.search("report-7-draft", 8, &|| false);
+        assert_eq!(hits.len(), 8);
+        assert_eq!(v.name_of(hits[0].frn), Some("report-7-draft.txt"));
+        assert_eq!(v.search("draft", 8, &|| false).len(), 8);
+    }
+
+    /// The mirror case: once the arena outgrows the set, the set is built and
+    /// the trigram gate starts rejecting again.
+    #[test]
+    fn a_large_volume_allocates_the_trigram_set() {
+        let mut v = ix();
+        let mut i = 0u64;
+        while v.folded_arena.len() < TRI_PRESENT_MIN_ARENA + (1 << 16) {
+            v.add(
+                i + 1,
+                ABSENT_PARENT,
+                &format!("document-{i}-revision-final.txt"),
+                0,
+            );
+            i += 1;
+        }
+        v.finalize();
+
+        assert!(!v.tri_present.is_empty(), "set should be allocated");
+        // Built from the live records, not left zeroed — a zeroed set would
+        // reject every query, so this also proves `populate` ran.
+        assert_eq!(v.search("revision", 4, &|| false).len(), 4);
+        assert_eq!(v.search("zzqxjv", 4, &|| false).len(), 0);
     }
 }
