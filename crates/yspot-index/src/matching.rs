@@ -7,11 +7,23 @@
 //!
 //! Final score = `base × depth_penalty × hidden_penalty` where
 //! `depth_penalty = 1 / (1 + 0.02·path_depth)` and entries carrying the
-//! HIDDEN or SYSTEM attribute are additionally multiplied by `0.85`.
+//! HIDDEN or SYSTEM attribute are additionally multiplied by `0.85`. Both
+//! factors are read out of the index's 1 B/entry `rank_key` column through
+//! [`crate::index::DEPTH_PEN`] — a table lookup, not a parent-chain walk.
+//!
+//! Candidates are ranked INLINE, into a min-heap capped at `2·max_results`
+//! (see [`Selector`]), so a pass whose best possible score cannot reach the
+//! page is skipped and a hit whose tier cannot reach it is rejected from the
+//! two arena bytes fencing it, before anything is mapped or looked up. Every
+//! such comparison is strict; the reason, and the test that holds it in place,
+//! are on [`Selector`].
 //!
 //! Candidate generation never walks the whole entry table per tier:
 //! exact/prefix/word-boundary/substring fall out of one `memmem` scan over
-//! the folded name arena (hits mapped to entries via a sorted offset vec);
+//! the folded name arena — which is `0x00 rec 0x00 rec 0x00`, so the two
+//! bytes fencing a hit give its tier outright and a delimiter-free query can
+//! only ever match inside a single record (hits are mapped to entries via a
+//! sorted offset vec);
 //! initials are substring-scanned in their own small arena; fuzzy candidates
 //! come from byte-trigram posting-list intersection, capped at
 //! [`FUZZY_CAP`] scored candidates per query.
@@ -24,12 +36,18 @@ use std::collections::{BinaryHeap, HashMap};
 
 use memchr::memmem;
 
-use crate::index::{fold, VolumeIndex};
-use crate::{flags, Hit};
+use crate::index::{fold, has_control_byte, VolumeIndex, DEPTH_PEN, FOLDED_DELIM};
+use crate::Hit;
 
 /// Cancellation is polled at least every this many hits/candidates (§3.4
 /// mandates prompt cancel on new keystrokes) and before every pass.
 const CANCEL_STRIDE: usize = 4096;
+
+/// Pass A also polls cancellation every this many arena bytes advanced, so a
+/// query that hits nothing at all is still interruptible: `CANCEL_STRIDE` is
+/// counted in HITS, and a zero-hit scan of a 24 MB arena would otherwise run to
+/// completion no matter how many keystrokes arrived.
+const SCAN_POLL_CHUNK: usize = 1 << 20;
 
 /// Max fuzzy candidates scored per query (§3.4 prefilter bound).
 const FUZZY_CAP: usize = 20_000;
@@ -81,11 +99,12 @@ impl Accel {
         if !self.dirty {
             return;
         }
-        // Live entries only. A tombstoned slot keeps its name in both arenas,
-        // so a dead slot left in `folded_order` would map hits in those stale
-        // bytes back to a deleted file. Excluding it also makes those bytes
-        // unmappable: the nearest preceding live record ends before them, so
-        // `entry_at`'s bounds check rejects the hit.
+        // Live entries only. A tombstoned slot keeps its ORIGINAL-case name in
+        // the name arena, so a dead slot left in `folded_order` would map a
+        // hit back to a deleted file. Its folded record is erased at
+        // `unregister_slot`, so those bytes can no longer produce a hit at
+        // all — the exclusion here and the erasure there are belt and braces
+        // for the same wrong-result failure.
         self.folded_order.clear();
         self.folded_order.reserve(ix.len());
         for (slot, e) in ix.live_entries() {
@@ -178,7 +197,10 @@ pub(crate) struct AccelRam {
 /// needle lengths it is far below the scan cost.
 pub(crate) fn arena_scan_probe(ix: &VolumeIndex, needle: &str) -> usize {
     let fq = fold(needle);
-    if fq.is_empty() {
+    // Rejected on the same rule as a real query: a needle carrying a reserved
+    // byte would count record fences instead of names, which is not the scan
+    // this probe is meant to isolate.
+    if fq.is_empty() || has_control_byte(&fq) {
         return 0;
     }
     memmem::find_iter(ix.folded_arena.as_bytes(), fq.as_bytes()).count()
@@ -297,39 +319,75 @@ fn tier_base(t: Tier) -> f32 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct Cand {
-    tier: Tier,
-    base: f32,
+/// Exact upper bound on any final score a tier can produce.
+///
+/// `score = base × depth_penalty × hidden_penalty` and both factors are ≤ 1, so
+/// the tier's own base bounds it. Nothing else about the candidate is needed,
+/// which is the point: this is testable from the two arena bytes fencing a hit,
+/// before any mapping, entry read or column touch.
+///
+/// Distinct from [`tier_base`] for exactly one tier. `tier_base(Fuzzy)` is 0.3,
+/// documented at its definition as a FLOOR — the real fuzzy base is
+/// `0.3 + 0.2·density`, up to 0.5. Using 0.3 as a bound would discard every
+/// fuzzy candidate scoring 0.31-0.5, silently, with no test failing.
+fn tier_upper_bound(t: Tier) -> f32 {
+    match t {
+        Tier::Exact => 1.0,
+        Tier::Prefix => 0.9,
+        Tier::WordBoundary => 0.8,
+        Tier::Initials => 0.7,
+        Tier::Substring => 0.55,
+        Tier::Fuzzy => 0.5,
+    }
 }
 
-/// Dedup across tiers by entry, keeping the best base score.
-fn upgrade(best: &mut HashMap<u32, Cand>, entry: u32, tier: Tier, base: f32) {
-    best.entry(entry)
-        .and_modify(|c| {
-            if base > c.base {
-                *c = Cand { tier, base };
-            }
-        })
-        .or_insert(Cand { tier, base });
+/// Tier of a folded-arena hit, from the two bytes fencing it — both already in
+/// L1 from the scan, so this is a couple of compares and no lookup at all.
+///
+/// Sound because the arena is `0x00 rec 0x00 rec 0x00` and the query is
+/// delimiter-free (checked in [`search`]): a hit therefore lies strictly inside
+/// one record and has a fence byte on each side. A leading delimiter means the
+/// match starts the name, a trailing one means it ends the name, both means the
+/// match IS the name.
+#[inline]
+fn classify(before: u8, after: u8) -> Tier {
+    match (before, after) {
+        (FOLDED_DELIM, FOLDED_DELIM) => Tier::Exact,
+        (FOLDED_DELIM, _) => Tier::Prefix,
+        (b, _) if is_sep_byte(b) => Tier::WordBoundary,
+        _ => Tier::Substring,
+    }
 }
 
-/// Map a folded-arena hit offset to the entry containing it, if the whole
-/// match lies inside that entry's folded name (stale bytes from renamed or
-/// deleted names fail the bounds check and are skipped).
+/// Map a folded-arena hit offset to the entry containing it.
+///
+/// With the arena fenced this can no longer reject anything, and that is the
+/// point. A delimiter-free query only matches inside a maximal run of
+/// non-delimiter bytes; every such run is exactly one live record, because
+/// each record is appended with its own trailing fence and a vacated one is
+/// overwritten with fences; and record offsets are unique and ascending. So
+/// the greatest live offset `≤ hit` is the record the hit is in, and the whole
+/// match lies inside it.
+///
+/// That is what retires the straddle bug: the containment test used to reject
+/// a match spanning two records *after* `find_iter` had already moved its
+/// non-overlapping cursor past a genuine match starting inside the straddle,
+/// so the second entry was silently unreachable. The test is kept as a
+/// defensive belt — a later structure could reintroduce a stale offset here —
+/// and asserted on in debug so a broken invariant is loud rather than a
+/// quietly missing result.
 fn entry_at(order: &[(u32, u32)], ix: &VolumeIndex, hit: usize, qlen: usize) -> Option<u32> {
     let pos = order.partition_point(|&(off, _)| (off as usize) <= hit);
     if pos == 0 {
-        return None;
+        return None; // unreachable while the arena is fenced: hit ≥ 1 and the
+                     // first live record starts at offset 1 or before the hit
     }
     let (off, eidx) = order[pos - 1];
     let e = &ix.entries[eidx as usize];
     debug_assert!(!e.is_dead(), "folded_order must hold live slots only");
-    if hit + qlen <= off as usize + e.folded_len as usize {
-        Some(eidx)
-    } else {
-        None
-    }
+    let contained = hit + qlen <= off as usize + e.folded_len as usize;
+    debug_assert!(contained, "hit at {hit} escaped its record: arena fencing");
+    contained.then_some(eidx)
 }
 
 fn initials_entry_at(spans: &[InitialsSpan], hit: usize, qlen: usize) -> Option<u32> {
@@ -511,6 +569,105 @@ impl Ord for Scored {
     }
 }
 
+/// Running top-K: a min-heap capped at `2·max_results`, plus a `seen` bitset so
+/// the fuzzy pass can skip slots a higher tier already claimed.
+///
+/// This replaces a `HashMap<u32, Cand>` that collected EVERY candidate and a
+/// ranking loop that then walked all of them calling `depth_of`. Candidates
+/// are now scored and admitted inline, so the pruning rules below can look at a
+/// live floor and stop work that provably cannot reach the page.
+///
+/// **Why 2K is exactly enough.** An entry is offered at most twice: once by
+/// Pass A (all its hits lie inside its one contiguous record, and consecutive-
+/// slot grouping collapses them into a single offer) and once by Pass B; Pass C
+/// skips `seen` slots. Let `s_K` be the K-th best distinct slot, with best
+/// offer `(v, s_K)`. Each of the K-1 better distinct slots contributes at most
+/// 2 offers, so `(v, s_K)` ranks at worst 2K-1 among all offers and a 2K heap
+/// retains it. Drain, dedup by slot keeping the max, sort, truncate to K —
+/// identical to ranking everything, with no heap-position bookkeeping.
+///
+/// **Why the rules are STRICT.** [`Scored::cmp`] breaks equal scores by LOWER
+/// `eidx`, so an offer whose score merely EQUALS the floor can still displace
+/// the current 2K-th. `≥`/`≤` rules would discard those tie-break winners —
+/// a wrong-results bug that changes nothing an existing test asserts, which is
+/// why the differential test in this module's tests exists.
+struct Selector {
+    heap: BinaryHeap<Reverse<Scored>>,
+    /// `2·max_results`.
+    cap: usize,
+    /// Score of the current 2K-th best offer. Meaningful only once the heap is
+    /// full; monotonically non-decreasing from then on, which is what makes the
+    /// rules conservative — the running floor is the 2K-th best over a PREFIX
+    /// of the offer stream, hence never above the final 2K-th best.
+    floor: f32,
+    /// One bit per slot: offered by some pass already.
+    seen: Vec<u64>,
+}
+
+impl Selector {
+    fn new(max_results: usize, slots: usize) -> Self {
+        let cap = max_results.saturating_mul(2).max(1);
+        Self {
+            heap: BinaryHeap::with_capacity(cap),
+            cap,
+            floor: f32::NEG_INFINITY,
+            seen: vec![0u64; slots.div_ceil(64)],
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.heap.len() >= self.cap
+    }
+
+    /// Whether a candidate bounded by `ub` provably cannot reach the page.
+    ///
+    /// STRICT `<`: on equality the offer falls through to the full
+    /// [`Scored::cmp`], which is where the `eidx` tie-break lives. Used both as
+    /// the per-hit reject (~5 ns, touches no memory but the two fence bytes)
+    /// and, with the tier's own bound, as the whole-pass skip.
+    fn rejects(&self, ub: f32) -> bool {
+        self.full() && ub < self.floor
+    }
+
+    fn is_seen(&self, slot: u32) -> bool {
+        self.seen[slot as usize >> 6] >> (slot & 63) & 1 != 0
+    }
+
+    /// Score `slot` and admit it. `rank_key` supplies depth and the
+    /// hidden/system penalty in one byte — no entry read, no parent walk.
+    fn offer(&mut self, rank_key: &[u8], slot: u32, tier: Tier, base: f32) {
+        self.seen[slot as usize >> 6] |= 1 << (slot & 63);
+        let s = Scored {
+            score: base * DEPTH_PEN[rank_key[slot as usize] as usize],
+            eidx: slot,
+            tier,
+        };
+        if self.heap.len() < self.cap {
+            self.heap.push(Reverse(s));
+            if self.heap.len() == self.cap {
+                self.floor = self.heap.peek().expect("full").0.score;
+            }
+        } else if s.cmp(&self.heap.peek().expect("full").0) == Ordering::Greater {
+            // Equal here means same score AND same slot, i.e. a duplicate
+            // offer, which drain-dedup would collapse anyway.
+            self.heap.pop();
+            self.heap.push(Reverse(s));
+            self.floor = self.heap.peek().expect("full").0.score;
+        }
+    }
+
+    /// Drain to the final page: dedup by slot keeping the best offer, order by
+    /// [`Scored::cmp`], truncate to `max_results`.
+    fn drain(self, max_results: usize) -> Vec<Scored> {
+        let mut all: Vec<Scored> = self.heap.into_iter().map(|r| r.0).collect();
+        all.sort_unstable_by(|a, b| a.eidx.cmp(&b.eidx).then_with(|| b.cmp(a)));
+        all.dedup_by_key(|s| s.eidx); // runs are best-first, so this keeps the max
+        all.sort_unstable_by(|a, b| b.cmp(a));
+        all.truncate(max_results);
+        all
+    }
+}
+
 /// Tiered search over one volume index (§3.4); called from
 /// [`VolumeIndex::search`]. Returns up to `max_results` hits, best first.
 pub(crate) fn search(
@@ -525,62 +682,153 @@ pub(crate) fn search(
     if fq.is_empty() || max_results == 0 || ix.is_empty() {
         return Vec::new();
     }
+    // Queries arrive from the untrusted pipe (§3, §8.1) and U+0000 is the
+    // folded arena's record delimiter, so a query carrying one is the single
+    // input that could match across two records — the exact adjacency the
+    // delimiters exist to forbid. Every other byte below 0x20 is likewise
+    // absent from the arena by invariant I3, so it can only burn a full scan
+    // to find nothing. Rejected, not stripped: quietly searching for
+    // something the caller did not type is the worse of the two failures.
+    if has_control_byte(&fq) {
+        log::debug!("search: query with a reserved byte rejected");
+        return Vec::new();
+    }
 
     let mut accel = ix.accel_lock();
     accel.ensure_basic(ix);
 
-    let mut best: HashMap<u32, Cand> = HashMap::new();
+    let rank_key = &ix.rank_key;
+    let mut sel = Selector::new(max_results, ix.entries.len());
     let finder = memmem::Finder::new(fq.as_bytes());
+    let qlen = fq.len();
     let mut processed = 0usize;
     let mut cancelled = is_cancelled();
 
-    // Pass 1: one scan of the folded name arena classifies the
+    // Pass A: one scan of the folded name arena classifies the
     // exact / prefix / word-boundary / substring tiers per hit.
+    //
+    // Driven by hand rather than through `find_iter` for two reasons: the
+    // cursor has to be visible so cancellation can be polled per MiB of arena
+    // as well as per hit, and hits have to be groupable by record. Advancing by
+    // `qlen` after every hit reproduces `find_iter`'s non-overlapping matches
+    // exactly, so nothing about which hits are seen changes here.
     if !cancelled {
         let arena = ix.folded_arena.as_bytes();
-        for hit in finder.find_iter(arena) {
-            processed += 1;
-            if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
+        // Tier classification reads `arena[hit - 1]` and `arena[hit + qlen]`
+        // unchecked; both are in bounds only because the arena opens and closes
+        // with a fence. Step 9's in-place compaction truncates this arena, and
+        // truncating one byte too far would turn that into a panic on the query
+        // path — this makes it a failing test instead.
+        debug_assert!(
+            matches!(
+                (arena.first(), arena.last()),
+                (
+                    Some(&crate::index::FOLDED_DELIM),
+                    Some(&crate::index::FOLDED_DELIM)
+                )
+            ),
+            "folded arena lost a fence"
+        );
+        // The record a run of consecutive hits belongs to, and the best tier
+        // seen for it. All of a record's hits are adjacent in this ascending
+        // scan, so this gives per-entry dedup — what the `best` map used to do
+        // — for the cost of one compare.
+        let mut pend: Option<(u32, Tier)> = None;
+        let mut pos = 0usize;
+        'scan: while pos + qlen <= arena.len() {
+            if is_cancelled() {
                 cancelled = true;
                 break;
             }
-            let Some(eidx) = entry_at(&accel.folded_order, ix, hit, fq.len()) else {
-                continue;
-            };
-            let e = &ix.entries[eidx as usize];
-            let tier = if hit == e.folded_off as usize {
-                if fq.len() == e.folded_len as usize {
-                    Tier::Exact
-                } else {
-                    Tier::Prefix
+            // The window carries the needle overlap ON TOP of the poll chunk,
+            // so `pos` advances by SCAN_POLL_CHUNK + 1 bytes every iteration
+            // whatever `qlen` is. Sizing it as just `pos + SCAN_POLL_CHUNK`
+            // spins forever once `qlen > SCAN_POLL_CHUNK`: the resume point
+            // below saturates to 0 and `pos` never moves. That is reachable
+            // from the pipe — a 1 MiB frame (MAX_FRAME_C2S) of U+0130 folds to
+            // ~1.5x its size, clearing the chunk — so it is a remote spin, not
+            // a theoretical one. `SCAN_POLL_CHUNK.max(qlen)` does NOT fix it:
+            // it degenerates to one byte of progress per full-window rescan.
+            let win_end = (pos + SCAN_POLL_CHUNK + qlen).min(arena.len());
+            let mut cursor = pos;
+            while let Some(rel) = finder.find(&arena[cursor..win_end]) {
+                let hit = cursor + rel;
+                cursor = hit + qlen;
+                processed += 1;
+                if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
+                    cancelled = true;
+                    break 'scan;
                 }
-            } else if is_sep_byte(arena[hit - 1]) {
-                Tier::WordBoundary
+                let tier = classify(arena[hit - 1], arena[hit + qlen]);
+                // The reject that makes the tail cheap: two L1 bytes and one
+                // float compare, no mapping, no column touch, no entry read.
+                if sel.rejects(tier_upper_bound(tier)) {
+                    continue;
+                }
+                let Some(slot) = entry_at(&accel.folded_order, ix, hit, qlen) else {
+                    continue;
+                };
+                match pend {
+                    Some((prev, best)) if prev == slot => {
+                        if tier_base(tier) > tier_base(best) {
+                            pend = Some((prev, tier));
+                        }
+                    }
+                    Some((prev, best)) => {
+                        sel.offer(rank_key, prev, best, tier_base(best));
+                        pend = Some((slot, tier));
+                    }
+                    None => pend = Some((slot, tier)),
+                }
+            }
+            // No hit STARTS before `win_end - qlen + 1`, so resuming there
+            // cannot re-find or skip anything; `cursor` covers the case where
+            // the last hit ended past that point.
+            pos = if win_end == arena.len() {
+                arena.len()
             } else {
-                Tier::Substring
+                cursor.max(win_end.saturating_sub(qlen - 1))
             };
-            upgrade(&mut best, eidx, tier, tier_base(tier));
+        }
+        if let Some((slot, tier)) = pend {
+            sel.offer(rank_key, slot, tier, tier_base(tier));
         }
     }
 
-    // Pass 2: camel/initials — substring scan of the initials arena.
-    if !cancelled {
+    // Pass B: camel/initials — substring scan of the initials arena.
+    if !cancelled && !sel.rejects(tier_upper_bound(Tier::Initials)) {
+        let mut pend: Option<u32> = None;
         for hit in finder.find_iter(accel.initials_arena.as_bytes()) {
             processed += 1;
             if processed.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
                 cancelled = true;
                 break;
             }
-            let Some(eidx) = initials_entry_at(&accel.initials_spans, hit, fq.len()) else {
+            // The floor only rises, so once the tier is out it stays out.
+            if sel.rejects(tier_upper_bound(Tier::Initials)) {
+                break;
+            }
+            let Some(slot) = initials_entry_at(&accel.initials_spans, hit, qlen) else {
                 continue;
             };
-            upgrade(&mut best, eidx, Tier::Initials, tier_base(Tier::Initials));
+            match pend {
+                Some(prev) if prev == slot => {}
+                Some(prev) => {
+                    sel.offer(rank_key, prev, Tier::Initials, tier_base(Tier::Initials));
+                    pend = Some(slot);
+                }
+                None => pend = Some(slot),
+            }
+        }
+        if let Some(slot) = pend {
+            sel.offer(rank_key, slot, Tier::Initials, tier_base(Tier::Initials));
         }
     }
 
-    // Pass 3: fuzzy subsequence over trigram-intersection candidates.
-    // Queries shorter than 3 bytes skip the tier entirely (§3.4).
-    if !cancelled && fq.len() >= 3 {
+    // Pass C: fuzzy subsequence over trigram-intersection candidates.
+    // Queries shorter than 3 bytes skip the tier entirely (§3.4), and so does
+    // a page already filled above the fuzzy ceiling.
+    if !cancelled && qlen >= 3 && !sel.rejects(tier_upper_bound(Tier::Fuzzy)) {
         accel.ensure_trigrams(ix);
         let tg = accel.trigrams.as_ref().expect("just built");
         let qb = fq.as_bytes();
@@ -600,8 +848,8 @@ pub(crate) fn search(
             let (first, rest) = lists.split_first().expect("non-empty");
             let mut scored = 0usize;
             for &cand in first.iter() {
-                if best.contains_key(&cand) {
-                    continue; // already matched by a higher tier (fuzzy max 0.5 < 0.55)
+                if sel.is_seen(cand) {
+                    continue; // already offered by a higher tier (fuzzy max 0.5 < 0.55)
                 }
                 if !rest.iter().all(|l| l.binary_search(&cand).is_ok()) {
                     continue;
@@ -616,7 +864,7 @@ pub(crate) fn search(
                 }
                 let e = &ix.entries[cand as usize];
                 if let Some(density) = fuzzy_density(ix.folded_of_entry(e), &fq) {
-                    upgrade(&mut best, cand, Tier::Fuzzy, 0.3 + 0.2 * density);
+                    sel.offer(rank_key, cand, Tier::Fuzzy, 0.3 + 0.2 * density);
                 }
             }
         }
@@ -625,29 +873,7 @@ pub(crate) fn search(
         log::trace!("search cancelled early; returning partial results");
     }
 
-    // Rank: score = base × depth_penalty × hidden_penalty; top-K via heap.
-    let mut heap: BinaryHeap<Reverse<Scored>> = BinaryHeap::new();
-    for (i, (&eidx, cand)) in best.iter().enumerate() {
-        if (i + 1).is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
-            break; // return what we have (§3.4 cancellation)
-        }
-        let e = &ix.entries[eidx as usize];
-        let depth = ix.depth_of(eidx);
-        let mut score = cand.base / (1.0 + 0.02 * depth as f32);
-        if e.flags & (flags::HIDDEN | flags::SYSTEM) != 0 {
-            score *= 0.85;
-        }
-        heap.push(Reverse(Scored {
-            score,
-            eidx,
-            tier: cand.tier,
-        }));
-        if heap.len() > max_results {
-            heap.pop();
-        }
-    }
-    let mut top: Vec<Scored> = heap.into_iter().map(|r| r.0).collect();
-    top.sort_by(|a, b| b.cmp(a));
+    let top = sel.drain(max_results);
 
     // match_ranges only for the final page (§3.4).
     let mut hits = Vec::with_capacity(top.len());
@@ -665,6 +891,8 @@ pub(crate) fn search(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{btree_map, BTreeMap};
+
     use super::*;
     use crate::EntrySink;
 
@@ -851,6 +1079,27 @@ mod tests {
         assert_eq!(hits.len(), 10);
     }
 
+    /// A needle longer than [`SCAN_POLL_CHUNK`] must still terminate. Pass A
+    /// resumes each window at `win_end - (qlen - 1)`; if the window is only
+    /// `SCAN_POLL_CHUNK` wide that saturates to the window start and the scan
+    /// spins forever, escapable only by cancellation. Reachable from the pipe:
+    /// a legal 1 MiB frame folds larger than it arrives (U+0130 → 3 bytes), so
+    /// this is a remote spin. `no_cancel` is deliberate — a cancelling closure
+    /// would mask the hang this pins down.
+    #[test]
+    fn needle_longer_than_the_poll_chunk_terminates() {
+        let mut v = ix();
+        for i in 0..8000u64 {
+            v.add(i + 1, 999, &format!("file{i}.txt"), 0);
+        }
+        assert!(
+            v.folded_arena_len() < SCAN_POLL_CHUNK,
+            "the arena must be smaller than the needle for this to bite"
+        );
+        let needle = "b".repeat(SCAN_POLL_CHUNK + 1);
+        assert!(v.search(&needle, 8, &no_cancel).is_empty());
+    }
+
     #[test]
     fn no_cross_entry_arena_matches() {
         let mut v = ix();
@@ -859,6 +1108,50 @@ mod tests {
         v.add(1, 999, "abc", 0);
         v.add(2, 999, "def", 0);
         assert!(v.search("cd", 10, &no_cancel).is_empty());
+    }
+
+    /// SPEC DECISION 8 — a straddling hit must not HIDE a real one.
+    ///
+    /// `memmem::find_iter` yields NON-overlapping matches. Before the arena
+    /// was NUL-delimited it read `"xaaab"`, the only hit for `"aa"` was the
+    /// cross-record one at offset 1, the bounds check dropped it, and the
+    /// finder resumed at offset 3 — past the genuine prefix match on `"aab"`
+    /// at offset 2. The entry was silently unreachable. One delimiter byte per
+    /// record makes the straddle impossible to form, so no hit is ever
+    /// rejected and no resume point can skip a match.
+    #[test]
+    fn adjacent_records_cannot_hide_a_real_match() {
+        let mut v = ix();
+        v.add(1, 999, "xa", 0);
+        v.add(2, 999, "aab", 0);
+        let hits = v.search("aa", 10, &no_cancel);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].frn, 2);
+        assert!(approx(hits[0].score, 0.9)); // a real prefix hit, not a ghost
+        assert_eq!(hits[0].match_ranges, vec![(0, 2)]);
+    }
+
+    /// Queries arrive off the untrusted pipe (§3, §8.1) and U+0000 is the
+    /// folded arena's record delimiter, so a control byte in the folded query
+    /// is rejected at the top of `search` (invariant I3). Without this, an
+    /// attacker-shaped query could address a delimiter and match across two
+    /// records — the exact adjacency the delimiters exist to forbid.
+    #[test]
+    fn control_byte_query_is_rejected_and_never_spans_a_delimiter() {
+        let mut v = ix();
+        v.add(1, 999, "abc", 0);
+        v.add(2, 999, "def", 0);
+        // "c\0d" is literally present in the arena as `…abc\0def…`.
+        assert!(v.search("c\u{0}d", 10, &no_cancel).is_empty());
+        assert!(v.search("\u{0}", 10, &no_cancel).is_empty());
+        assert!(v.search("abc\u{0}", 10, &no_cancel).is_empty());
+        assert!(v.search("\u{0}abc", 10, &no_cancel).is_empty());
+        // Same rule for every other control byte, none of which can occur in
+        // the arena either (I3 is enforced at `intern` too).
+        assert!(v.search("a\tb", 10, &no_cancel).is_empty());
+        assert!(v.search("ab\u{1f}", 10, &no_cancel).is_empty());
+        // The guard rejects control bytes, not queries.
+        assert_eq!(v.search("abc", 10, &no_cancel).len(), 1);
     }
 
     #[test]
@@ -904,6 +1197,400 @@ mod tests {
         assert!(approx(fuzzy_density("abcx_bcd", "abcd").unwrap(), 0.5));
         assert_eq!(fuzzy_density("abc", "abd"), None);
         assert_eq!(fuzzy_density("ab", "abc"), None);
+    }
+
+    // -----------------------------------------------------------------
+    // The differential test.
+    //
+    // `search` now prunes: it skips whole passes and rejects individual hits
+    // against a running floor, and it keeps only 2·max_results offers instead
+    // of every candidate. Both rules must be RESULT-PRESERVING, and no other
+    // test in this file can show that they are — `max_results_caps_and_orders`
+    // only asserts descending order and has no tie at the K boundary. The
+    // failure mode is silent: `Scored::cmp` breaks an equal score by LOWER
+    // eidx, so a `≥` where the design says `>` discards tie-break winners and
+    // every existing assertion still passes.
+    //
+    // So: an exhaustive reference scorer with no heap, no capacity and no
+    // floor, run against the real selector over hundreds of randomized
+    // corpora deliberately built so that equal scores land at the K boundary
+    // — a six-word alphabet (so names repeat verbatim) parented into a handful
+    // of directories (so repeated names share a depth, hence an exactly equal
+    // score) and read back at K = 1..8, where the boundary is a tie almost
+    // every time.
+    // -----------------------------------------------------------------
+
+    /// xorshift64*, so a failure names a seed rather than a mood.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// Deliberately tiny, so names collide verbatim and scores tie exactly.
+    const WORDS: [&str; 6] = ["aa", "ab", "ba", "bb", "ac", "ca"];
+    const SEPS: [char; 4] = ['-', '_', '.', ' '];
+
+    /// Queries across every tier: whole words (exact/prefix), separator-led
+    /// (word boundary), initial pairs and triples (initials), interior slices
+    /// (substring), gapped and 3+ byte forms (fuzzy), and misses.
+    ///
+    /// `FUZZY_PROBE` is the one query the random alphabet cannot produce, and
+    /// it is what puts the fuzzy tier's own bound under test — see
+    /// [`plant_fuzzy_band`].
+    const FUZZY_PROBE: &str = "abcd";
+    const QUERIES: [&str; 31] = [
+        "a",
+        "b",
+        "c",
+        "aa",
+        "ab",
+        "ba",
+        "bb",
+        "ac",
+        "ca",
+        "abc",
+        "aab",
+        "aba",
+        "a-a",
+        "a_b",
+        "a.b",
+        "a b",
+        "-a",
+        "aa-",
+        "aaa",
+        "abab",
+        "aabb",
+        "bac",
+        "aa-b",
+        "b.c",
+        "cab",
+        "aacb",
+        "aaaa",
+        "cc",
+        "zz",
+        "abcabc",
+        FUZZY_PROBE,
+    ];
+
+    fn random_name(rng: &mut Rng) -> String {
+        let mut s = String::new();
+        for i in 0..1 + rng.below(3) {
+            if i > 0 {
+                s.push(SEPS[rng.below(SEPS.len())]);
+            }
+            let w = WORDS[rng.below(WORDS.len())];
+            // Camel-case some segments so the initials tier sees more than one
+            // initial per separator-delimited run.
+            if rng.below(2) == 0 {
+                s.push_str(&w.to_uppercase());
+            } else {
+                s.push_str(w);
+            }
+        }
+        s
+    }
+
+    /// FRN nothing in a generated corpus mints, so naming it as a parent puts
+    /// an entry at depth 0.
+    const NO_PARENT: u64 = 999_999;
+
+    /// Plant the one arrangement that puts `tier_upper_bound(Fuzzy)` itself
+    /// under test, because the random alphabet cannot produce it.
+    ///
+    /// The bound only ever decides anything when the heap is already full and
+    /// the floor sits BELOW the fuzzy ceiling — i.e. when a fuzzy candidate can
+    /// still win the page. So: a deep, hidden family that matches
+    /// [`FUZZY_PROBE`] as a mere substring (`0.55 × 0.85 / 1.24 ≈ 0.377`, and
+    /// enough of them to fill any small page), plus shallow unattributed names
+    /// that the query only reaches as a GAPPED subsequence
+    /// (`0.3 + 0.2 × 4/6 ≈ 0.433`). The fuzzy row outranks the substring rows,
+    /// so skipping Pass C changes the answer.
+    ///
+    /// This is what a bound of `tier_base(Fuzzy)` = 0.3 would break: 0.3 is
+    /// below the 0.377 floor, so the whole pass would be skipped and the 0.433
+    /// row would silently vanish. `abcd` is unreachable from `WORDS` (no `d`),
+    /// and `abcbcd` carries both of the query's trigrams without carrying the
+    /// query itself, so nothing else in the corpus interferes.
+    fn plant_fuzzy_band(v: &mut VolumeIndex) {
+        const DEEP: u64 = 12;
+        for d in 0..=DEEP {
+            let parent = if d == 0 { NO_PARENT } else { 20 + d - 1 };
+            v.add(20 + d, parent, &format!("deep{d}"), crate::flags::DIR);
+        }
+        for i in 0..6u64 {
+            v.add(40 + i, 20 + DEEP, "xabcd", crate::flags::HIDDEN);
+        }
+        for i in 0..3u64 {
+            v.add(60 + i, NO_PARENT, "abcbcd", 0);
+        }
+    }
+
+    /// A corpus shaped to make the K boundary a TIE as often as possible, which
+    /// is the only condition under which a non-strict pruning rule misbehaves.
+    ///
+    /// Three properties do that work, and all three are load-bearing:
+    /// - most entries sit at depth 0 and carry no attributes, so their score is
+    ///   *exactly* `tier_base` — the only way `tier_upper_bound(t)` can equal
+    ///   the running floor rather than merely approach it;
+    /// - names come from a six-word alphabet, so they repeat verbatim and
+    ///   identical names at identical depths score bit-identically;
+    /// - the corpus is churned, so slots come off the freelist and arena order
+    ///   stops agreeing with slot order — a tie-break WINNER (lower eidx) then
+    ///   arrives after the heap is already full, which is exactly the offer a
+    ///   `≥` rule would throw away.
+    fn random_corpus(seed: u64, files: usize) -> VolumeIndex {
+        let mut rng = Rng::new(seed);
+        let mut v = ix();
+        // A few directories at assorted depths, so the depth penalty still
+        // spreads some scores apart.
+        let dirs: Vec<u64> = (0..4u64).map(|i| 10 + i).collect();
+        for i in 0..dirs.len() {
+            let parent = if i == 0 {
+                NO_PARENT
+            } else {
+                dirs[rng.below(i)]
+            };
+            let name = random_name(&mut rng);
+            v.add(dirs[i], parent, &name, crate::flags::DIR);
+        }
+        let place = |rng: &mut Rng, v: &mut VolumeIndex, frn: u64| {
+            // Two thirds at depth 0 with no attributes: score == tier_base.
+            let parent = match rng.below(3) {
+                0 => dirs[rng.below(dirs.len())],
+                _ => NO_PARENT,
+            };
+            let attrs = match rng.below(8) {
+                0 => crate::flags::HIDDEN,
+                1 => crate::flags::SYSTEM,
+                _ => 0,
+            };
+            let name = random_name(rng);
+            v.add(frn, parent, &name, attrs);
+        };
+        for k in 0..files {
+            place(&mut rng, &mut v, 1000 + k as u64);
+        }
+        for _ in 0..files / 4 {
+            v.apply(crate::UsnEvent::Delete {
+                frn: 1000 + rng.below(files) as u64,
+            });
+        }
+        for k in 0..files / 4 {
+            place(&mut rng, &mut v, 5000 + k as u64);
+        }
+        plant_fuzzy_band(&mut v);
+        v.finalize();
+        v
+    }
+
+    /// Keep the better base for a slot, exactly as the old `upgrade` did.
+    fn upgrade_ref(best: &mut BTreeMap<u32, (Tier, f32)>, slot: u32, tier: Tier, base: f32) {
+        match best.entry(slot) {
+            btree_map::Entry::Occupied(mut o) => {
+                if base > o.get().1 {
+                    o.insert((tier, base));
+                }
+            }
+            btree_map::Entry::Vacant(e) => {
+                e.insert((tier, base));
+            }
+        }
+    }
+
+    /// Exhaustive reference: every candidate the three passes can produce,
+    /// every one of them scored, sorted and truncated. No heap, no capacity,
+    /// no floor, no early-out, no grouping — nothing the selector may get
+    /// wrong.
+    ///
+    /// Written per ENTRY rather than per arena, so it shares no code with the
+    /// thing under test. Pass A is `find_iter` inside one record, which yields
+    /// exactly the hits the arena-wide scan yields for that record: a match
+    /// can never straddle a fence, and the resume point after a hit stays
+    /// inside the record it was found in.
+    fn reference_search(ix: &VolumeIndex, query: &str, max_results: usize) -> Vec<Hit> {
+        let fq = fold(query);
+        if fq.is_empty() || max_results == 0 || ix.is_empty() || has_control_byte(&fq) {
+            return Vec::new();
+        }
+        let mut best: BTreeMap<u32, (Tier, f32)> = BTreeMap::new();
+
+        // Pass A.
+        for (slot, e) in ix.live_entries() {
+            let rec = ix.folded_of_entry(e).as_bytes();
+            for p in memmem::find_iter(rec, fq.as_bytes()) {
+                let before = if p == 0 { FOLDED_DELIM } else { rec[p - 1] };
+                let after = if p + fq.len() == rec.len() {
+                    FOLDED_DELIM
+                } else {
+                    rec[p + fq.len()]
+                };
+                let tier = classify(before, after);
+                upgrade_ref(&mut best, slot, tier, tier_base(tier));
+            }
+        }
+
+        // Pass B, over the initials arena as `Accel::ensure_basic` lays it out,
+        // straddle rejection included — this is the tier's candidate set as it
+        // stands today, not as step 6 will rebuild it.
+        let mut arena = String::new();
+        let mut spans: Vec<(usize, usize, u32)> = Vec::new();
+        for (slot, e) in ix.live_entries() {
+            let name = ix.name_of_entry(e);
+            let off = arena.len();
+            for (seg, _) in segment_spans(name) {
+                if let Some(c) = name[seg..].chars().next() {
+                    arena.extend(c.to_lowercase());
+                }
+            }
+            spans.push((off, arena.len() - off, slot));
+        }
+        for hit in memmem::find_iter(arena.as_bytes(), fq.as_bytes()) {
+            if let Some(&(off, len, slot)) = spans.iter().rev().find(|s| s.0 <= hit) {
+                if hit + fq.len() <= off + len {
+                    upgrade_ref(&mut best, slot, Tier::Initials, tier_base(Tier::Initials));
+                }
+            }
+        }
+
+        // Pass C. The trigram prefilter is modelled directly: a posting list
+        // for a trigram holds exactly the live slots whose folded name contains
+        // it, so the intersection is "contains every 3-byte window".
+        if fq.len() >= 3 {
+            for (slot, e) in ix.live_entries() {
+                if best.contains_key(&slot) {
+                    continue;
+                }
+                let rec = ix.folded_of_entry(e);
+                if !fq
+                    .as_bytes()
+                    .windows(3)
+                    .all(|w| memmem::find(rec.as_bytes(), w).is_some())
+                {
+                    continue;
+                }
+                if let Some(density) = fuzzy_density(rec, &fq) {
+                    upgrade_ref(&mut best, slot, Tier::Fuzzy, 0.3 + 0.2 * density);
+                }
+            }
+        }
+
+        let mut all: Vec<Scored> = best
+            .iter()
+            .map(|(&slot, &(tier, base))| Scored {
+                score: base * DEPTH_PEN[ix.rank_key[slot as usize] as usize],
+                eidx: slot,
+                tier,
+            })
+            .collect();
+        all.sort_by(|a, b| b.cmp(a));
+        all.truncate(max_results);
+        all.iter()
+            .map(|s| {
+                let e = &ix.entries[s.eidx as usize];
+                Hit {
+                    frn: e.frn,
+                    score: s.score,
+                    match_ranges: compute_ranges(ix.name_of_entry(e), &fq, s.tier),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pruned_selector_matches_an_exhaustive_reference() {
+        const CORPORA: u64 = 1500;
+        const FILES: usize = 56;
+        const PAGES: [usize; 6] = [1, 2, 3, 5, 8, 32];
+
+        let mut compared = 0usize;
+        let mut ties_at_boundary = 0usize;
+        let mut nonempty = 0usize;
+        for seed in 1..=CORPORA {
+            let v = random_corpus(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), FILES);
+            for q in QUERIES {
+                // The reference truncates a fully sorted candidate list, so its
+                // answer for any K is a prefix of its answer for a larger one.
+                // Computed once per query and sliced, which is what keeps the
+                // corpus count in the thousands rather than the hundreds.
+                let full = reference_search(&v, q, 33);
+                for k in PAGES {
+                    let got = v.search(q, k, &no_cancel);
+                    let want = &full[..k.min(full.len())];
+                    compared += 1;
+                    nonempty += usize::from(!want.is_empty());
+                    assert_eq!(
+                        got.len(),
+                        want.len(),
+                        "seed {seed} query {q:?} k {k}: result count"
+                    );
+                    for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                        assert_eq!(g.frn, w.frn, "seed {seed} query {q:?} k {k} row {i}: frn");
+                        assert_eq!(
+                            g.score.to_bits(),
+                            w.score.to_bits(),
+                            "seed {seed} query {q:?} k {k} row {i}: score"
+                        );
+                        assert_eq!(
+                            g.match_ranges, w.match_ranges,
+                            "seed {seed} query {q:?} k {k} row {i}: ranges"
+                        );
+                    }
+                    // The property the strict rules exist for: the last row of
+                    // a full page scoring exactly what the next candidate
+                    // scores, so only the eidx tie-break separates them and a
+                    // `≥` rule would have thrown the winner away.
+                    if got.len() == k
+                        && full.len() > k
+                        && full[k].score.to_bits() == full[k - 1].score.to_bits()
+                    {
+                        ties_at_boundary += 1;
+                    }
+                }
+            }
+        }
+        // The corpora are only a proof obligation if they actually exercise
+        // one; assert the shape of the sample rather than trusting it.
+        assert!(compared >= 50_000, "compared {compared}");
+        assert!(
+            nonempty * 4 > compared,
+            "corpora barely match: {nonempty}/{compared}"
+        );
+        assert!(
+            ties_at_boundary > compared / 20,
+            "too few K-boundary ties to prove anything: {ties_at_boundary}/{compared}"
+        );
+    }
+
+    #[test]
+    fn fuzzy_upper_bound_is_the_density_ceiling_not_the_base_floor() {
+        // `tier_base(Fuzzy)` is documented at its definition as a FLOOR: the
+        // real base is 0.3 + 0.2·density, up to 0.5. Using it as a pruning
+        // bound would discard every fuzzy candidate scoring 0.31-0.5.
+        assert_eq!(tier_upper_bound(Tier::Fuzzy), 0.5);
+        assert!(tier_upper_bound(Tier::Fuzzy) > tier_base(Tier::Fuzzy));
+        // Every other tier's bound is its base, and the bounds are ordered.
+        for t in [
+            Tier::Exact,
+            Tier::Prefix,
+            Tier::WordBoundary,
+            Tier::Initials,
+            Tier::Substring,
+        ] {
+            assert_eq!(tier_upper_bound(t), tier_base(t));
+        }
+        assert!(tier_upper_bound(Tier::Substring) > tier_upper_bound(Tier::Fuzzy));
     }
 
     #[test]

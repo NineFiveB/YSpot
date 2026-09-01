@@ -6,18 +6,33 @@
 //! reconstruction. Full paths are never stored — [`VolumeIndex::path_of`]
 //! walks the `parent_frn` chain to the volume root on demand.
 //!
-//! Mutations (`add`/`apply`) only append to the arenas; bytes belonging to
-//! deleted or renamed entries leak until the next full rebuild/snapshot cycle
-//! (§3.7). This keeps USN application O(1) and is bounded by rebuild cadence.
+//! Mutations (`add`/`apply`) only append to the arenas; the bytes a deleted or
+//! renamed entry leaves behind are erased in place but not reclaimed until the
+//! next full rebuild/snapshot cycle (§3.7). This keeps USN application O(1)
+//! and is bounded by rebuild cadence.
+//!
+//! Folded-arena layout: `0x00 rec 0x00 rec 0x00`. Every record is fenced by
+//! [`FOLDED_DELIM`], no record may contain a byte below `0x20`, and a vacated
+//! record is overwritten with delimiters. That is what lets the matcher read a
+//! hit's tier straight off `arena[hit - 1]` / `arena[hit + qlen]`, and what
+//! makes a match spanning two records structurally impossible rather than
+//! something the query path has to detect and discard.
 //!
 //! Slot stability: `entries[i]` belongs to one file for its lifetime. A delete
 //! tombstones the slot ([`crate::flags::DEAD`]) and offers it to `free_slots`;
 //! it never moves another entry. That is what allows structures to be keyed by
 //! entry index, and it is why `len()` is a maintained live count rather than
 //! `entries.len()`.
+//!
+//! [`VolumeIndex::rank_key`] is the first such structure: one byte per slot
+//! holding everything §3.4's score needs about an entry other than its match
+//! quality. It is maintained incrementally at the two mutation choke points,
+//! settled by a memoized sweep in [`VolumeIndex::finalize`], and repaired on
+//! the WRITER after a directory reparent — never rebuilt from a query.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use unicode_normalization::UnicodeNormalization;
 
@@ -27,6 +42,63 @@ use crate::{Hit, UsnEvent};
 /// Cycle/depth guard for parent-chain walks. NTFS practical depth is far
 /// below this; the cap only defends against corrupt/cyclic parent chains.
 pub(crate) const PATH_DEPTH_CAP: u32 = 512;
+
+/// Widest depth [`VolumeIndex::rank_key`] can carry: it packs depth into 7
+/// bits so one byte also holds the HIDDEN/SYSTEM flag.
+///
+/// This is a RANKING clamp only. [`VolumeIndex::depth_of`] and
+/// [`VolumeIndex::path_of`] keep [`PATH_DEPTH_CAP`] semantics untouched, and
+/// the penalty difference between depth 127 (1/3.54) and 512 (1/11.2) is only
+/// reachable on a corrupt or cyclic parent chain.
+pub(crate) const RANK_DEPTH_MAX: u8 = 127;
+
+/// `rank_key` bit 7: the entry carries HIDDEN or SYSTEM (§3.4's ×0.85).
+const RANK_PENALIZED: u8 = 0x80;
+
+/// `depth_penalty × hidden_penalty` for every [`VolumeIndex::rank_key`] value,
+/// so the §3.4 score is `base × DEPTH_PEN[rank_key[slot]]`: one L2 read into a
+/// 1 B/entry column, one L1 table lookup and one multiply.
+///
+/// What it replaces is the whole reason this table exists: the ranking loop
+/// used to call `depth_of` per candidate, a parent-chain walk with a `frn_map`
+/// probe per level into a 20-35 MB map (~250-400 ns each). At tens of
+/// thousands of candidates that walk *was* the query.
+///
+/// Indexed by the packed key, so both factors are folded in: the low 7 bits
+/// give `1 / (1 + 0.02·depth)` and bit 7 multiplies by 0.85.
+pub(crate) static DEPTH_PEN: [f32; 256] = {
+    let mut t = [0.0f32; 256];
+    let mut k = 0usize;
+    while k < 256 {
+        let depth = (k & RANK_DEPTH_MAX as usize) as f32;
+        let p = 1.0 / (1.0 + 0.02 * depth);
+        t[k] = if k & RANK_PENALIZED as usize != 0 {
+            p * 0.85
+        } else {
+            p
+        };
+        k += 1;
+    }
+    t
+};
+
+/// Depth-sweep marks. One byte per slot, live only for the duration of a
+/// sweep: `UNKNOWN` → not yet visited, `ON_STACK` → on the current upward
+/// walk (so meeting it again is a cycle), `DONE` → its `rank_key` depth is
+/// authoritative and can be used as a memo base.
+const D_UNKNOWN: u8 = 0;
+const D_ON_STACK: u8 = 1;
+const D_DONE: u8 = 2;
+
+/// How long a directory reparent waits before the writer repairs its
+/// descendants' cached depths (design §5, behavior change 4). Long enough that
+/// a `move` of a large tree coalesces into one sweep.
+pub const DEPTH_REPAIR_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Slots repaired per [`VolumeIndex::repair_depths_slice`] call, i.e. per
+/// write-lock acquisition. The sweep is memoized and O(1) amortized per slot,
+/// so this bounds the stall rather than the total work.
+const DEPTH_REPAIR_SLICE: usize = 64 * 1024;
 
 /// Post-[`VolumeIndex::finalize`] growth steps: 64 Ki entries (2 MiB) and
 /// 1 MiB per arena, taken with `reserve_exact`.
@@ -38,6 +110,23 @@ pub(crate) const PATH_DEPTH_CAP: u32 = 512;
 /// its size, which is the 4.19 B/entry line of the §3.4 memory budget.
 const ENTRY_GROW_CHUNK: usize = 64 * 1024;
 const ARENA_GROW_CHUNK: usize = 1024 * 1024;
+
+/// Folded-arena record delimiter. U+0000 is valid UTF-8 and, by
+/// [`has_control_byte`], can never occur inside a record — so one byte fences
+/// each record with no escaping and no ambiguity, and a delimiter-free query
+/// cannot match across two records. Costs 1 B/record.
+pub(crate) const FOLDED_DELIM: u8 = 0x00;
+
+/// Whether folded text carries a byte the folded arena reserves for itself.
+///
+/// The arena's whole design rests on nothing below `0x20` appearing inside a
+/// record, so the rule is enforced on both sides of the matcher from this one
+/// definition: [`VolumeIndex::intern`] drops such names, and
+/// [`crate::matching::search`] rejects such queries. NTFS forbids these bytes
+/// in filenames, so only synthetic and walk-mode inputs can produce them.
+pub(crate) fn has_control_byte(s: &str) -> bool {
+    s.bytes().any(|b| b < 0x20)
+}
 
 /// One file or directory (§3.4). 32 B with padding.
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +191,8 @@ pub struct RamBreakdown {
     /// Tombstoned slots awaiting reuse; grows with delete churn and drains
     /// back to zero as creates recycle them.
     pub free_slots: u64,
+    /// Packed depth + hidden/system ranking column, 1 B per slot.
+    pub rank_key: u64,
     /// Matcher accel: sorted `(folded_off, entry_idx)` vec.
     pub folded_order: u64,
     /// Matcher accel: initials arena plus its span table.
@@ -118,6 +209,7 @@ impl RamBreakdown {
             + self.folded_arena
             + self.frn_map
             + self.free_slots
+            + self.rank_key
             + self.folded_order
             + self.initials
             + self.trigrams
@@ -131,7 +223,9 @@ pub struct VolumeIndex {
     pub(crate) entries: Vec<Entry>,
     /// Original-case names, UTF-8, NFC-normalized, back to back.
     pub(crate) name_arena: String,
-    /// Case-folded shadow of `name_arena` (offsets differ; folding expands).
+    /// Case-folded shadow of `name_arena` (offsets differ; folding expands),
+    /// laid out as `0x00 rec 0x00 rec 0x00` — see [`FOLDED_DELIM`]. This is
+    /// the arena the matcher scans, so it is the one that has to be fenced.
     pub(crate) folded_arena: String,
     /// FRN → index into `entries`.
     pub(crate) frn_map: HashMap<u64, u32>,
@@ -145,6 +239,23 @@ pub struct VolumeIndex {
     /// Name + folded arena bytes belonging to tombstoned or renamed-away
     /// names. The compaction trigger (§3.7) is a fraction of this.
     dead_bytes: usize,
+    /// Everything ranking needs about a slot, in one byte:
+    /// `depth.min(127) | (hidden|system) << 7`. Indexed by slot, so it is
+    /// exactly as long as `entries`.
+    ///
+    /// Deliberately NOT a field of [`Entry`]: the ranking loop touches one
+    /// candidate at a time in arena order, and a 1 MB column streams where a
+    /// 32 MB entry table misses. Scoring reads it through [`DEPTH_PEN`].
+    pub(crate) rank_key: Vec<u8>,
+    /// When a directory reparent armed the writer-side depth repair, or `None`
+    /// if no repair is outstanding. See [`Self::repair_depths_slice`].
+    depth_repair_armed: Option<Instant>,
+    /// Next slot the outstanding repair will visit.
+    depth_repair_cursor: usize,
+    /// Sweep marks for the outstanding repair, carried across slices so the
+    /// sliced sweep stays O(n) in total rather than O(n·depth). Empty
+    /// whenever no repair is running.
+    depth_repair_state: Vec<u8>,
     /// Lazily rebuilt matcher acceleration structures (§3.4 prefilters).
     /// Mutex (not RefCell) so `search(&self)` stays `Sync`-safe behind an
     /// outer `RwLock` in the service.
@@ -171,6 +282,10 @@ impl VolumeIndex {
             live_count: 0,
             free_slots: Vec::new(),
             dead_bytes: 0,
+            rank_key: Vec::new(),
+            depth_repair_armed: None,
+            depth_repair_cursor: 0,
+            depth_repair_state: Vec::new(),
             accel: Mutex::new(Accel::new()),
             settled: false,
             frn_map_buckets: 0,
@@ -241,16 +356,169 @@ impl VolumeIndex {
     /// at 1M entries is tens of MB of nothing; `shrink_to_fit` hands it back.
     /// `settled` then keeps it handed back: without it the next USN event
     /// would re-double an arena straight back to where it was.
+    /// Release bulk-load growth slack and settle the cached ranking depths.
     pub fn finalize(&mut self) {
         self.entries.shrink_to_fit();
         self.name_arena.shrink_to_fit();
         self.folded_arena.shrink_to_fit();
         self.frn_map.shrink_to_fit();
+        self.rank_key.shrink_to_fit();
         // The one place the map's allocation actually gets smaller, so the one
         // place the monotonic bucket count may be lowered.
         self.frn_map_buckets = 0;
         self.note_frn_map_buckets();
         self.settled = true;
+        self.sweep_all_depths();
+    }
+
+    /// Recompute every slot's cached ranking depth in one memoized sweep.
+    ///
+    /// Required, not an optimization: `FSCTL_ENUM_USN_DATA` walks in MFT-record
+    /// order, not parent-first, so a child enumerated before its parent gets
+    /// depth 0 from [`Self::register_slot`] — it would then outrank the file it
+    /// is nested twenty levels below. Steady-state USN creates almost always
+    /// arrive after their parent, which is why the incremental rule is enough
+    /// between sweeps.
+    fn sweep_all_depths(&mut self) {
+        let n = self.entries.len();
+        let mut state = vec![D_UNKNOWN; n];
+        let mut stack: Vec<u32> = Vec::new();
+        self.depth_sweep(0, n, &mut state, &mut stack);
+        // A full sweep supersedes any outstanding sliced repair.
+        self.depth_repair_armed = None;
+        self.depth_repair_cursor = 0;
+        self.depth_repair_state = Vec::new();
+    }
+
+    /// Memoized, cycle-guarded depth sweep over slots `[start, end)`.
+    ///
+    /// Each slot walks up its `parent_frn` chain until it meets a slot already
+    /// marked `D_DONE` (whose cached depth is the memo base), the volume root,
+    /// a missing parent, or itself — then the walk is unwound and every slot on
+    /// it is assigned and marked. Every slot is therefore pushed and assigned
+    /// exactly once across a whole sweep: O(n), not O(n·depth).
+    ///
+    /// A chain that closes on itself gets [`RANK_DEPTH_MAX`] throughout, which
+    /// is what [`Self::depth_of`] reports for a cycle once clamped
+    /// (`PATH_DEPTH_CAP` ≥ `RANK_DEPTH_MAX`), so the cached value and the
+    /// walking one agree on corrupt chains too.
+    fn depth_sweep(&mut self, start: usize, end: usize, state: &mut Vec<u8>, stack: &mut Vec<u32>) {
+        debug_assert_eq!(self.rank_key.len(), self.entries.len());
+        if state.len() < self.entries.len() {
+            state.resize(self.entries.len(), D_UNKNOWN);
+        }
+        let end = end.min(self.entries.len());
+        for s in start..end {
+            if state[s] != D_UNKNOWN || self.entries[s].is_dead() {
+                continue;
+            }
+            stack.clear();
+            let mut cur = s as u32;
+            // Depth to assign to the LAST slot pushed; the walk unwinds from
+            // there back down to `s`, incrementing.
+            let mut first = 0u32;
+            let mut cycle = false;
+            loop {
+                match state[cur as usize] {
+                    D_DONE => {
+                        let d = (self.rank_key[cur as usize] & RANK_DEPTH_MAX) as u32;
+                        first = (d + 1).min(RANK_DEPTH_MAX as u32);
+                        break;
+                    }
+                    D_ON_STACK => {
+                        cycle = true;
+                        break;
+                    }
+                    _ => {}
+                }
+                state[cur as usize] = D_ON_STACK;
+                stack.push(cur);
+                let e = self.entries[cur as usize];
+                if e.parent_frn == e.frn {
+                    break; // volume root records itself as its own parent
+                }
+                match self.frn_map.get(&e.parent_frn) {
+                    // `frn_map` never holds a tombstone, so a hit is live.
+                    Some(&p) if p != cur => cur = p,
+                    _ => break, // missing parent: anchored at the root
+                }
+            }
+            if cycle {
+                for &slot in stack.iter() {
+                    self.set_rank_depth(slot, RANK_DEPTH_MAX as u32);
+                    state[slot as usize] = D_DONE;
+                }
+            } else {
+                let mut d = first;
+                for &slot in stack.iter().rev() {
+                    self.set_rank_depth(slot, d);
+                    state[slot as usize] = D_DONE;
+                    d = (d + 1).min(RANK_DEPTH_MAX as u32);
+                }
+            }
+        }
+    }
+
+    /// Write `depth` into a slot's `rank_key`, keeping its hidden/system bit.
+    fn set_rank_depth(&mut self, slot: u32, depth: u32) {
+        let k = &mut self.rank_key[slot as usize];
+        *k = (*k & RANK_PENALIZED) | (depth.min(RANK_DEPTH_MAX as u32) as u8);
+    }
+
+    /// Arm the writer-side depth repair: a directory changed parent, so every
+    /// descendant's cached depth is now stale by a constant offset.
+    ///
+    /// Re-arming restarts the sweep from slot 0, which is what makes the
+    /// carried-over marks sound: the only mutation that invalidates an already
+    /// swept slot's depth is another reparent, and that lands here.
+    fn arm_depth_repair(&mut self) {
+        self.depth_repair_armed = Some(Instant::now());
+        self.depth_repair_cursor = 0;
+        self.depth_repair_state = Vec::new();
+    }
+
+    /// Whether a directory reparent is waiting and its
+    /// [`DEPTH_REPAIR_DEBOUNCE`] has elapsed.
+    ///
+    /// Polled by the WRITER (the USN tail loop), never by `search`. Refreshing
+    /// depth on the query path would re-arm exactly the rebuild-on-mutation
+    /// cliff this column exists to remove, inside the §2.5 10 ms budget; the
+    /// query path reads `rank_key` unconditionally, with no epoch check and no
+    /// fallback walk. The price is bounded staleness on a moved subtree — a few
+    /// percent of score for a few hundred ms, and no entry ever appears or
+    /// disappears because of it (behavior change 4).
+    pub fn depth_repair_due(&self) -> bool {
+        matches!(self.depth_repair_armed, Some(t) if t.elapsed() >= DEPTH_REPAIR_DEBOUNCE)
+    }
+
+    /// Advance an armed depth repair by one [`DEPTH_REPAIR_SLICE`] of slots.
+    /// Returns `true` while work remains, so the caller can release and retake
+    /// the write lock between slices.
+    pub fn repair_depths_slice(&mut self) -> bool {
+        if self.depth_repair_armed.is_none() {
+            return false;
+        }
+        let n = self.entries.len();
+        if self.depth_repair_state.len() < n {
+            // Slots appended since the repair started sit past the cursor, so
+            // they are swept in their turn; recycled slots below it already
+            // carry a fresh depth from `register_slot`.
+            self.depth_repair_state.resize(n, D_UNKNOWN);
+        }
+        let start = self.depth_repair_cursor.min(n);
+        let end = (start + DEPTH_REPAIR_SLICE).min(n);
+        let mut state = std::mem::take(&mut self.depth_repair_state);
+        let mut stack: Vec<u32> = Vec::new();
+        self.depth_sweep(start, end, &mut state, &mut stack);
+        self.depth_repair_state = state;
+        self.depth_repair_cursor = end;
+        if end < n {
+            return true;
+        }
+        self.depth_repair_armed = None;
+        self.depth_repair_cursor = 0;
+        self.depth_repair_state = Vec::new();
+        false
     }
 
     /// Make room for `need` more arena bytes in whole [`ARENA_GROW_CHUNK`]s.
@@ -274,7 +542,19 @@ impl VolumeIndex {
 
     /// NFC-normalize + fold `name` and append both forms to the arenas.
     /// Returns `(name_off, name_len, folded_off, folded_len)`, or `None` for
-    /// unusable names (empty after normalization, or arena offsets exhausted).
+    /// unusable names (empty after normalization, a folded form carrying a
+    /// byte the arena reserves, or arena offsets exhausted).
+    ///
+    /// Appends the folded record as `rec 0x00`, laying down the opening
+    /// `0x00` on the first call. The trailing delimiter of one record is the
+    /// leading delimiter of the next, so the arena is `0x00 rec 0x00 rec 0x00`
+    /// at one byte per record — and both `arena[folded_off - 1]` and
+    /// `arena[folded_off + folded_len]` are unconditionally in bounds and
+    /// equal to [`FOLDED_DELIM`], which is what the matcher's tier test reads.
+    ///
+    /// Nothing is written to either arena until every rejection test has
+    /// passed: a half-interned name would leave orphan bytes that the next
+    /// record's offsets sit after and that no entry claims.
     fn intern(&mut self, name: &str) -> Option<(u32, u16, u32, u16)> {
         let nfc: String = name.nfc().collect();
         let nfc = truncate_to_boundary(&nfc, u16::MAX as usize);
@@ -283,20 +563,34 @@ impl VolumeIndex {
         }
         let folded_full = fold(nfc);
         let folded = truncate_to_boundary(&folded_full, u16::MAX as usize);
+        // A control byte would either forge a delimiter — splitting one name
+        // into two records that no offset accounts for — or leave the tier
+        // test reading a fence that is not one. Dropped like the empty name.
+        if folded.is_empty() || has_control_byte(folded) {
+            log::debug!("index: name with a reserved byte in its folded form dropped");
+            return None;
+        }
+        // This record's trailing delimiter, plus the opening one if the arena
+        // has not been written to yet.
+        let fences = 1 + usize::from(self.folded_arena.is_empty());
         if self.name_arena.len() + nfc.len() > u32::MAX as usize
-            || self.folded_arena.len() + folded.len() > u32::MAX as usize
+            || self.folded_arena.len() + folded.len() + fences > u32::MAX as usize
         {
             log::error!("index: name arena offset space exhausted; entry dropped");
             return None;
         }
         if self.settled {
             Self::reserve_arena(&mut self.name_arena, nfc.len());
-            Self::reserve_arena(&mut self.folded_arena, folded.len());
+            Self::reserve_arena(&mut self.folded_arena, folded.len() + fences);
         }
         let name_off = self.name_arena.len() as u32;
         self.name_arena.push_str(nfc);
+        if self.folded_arena.is_empty() {
+            self.folded_arena.push(FOLDED_DELIM as char);
+        }
         let folded_off = self.folded_arena.len() as u32;
         self.folded_arena.push_str(folded);
+        self.folded_arena.push(FOLDED_DELIM as char);
         Some((name_off, nfc.len() as u16, folded_off, folded.len() as u16))
     }
 
@@ -325,6 +619,25 @@ impl VolumeIndex {
         debug_assert_eq!(flags & crate::flags::DEAD, 0, "DEAD is not an attribute");
         let flags = flags & !crate::flags::DEAD;
         debug_assert!(slot as usize <= self.entries.len(), "slot out of range");
+        // Ranking key, computed BEFORE `frn_map` learns about this FRN so a
+        // self-parenting root cannot read its own half-written depth. The
+        // parent's cached depth is the whole walk: O(1), and correct whenever
+        // the parent is already indexed, which is the steady-state USN case.
+        // Bulk load can enumerate a child first — that is what `finalize`'s
+        // sweep is for — and a directory reparent is repaired by
+        // `repair_depths_slice`.
+        let depth = if parent_frn == frn {
+            0
+        } else {
+            match self.frn_map.get(&parent_frn) {
+                Some(&p) if p != slot => {
+                    ((self.rank_key[p as usize] & RANK_DEPTH_MAX) + 1).min(RANK_DEPTH_MAX)
+                }
+                _ => 0,
+            }
+        };
+        let penalized = u8::from(flags & (crate::flags::HIDDEN | crate::flags::SYSTEM) != 0);
+        let key = depth | (penalized * RANK_PENALIZED);
         let e = Entry {
             frn,
             parent_frn,
@@ -335,13 +648,26 @@ impl VolumeIndex {
             flags,
         };
         if slot as usize == self.entries.len() {
-            if self.settled && self.entries.len() == self.entries.capacity() {
-                self.entries.reserve_exact(ENTRY_GROW_CHUNK);
+            // Each column is guarded on its OWN capacity. Sharing one test
+            // works only while the two capacities move in lockstep, and the
+            // moment they diverge the unguarded one silently falls back to
+            // geometric doubling — the behavior Step 1 exists to remove. Every
+            // column added later needs this same shape.
+            if self.settled {
+                if self.entries.len() == self.entries.capacity() {
+                    self.entries.reserve_exact(ENTRY_GROW_CHUNK);
+                }
+                if self.rank_key.len() == self.rank_key.capacity() {
+                    self.rank_key.reserve_exact(ENTRY_GROW_CHUNK);
+                }
             }
             self.entries.push(e);
+            self.rank_key.push(key);
         } else {
             self.entries[slot as usize] = e;
+            self.rank_key[slot as usize] = key;
         }
+        debug_assert_eq!(self.rank_key.len(), self.entries.len());
         self.frn_map.insert(frn, slot);
         self.live_count += 1;
         self.note_frn_map_buckets();
@@ -361,10 +687,10 @@ impl VolumeIndex {
         self.frn_map_buckets = self.frn_map_buckets.max(buckets);
     }
 
-    /// Tombstone `slot`: drop it from `frn_map`, mark it [`crate::flags::DEAD`]
-    /// and charge its arena bytes to `dead_bytes`. The entry stays where it
-    /// is — nothing is ever swap-removed, because that would permute every
-    /// other entry's index.
+    /// Tombstone `slot`: drop it from `frn_map`, mark it [`crate::flags::DEAD`],
+    /// erase its folded record and charge its arena bytes to `dead_bytes`. The
+    /// entry stays where it is — nothing is ever swap-removed, because that
+    /// would permute every other entry's index.
     ///
     /// The freelist push is deliberately the CALLER's: a rename tears its slot
     /// down and re-registers the same slot, and that slot must never appear in
@@ -375,14 +701,47 @@ impl VolumeIndex {
         e.flags |= crate::flags::DEAD;
         let frn = e.frn;
         let bytes = e.name_len as usize + e.folded_len as usize;
+        let (folded_off, folded_len) = (e.folded_off as usize, e.folded_len as usize);
         self.frn_map.remove(&frn);
+        // A tombstone gets the WORST ranking key, not zero. The query path
+        // reads `rank_key` with no liveness check by design, so if a dead slot
+        // ever does leak through a pass, it must sort to the bottom of the page
+        // rather than the top — and zero is the most favourable byte the column
+        // can hold (depth 0, unpenalized, DEPTH_PEN 1.0). Safe to poison
+        // because a new occupant's depth is derived through `frn_map`, which
+        // never holds a tombstone.
+        self.rank_key[slot as usize] = RANK_DEPTH_MAX | RANK_PENALIZED;
+        self.erase_folded(folded_off, folded_len);
         self.dead_bytes += bytes;
         self.live_count -= 1;
         debug_assert_eq!(self.live_count, self.frn_map.len());
     }
 
+    /// Overwrite a vacated folded record with [`FOLDED_DELIM`] (invariant I4).
+    ///
+    /// Those bytes used to be left in place and filtered out on the query path
+    /// by a bounds check against the live records' offsets — dead bytes could
+    /// still produce a hit, and every pass had to know to throw it away.
+    /// Erasing makes them *inert*: a delimiter-free query cannot match inside
+    /// a run of delimiters at all. The erased record merges with its two
+    /// fences into one longer run, which is still a well-formed arena, because
+    /// records are addressed by their stored `folded_off` and never by
+    /// counting delimiters.
+    ///
+    /// The name arena is deliberately left alone: it is never scanned, only
+    /// indexed through a live entry, and `path_of` reads it on the hot path.
+    fn erase_folded(&mut self, off: usize, len: usize) {
+        // SAFETY: `off..off + len` is exactly one interned record, so both
+        // ends are char boundaries; U+0000 is a one-byte encoding, so
+        // replacing whole chars with it leaves the arena valid UTF-8.
+        let bytes = unsafe { self.folded_arena.as_mut_vec() };
+        bytes[off..off + len].fill(FOLDED_DELIM);
+    }
+
     /// Add one entry; an existing FRN is updated in place (new name appended
-    /// to the arenas — old bytes leak until rebuild, §3.7).
+    /// to the arenas, old folded record erased where it stands and its bytes
+    /// charged as dead — the space itself is not reclaimed until rebuild,
+    /// §3.7).
     pub(crate) fn add_entry(&mut self, frn: u64, parent_frn: u64, name: &str, flags: u16) {
         let existing = self.frn_map.get(&frn).copied();
         // Only a create that has to append a slot can exhaust the index space;
@@ -403,6 +762,7 @@ impl VolumeIndex {
             // it behaves as a rename, so tear the old name down through the
             // same choke point a rename uses and re-register the same slot.
             Some(idx) => {
+                self.note_reparent(idx, parent_frn);
                 self.unregister_slot(idx);
                 idx
             }
@@ -412,10 +772,31 @@ impl VolumeIndex {
         self.mark_dirty();
     }
 
+    /// Arm the depth repair if `slot` is a directory that is about to change
+    /// parent: its descendants' cached depths all shift by a constant.
+    ///
+    /// A non-directory has no descendants and `register_slot` recomputes its
+    /// own depth, so a file move costs nothing.
+    fn note_reparent(&mut self, slot: u32, new_parent_frn: u64) {
+        let e = &self.entries[slot as usize];
+        if e.flags & crate::flags::DIR != 0 && e.parent_frn != new_parent_frn {
+            self.arm_depth_repair();
+        }
+    }
+
     fn remove_entry(&mut self, frn: u64) {
         let Some(&idx) = self.frn_map.get(&frn) else {
             return;
         };
+        // Deleting a directory changes every surviving descendant's true depth
+        // — their chain now breaks at the missing parent — but their cached
+        // `rank_key` keeps the old, larger value. Without arming the repair
+        // that staleness is UNBOUNDED, and behavior change 4 only signs off
+        // bounded staleness. Costs one timestamp write; the sweep is memoized
+        // and sliced. Ranking only, never membership.
+        if self.entries[idx as usize].flags & crate::flags::DIR != 0 {
+            self.arm_depth_repair();
+        }
         self.unregister_slot(idx);
         // The slot keeps its place in the table and its (now dead) arena bytes
         // until rebuild (§3.7); the next create takes it back.
@@ -435,6 +816,7 @@ impl VolumeIndex {
         // Read before tombstoning: a rename carries no attributes, so the
         // entry's own flags are what get re-registered.
         let flags = self.entries[idx as usize].flags;
+        self.note_reparent(idx, new_parent_frn);
         self.unregister_slot(idx);
         self.register_slot(idx, frn, new_parent_frn, interned, flags);
         self.mark_dirty();
@@ -497,8 +879,19 @@ impl VolumeIndex {
         Some(out)
     }
 
-    /// Number of parent links successfully followed from `entry_idx`
-    /// (the §3.4 `depth_penalty` input), capped at [`PATH_DEPTH_CAP`].
+    /// Number of parent links successfully followed from `entry_idx`, capped
+    /// at [`PATH_DEPTH_CAP`].
+    ///
+    /// NOT on the query path any more: ranking reads the cached, clamped depth
+    /// out of [`Self::rank_key`] instead, because this walk costs an `frn_map`
+    /// probe per level (~250-400 ns) and the ranking loop used to pay it once
+    /// per candidate. This stays as the exact, uncached definition — it is what
+    /// the sweep is checked against, and what `path_of`-shaped callers want.
+    // Deliberately kept with no non-test caller: this is the SPECIFICATION of
+    // the value `rank_key` caches, and the sweep is only trustworthy because a
+    // test asserts the two agree for every entry. Step 11 gives it callers
+    // again when `search` starts returning slots to the service.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn depth_of(&self, entry_idx: u32) -> u32 {
         let mut depth = 0u32;
         let mut idx = entry_idx;
@@ -548,6 +941,7 @@ impl VolumeIndex {
             folded_arena: self.folded_arena.capacity() as u64,
             frn_map,
             free_slots: (self.free_slots.capacity() * std::mem::size_of::<u32>()) as u64,
+            rank_key: self.rank_key.capacity() as u64,
             folded_order: accel.folded_order,
             initials: accel.initials,
             trigrams: accel.trigrams,
@@ -567,7 +961,9 @@ impl VolumeIndex {
         self.name_arena.len()
     }
 
-    /// Live+stale bytes of folded payload; see [`Self::name_arena_len`].
+    /// Live+stale bytes of folded payload, including the one-byte-per-record
+    /// [`FOLDED_DELIM`] fences (row 3 of the §3.4 accounting is `L + 1` for
+    /// exactly this reason); see [`Self::name_arena_len`].
     pub fn folded_arena_len(&self) -> usize {
         self.folded_arena.len()
     }
@@ -768,6 +1164,155 @@ mod tests {
         assert_eq!(v.path_of(2), None);
     }
 
+    /// Parent FRN no entry in these tests ever mints, so an entry naming it
+    /// anchors at the root instead of nesting under a sibling.
+    const ABSENT_PARENT: u64 = 9_999_999;
+
+    fn rank_depth(v: &VolumeIndex, frn: u64) -> u8 {
+        v.rank_key[v.frn_map[&frn] as usize] & RANK_DEPTH_MAX
+    }
+
+    /// The cached ranking depth must equal the exact parent walk — clamped to
+    /// the 7 bits it lives in — for EVERY entry, whatever order the entries
+    /// arrived in.
+    ///
+    /// Insertion order is the load-bearing part. `FSCTL_ENUM_USN_DATA` walks in
+    /// MFT-record order, so a child enumerated before its parent is the normal
+    /// case, not a corner one; the incremental rule in `register_slot` caches 0
+    /// for all of them, and only `finalize`'s sweep can fix it. Without the
+    /// sweep a file twenty levels down would rank as if it sat at the volume
+    /// root, and nothing else in the suite would notice.
+    #[test]
+    fn cached_depth_matches_depth_of_after_finalize() {
+        let mut v = ix();
+
+        // (1) A chain inserted CHILD FIRST: every add sees a parent that does
+        // not exist yet.
+        const CHAIN: u64 = 12;
+        for d in (0..=CHAIN).rev() {
+            let parent = if d == 0 { ABSENT_PARENT } else { 100 + d - 1 };
+            v.add(100 + d, parent, &format!("dir{d}"), flags::DIR);
+        }
+        assert_eq!(rank_depth(&v, 100 + CHAIN), 0, "child-first caches 0…");
+        assert_eq!(
+            v.depth_of(v.frn_map[&(100 + CHAIN)]),
+            CHAIN as u32,
+            "…wrongly"
+        );
+
+        // (2) Parent-first, with the hidden/system bit in play.
+        v.add(200, ABSENT_PARENT, "top", flags::DIR);
+        v.add(201, 200, "mid", flags::DIR | flags::HIDDEN);
+        v.add(202, 201, "leaf.txt", flags::SYSTEM);
+        // (3) A self-parenting volume root, something under it, and an orphan.
+        v.add(300, 300, "root", flags::DIR);
+        v.add(301, 300, "under-root.txt", 0);
+        v.add(400, 424_242, "orphan.txt", 0);
+        // (4) A chain deeper than the 7-bit clamp.
+        for d in 0..200u64 {
+            let parent = if d == 0 { ABSENT_PARENT } else { 1000 + d - 1 };
+            v.add(1000 + d, parent, &format!("d{d}"), flags::DIR);
+        }
+        // (5) A parent cycle, which `depth_of` reports as PATH_DEPTH_CAP.
+        v.add(500, 501, "cyc-a", flags::DIR);
+        v.add(501, 500, "cyc-b", flags::DIR);
+
+        v.finalize();
+
+        for (slot, e) in v.live_entries() {
+            assert_eq!(
+                (v.rank_key[slot as usize] & RANK_DEPTH_MAX) as u32,
+                v.depth_of(slot).min(RANK_DEPTH_MAX as u32),
+                "cached depth for frn {} disagrees with the walk",
+                e.frn
+            );
+            assert_eq!(
+                v.rank_key[slot as usize] & RANK_PENALIZED != 0,
+                e.flags & (flags::HIDDEN | flags::SYSTEM) != 0,
+                "hidden/system bit for frn {}",
+                e.frn
+            );
+        }
+
+        assert_eq!(rank_depth(&v, 100 + CHAIN), CHAIN as u8);
+        assert_eq!(rank_depth(&v, 202), 2);
+        assert_eq!(v.rank_key[v.frn_map[&202] as usize] & RANK_PENALIZED, 0x80);
+        assert_eq!(rank_depth(&v, 301), 1);
+        assert_eq!(rank_depth(&v, 400), 0);
+        // Clamped, not wrapped: 199 and 512 both land on 127.
+        assert_eq!(rank_depth(&v, 1199), RANK_DEPTH_MAX);
+        assert_eq!(rank_depth(&v, 500), RANK_DEPTH_MAX);
+        assert_eq!(rank_depth(&v, 501), RANK_DEPTH_MAX);
+    }
+
+    /// A directory reparent shifts every descendant's cached depth by a
+    /// constant. It is repaired on the WRITER, debounced and sliced — never
+    /// from `search`, because a depth refresh on the query path re-arms the
+    /// rebuild-on-mutation cliff the column exists to remove.
+    #[test]
+    fn directory_reparent_is_repaired_by_the_writer_not_by_search() {
+        let mut v = ix();
+        v.add(10, ABSENT_PARENT, "top", flags::DIR);
+        v.add(11, ABSENT_PARENT, "other", flags::DIR);
+        v.add(20, 10, "sub", flags::DIR);
+        v.add(30, 20, "deeper", flags::DIR);
+        v.add(31, 30, "x.txt", 0);
+        v.add(21, 20, "leaf.txt", 0);
+        v.finalize();
+        assert_eq!(
+            (rank_depth(&v, 20), rank_depth(&v, 30), rank_depth(&v, 31)),
+            (1, 2, 3)
+        );
+
+        // Moving a FILE arms nothing: it has no descendants, and its own depth
+        // is recomputed where it is re-registered.
+        v.apply(UsnEvent::Rename {
+            frn: 21,
+            new_parent_frn: 11,
+            new_name: "leaf.txt".into(),
+        });
+        assert!(
+            v.depth_repair_armed.is_none(),
+            "a file move has no descendants"
+        );
+        assert_eq!(rank_depth(&v, 21), 1);
+        assert!(!v.repair_depths_slice(), "nothing armed, nothing to do");
+
+        // Moving a DIRECTORY does. The moved entry itself is fixed at once;
+        // its descendants are what go stale.
+        v.apply(UsnEvent::Rename {
+            frn: 20,
+            new_parent_frn: ABSENT_PARENT,
+            new_name: "sub".into(),
+        });
+        assert!(v.depth_repair_armed.is_some());
+        assert!(!v.depth_repair_due(), "the debounce has not elapsed");
+        assert_eq!(
+            rank_depth(&v, 20),
+            0,
+            "the moved entry is exact immediately"
+        );
+        assert_eq!(
+            (rank_depth(&v, 30), rank_depth(&v, 31)),
+            (2, 3),
+            "descendants are stale"
+        );
+        // Search does NOT repair: it reads rank_key unconditionally.
+        assert_eq!(v.search("deeper", 10, &|| false).len(), 1);
+        assert_eq!(rank_depth(&v, 30), 2, "the query path must not sweep");
+
+        // The writer drains it in slices; one is enough at this size.
+        while v.repair_depths_slice() {}
+        assert!(v.depth_repair_armed.is_none());
+        assert_eq!((rank_depth(&v, 30), rank_depth(&v, 31)), (1, 2));
+        for (slot, _) in v.live_entries() {
+            assert_eq!(
+                (v.rank_key[slot as usize] & RANK_DEPTH_MAX) as u32,
+                v.depth_of(slot).min(RANK_DEPTH_MAX as u32)
+            );
+        }
+    }
+
     #[test]
     fn apply_create_existing_frn_updates() {
         let mut v = ix();
@@ -830,6 +1375,79 @@ mod tests {
         let mut v = ix();
         v.add(1, 999, "", 0);
         assert_eq!(v.len(), 0);
+    }
+
+    /// Invariant I3: nothing below 0x20 reaches the folded arena except the
+    /// record delimiters, so a name whose folded form carries a control byte
+    /// is dropped at `intern` alongside the empty-name drop. NTFS forbids
+    /// these bytes, so only synthetic and walk-mode inputs can hit this.
+    #[test]
+    fn control_byte_name_is_skipped() {
+        let mut v = ix();
+        v.add(1, 999, "nul\u{0}name.txt", 0); // the delimiter itself
+        v.add(2, 999, "bell\u{7}.txt", 0);
+        v.add(3, 999, "tab\there.txt", 0);
+        v.add(4, 999, "\u{1f}.txt", 0);
+        assert_eq!(v.len(), 0);
+        assert_eq!(v.name_of(1), None);
+        // Dropped BEFORE either arena is touched: a rejected name must not
+        // leave bytes behind for the next record's offsets to sit after.
+        assert!(v.name_arena.is_empty());
+        assert!(v.folded_arena.is_empty());
+        assert_eq!(v.dead_bytes(), 0);
+        // DEL (0x7f) and above are not control bytes by this rule, and a
+        // clean name is still accepted.
+        v.add(5, 999, "ok\u{7f}.txt", 0);
+        v.add(6, 999, "plain.txt", 0);
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.name_of(6), Some("plain.txt"));
+    }
+
+    /// The folded arena is `0x00 rec 0x00 rec 0x00` (design §2): every record
+    /// is fenced, `folded_off` points past its leading NUL, and the trailing
+    /// NUL is what makes `arena[hit + qlen]` in bounds for tier
+    /// classification. Delete and rename NUL-fill the vacated record so dead
+    /// bytes are inert rather than merely bounds-checked (invariant I4).
+    #[test]
+    fn folded_arena_is_nul_fenced_and_dead_records_are_erased() {
+        let mut v = ix();
+        v.add(1, 999, "Alpha", 0);
+        v.add(2, 999, "Beta", 0);
+        v.add(3, 999, "Gamma", 0);
+        assert_eq!(v.folded_arena, "\0alpha\0beta\0gamma\0");
+
+        let check_fenced = |v: &VolumeIndex| {
+            let a = v.folded_arena.as_bytes();
+            assert_eq!(a.first(), Some(&0), "leading delimiter");
+            assert_eq!(a.last(), Some(&0), "trailing delimiter");
+            for (_, e) in v.live_entries() {
+                let off = e.folded_off as usize;
+                let end = off + e.folded_len as usize;
+                assert_eq!(a[off - 1], 0, "record is preceded by a delimiter");
+                assert_eq!(a[end], 0, "record is followed by a delimiter");
+                assert!(a[off..end].iter().all(|&b| b >= 0x20), "no control bytes");
+            }
+        };
+        check_fenced(&v);
+
+        // Delete erases "beta" in place. Nothing shifts, so every surviving
+        // record keeps its offset; the erased record just merges with the two
+        // fences around it into one longer run of delimiters.
+        v.apply(UsnEvent::Delete { frn: 2 });
+        assert_eq!(v.folded_arena, format!("\0alpha{}gamma\0", "\0".repeat(6)));
+        check_fenced(&v);
+
+        // Rename appends the new record and erases the old one.
+        v.apply(UsnEvent::Rename {
+            frn: 3,
+            new_parent_frn: 999,
+            new_name: "Delta".into(),
+        });
+        assert_eq!(v.folded_arena, format!("\0alpha{}delta\0", "\0".repeat(12)));
+        check_fenced(&v);
+        assert_eq!(v.name_of(3), Some("Delta"));
+        assert!(v.search("gamma", 10, &|| false).is_empty());
+        assert_eq!(v.search("delta", 10, &|| false).len(), 1);
     }
 
     #[test]

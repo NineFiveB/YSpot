@@ -134,17 +134,23 @@ fn usn_tail_loop(state: Arc<ServiceState>, drive: String, mut cursor: UsnCursor)
             // back as NeedsRebuild, never as Err (§3.3 recovery contract).
             match idx_api::usn_read_batch(&mut tailer, &mut cursor) {
                 Ok(idx_api::TailOutcome::Events(events)) => {
-                    if events.is_empty() {
-                        continue;
-                    }
+                    // Also on an empty batch — a housekeeping-only read still
+                    // wakes this thread, and it is the only clock the depth
+                    // repair has. `read_batch` blocks until journal data
+                    // arrives, so an outstanding repair lands one batch after
+                    // its debounce elapses, not on a timer: on a volume with no
+                    // filesystem activity at all it simply waits, which is
+                    // exactly when a stale ranking depth costs nothing.
                     let n = events.len();
-                    {
+                    if n > 0 {
                         let mut idx = state.index_write();
                         for ev in events {
                             idx_api::apply_usn(&mut idx, ev);
                         }
+                        drop(idx);
+                        log::debug!("applied {n} USN events (next usn {})", cursor.next_usn);
                     }
-                    log::debug!("applied {n} USN events (next usn {})", cursor.next_usn);
+                    repair_depths(&state);
                 }
                 Ok(idx_api::TailOutcome::NeedsRebuild(reason)) => {
                     log::warn!("USN journal wrap ({reason}); full re-enumeration (§3.3)");
@@ -158,6 +164,35 @@ fn usn_tail_loop(state: Arc<ServiceState>, drive: String, mut cursor: UsnCursor)
             }
         }
     }
+}
+
+/// Drain an outstanding ranking-depth repair on the WRITER thread, one slice
+/// per write-lock acquisition (§3.4 `depth_penalty`, design §5).
+///
+/// A directory that changes parent shifts every descendant's cached depth by a
+/// constant. The alternative — refreshing depth from the query path — would put
+/// an O(n) sweep inside the §2.5 10 ms budget on the first keystroke after any
+/// `move`, which is exactly the rebuild-on-mutation cliff the cached column
+/// exists to remove. Here it costs the writer a few slices and readers nothing:
+/// the lock is released between slices, so a search never waits for the whole
+/// sweep, and until it lands the only effect is a few percent of score on a
+/// moved subtree. No result appears or disappears.
+fn repair_depths(state: &ServiceState) {
+    // Read lock for the poll: it runs after every USN batch and almost always
+    // says no, so it must not contend with searches.
+    if !idx_api::depth_repair_due(&state.index_read()) {
+        return;
+    }
+    let t0 = Instant::now();
+    let mut slices = 0usize;
+    while idx_api::repair_depths_slice(&mut state.index_write()) {
+        slices += 1;
+    }
+    log::debug!(
+        "ranking-depth repair done in {} slice(s), {} ms",
+        slices + 1,
+        t0.elapsed().as_millis()
+    );
 }
 
 /// Full re-enumeration behind the serving index: build a fresh index without

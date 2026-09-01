@@ -52,6 +52,18 @@ pub fn apply_usn(idx: &mut VolumeIndex, ev: UsnEvent) {
     idx.apply(ev);
 }
 
+/// Whether a directory reparent has left descendant ranking depths stale and
+/// its debounce has elapsed (§3.4 `depth_penalty`).
+pub fn depth_repair_due(idx: &VolumeIndex) -> bool {
+    idx.depth_repair_due()
+}
+
+/// Advance the depth repair by one slice; `true` while more remains, so the
+/// caller can drop and retake the write lock between slices.
+pub fn repair_depths_slice(idx: &mut VolumeIndex) -> bool {
+    idx.repair_depths_slice()
+}
+
 /// Dev-mode population (unelevated): iterative filesystem walk (§3 `walk` module).
 pub fn walk_into(root: &str, idx: &mut VolumeIndex) -> anyhow::Result<()> {
     yspot_index::walk::walk(Path::new(root), idx)?;

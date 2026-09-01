@@ -1054,13 +1054,14 @@ M0 sign-off requires numbers from reference Machine A and Machine B.";
 
 /// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
 /// object cannot drift apart.
-fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 8] {
+fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 9] {
     [
         ("entries", b.entries),
         ("name_arena", b.name_arena),
         ("folded_arena", b.folded_arena),
         ("frn_map", b.frn_map),
         ("free_slots", b.free_slots),
+        ("rank_key", b.rank_key),
         ("accel:folded_order", b.folded_order),
         ("accel:initials", b.initials),
         ("accel:trigrams", b.trigrams),
@@ -1179,8 +1180,11 @@ impl Report {
             "  cold first query (2-char, builds folded_order + initials arena) : {:>12.1} µs",
             self.cold_basic_us
         );
+        // The 3-char rows no longer imply a trigram build: a full page above the
+        // 0.5 fuzzy ceiling now skips the whole fuzzy pass, postings included.
+        // `ram_warm` is measured after a query that does reach the tier.
         println!(
-            "  cold first query (3-char, additionally builds trigram postings) : {:>12.1} µs",
+            "  cold first query (3-char; trigrams only if the fuzzy tier runs) : {:>12.1} µs",
             self.cold_trigram_us
         );
         println!(
@@ -1516,6 +1520,21 @@ fn run(cfg: &Config) -> Report {
     let t = Instant::now();
     std::hint::black_box(ix.search(&cold3, cfg.max_results, &|| false));
     let mutation_trigram_us = us(t);
+
+    // One query that actually REACHES the fuzzy tier, so `ram_warm` charges the
+    // trigram postings.
+    //
+    // It stopped being automatic once the matcher gained a floor: the 3-char
+    // probes above fill a 32-result page from the initials tier, the floor
+    // climbs past the 0.5 fuzzy ceiling, and the whole fuzzy pass — including
+    // building the postings — is skipped. That is the intended latency win, but
+    // it would leave the largest single structure in the index reported as 0 B
+    // while a fuzzy query still builds it. Warm has to mean every structure a
+    // served index can hold, or the §3.4 memory budget is measured against a
+    // number that is simply not the index.
+    if let Some(q) = fuzzy_queries.first() {
+        std::hint::black_box(ix.search(q, cfg.max_results, &|| false));
+    }
 
     let ram_warm_parts = ix.ram_breakdown();
     let ram_warm = ram_warm_parts.total();
