@@ -29,6 +29,12 @@ jobs:
   release:
     name: Build and sign (windows-latest)
     runs-on: windows-latest
+    # Federated credentials cannot use wildcards, and this workflow triggers on
+    # `v*` tags — so the credential is registered against an environment subject
+    # (`…:environment:release`) rather than a ref. Declaring the environment here
+    # is what makes the OIDC token carry that subject. Same pattern as the
+    # sibling repos on this signing account.
+    environment: release
     permissions:
       contents: read
       # Lets azure/login exchange a GitHub OIDC token for an Azure token, so no
@@ -176,6 +182,19 @@ jobs:
           timestamp-digest: SHA256
           description: YSpot installer
           description-url: ${{ github.server_url }}/${{ github.repository }}
+
+      # Certificate subjects come from Azure identity validation, not from this
+      # repo, so the only way to guarantee YSpot never ships under a personal
+      # identity is to inspect what signing actually produced (docs/SIGNING.md).
+      - name: "Verify publisher identity"
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          YSPOT_EXPECTED_SIGNER_CN: ${{ vars.YSPOT_EXPECTED_SIGNER_CN }}
+        run: |
+          ./scripts/verify-signature.ps1 -Path target/release/bundle -RequireSigned
+          ./scripts/verify-signature.ps1 -Path target/release/yspot-indexd.exe -RequireSigned
+          ./scripts/verify-signature.ps1 -Path target/release/yspot-shell.exe -RequireSigned
 
       - name: "Stage artifacts"
         id: stage

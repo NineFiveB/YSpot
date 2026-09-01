@@ -196,15 +196,53 @@ typing an organization name somewhere does not work; the subject follows the
 validated entity, so a personal billing identity produces a personally-named
 certificate.
 
-### Publishing as NineFiveB
+### Publishing as the organization
 
-**Status: blocked on a business decision, not on engineering.** The tooling in
-this repo is fully parameterized (endpoint / account / profile are config), so it
-works with whatever identity is eventually validated. What follows are the
-constraints, verified against the CA/Browser Forum Baseline Requirements,
-Microsoft Learn, the `az` CLI reference, and real certificates inspected on a
-developer machine. Do **not** treat any of it as changeable by argument — the
-naming rules are CA industry requirements, not Microsoft preferences.
+**Decision: YSpot signs under the organization identity, never a personal one.**
+Certificate profiles and identity validation on the signing account point at the
+organization; all future YSpot binaries must carry that publisher.
+
+**Live configuration** (verified against Azure on 2026-09-01):
+
+| Setting | Value | Where it lives |
+|---|---|---|
+| Signing account | `aegiosot` (Basic SKU, `eastus`) | RG `ytile-signing`, subscription `NineFiveB` |
+| Endpoint | `https://eus.codesigning.azure.net/` | repo var `YSPOT_SIGN_ENDPOINT` |
+| Certificate profile | `release-signing` | repo var `YSPOT_SIGN_PROFILE` |
+| Signing identity | user-assigned MI `ytile-release-signer` | repo var `YSPOT_AZURE_CLIENT_ID` |
+| Federated credential | `github-yspot-release` → `repo:AegiosOT@2933384/YSpot@1350372443:environment:release` | on that MI |
+| Environment gate | `environment: release` on the release job | `.github/workflows/release.yml` |
+
+The account name (`aegiosot`) is **not** part of the certificate — it is just an
+Azure resource name. Only the validated identity determines CN and O.
+
+> **Precondition before the first release:** the account currently has **no
+> certificate profile**. `release-signing` must exist and be bound to the
+> organization identity validation, or every signing step fails. Verify with:
+>
+> ```
+> az rest --method get --url "https://management.azure.com/subscriptions/<sub>/resourceGroups/ytile-signing/providers/Microsoft.CodeSigning/codeSigningAccounts/aegiosot/certificateProfiles?api-version=2026-05-15-preview"
+> ```
+>
+> Also confirm the profile type is **Public Trust**, not Public Trust Test.
+
+**Do not use the "Azure for Students" subscription** for signing — sponsored,
+free and trial subscriptions are rejected by Artifact Signing. The signing
+account lives in the `NineFiveB` subscription and must stay there (resources
+cannot be migrated across subscriptions, tenants or resource groups).
+
+**Verification is enforced, not assumed.** `scripts/verify-signature.ps1` runs
+after signing in the release workflow and fails the build if a shipped file is
+unsigned, has an invalid signature, or has a subject that does not match
+`YSPOT_EXPECTED_SIGNER_CN`. Set that variable to the organization's exact CN once
+the certificate profile exists — that is what mechanically prevents a personal
+identity from shipping again.
+
+The constraints below are verified against the CA/Browser Forum Baseline
+Requirements, Microsoft Learn, the `az` CLI reference, and real certificates
+inspected on a developer machine. Do **not** treat any of it as changeable by
+argument — the naming rules are CA industry requirements, not Microsoft
+preferences.
 
 **The certificate subject cannot be chosen.**
 
