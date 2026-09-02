@@ -135,7 +135,11 @@ fn search(
     gen: u64,
     text: String,
 ) -> Result<Accepted, String> {
-    pipe.search(gen, text)?;
+    log::debug!("search cmd: gen={gen} text={text:?}");
+    pipe.search(gen, text).map_err(|e| {
+        log::warn!("search cmd failed: {e}");
+        e
+    })?;
     Ok(Accepted { accepted: true })
 }
 
@@ -182,6 +186,68 @@ fn frontend_ready(
     }
     // The connect event may have fired before the frontend was listening.
     pipe_client::emit_conn_state(&app, pipe.is_connected());
+    Ok(())
+}
+
+/// §10 M0 non-injecting self-measurement request, read by the frontend on
+/// startup. `queries;iterations` (e.g. `kernel,ntdll,win;30`) drives the real
+/// keydown→results path IN THE PAGE — no SendInput, no ETW session, no window
+/// focus. Empty when not requested.
+#[tauri::command]
+fn m0_spec() -> String {
+    std::env::var("YSPOT_M0_SELFMEASURE").unwrap_or_default()
+}
+
+/// §10 M0: receive the self-measurement samples from the frontend and log the
+/// per-bucket keydown→results p50/p95 against the ≤ 20 ms §2.5 budget.
+#[tauri::command]
+fn m0_report(json: String) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct Sample {
+        q: String,
+        plen: usize,
+        ms: f64,
+    }
+    #[derive(serde::Deserialize)]
+    struct Report {
+        #[serde(default)]
+        iterations: u32,
+        #[serde(default)]
+        rows: Vec<Sample>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+    log::info!("m0 selfmeasure raw report: {json}");
+    let rep: Report = serde_json::from_str(&json).map_err(|e| e.to_string())?;
+    if let Some(err) = rep.error {
+        log::error!("m0 selfmeasure: frontend reported error: {err}");
+        return Ok(());
+    }
+    if rep.rows.is_empty() {
+        return Ok(());
+    }
+    log::info!(
+        "m0 selfmeasure results — {} iterations, {} samples, keydown→results (frontend clock, \
+         §2.5 gate p95 ≤ 20 ms):",
+        rep.iterations,
+        rep.rows.len()
+    );
+    // Bucket by (query, prefix length), same shape as `yspot-m0 type`.
+    let mut buckets: std::collections::BTreeMap<(String, usize), Vec<f64>> = Default::default();
+    for s in rep.rows {
+        buckets.entry((s.q, s.plen)).or_default().push(s.ms);
+    }
+    for ((q, plen), mut v) in buckets {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |frac: f64| v[((frac * v.len() as f64).ceil() as usize).clamp(1, v.len()) - 1];
+        let (p50, p95, max) = (at(0.50), at(0.95), v[v.len() - 1]);
+        let prefix: String = q.chars().take(plen).collect();
+        log::info!(
+            "  {prefix:<12} ({plen}c) n={:<3} p50 {p50:>6.2}  p95 {p95:>6.2}  max {max:>6.2} ms  {}",
+            v.len(),
+            if p95 <= 20.0 { "PASS" } else { "FAIL" }
+        );
+    }
     Ok(())
 }
 
@@ -255,7 +321,9 @@ pub fn run() {
             frontend_ready,
             execute_action,
             get_status,
-            m0_mark
+            m0_mark,
+            m0_report,
+            m0_spec
         ])
         .setup(move |app| {
             pipe_client::spawn(app.handle().clone(), pipe.clone());

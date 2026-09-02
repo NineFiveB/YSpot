@@ -39,6 +39,12 @@ export default function App(): ReactElement {
   const bufferRef = useRef<ipc.SearchResultsPayload[]>([]);
   const rafRef = useRef<number | null>(null);
   const keydownTsRef = useRef<number | null>(null);
+  // §10 M0 non-injecting self-measurement: gen → resolver, fulfilled when that
+  // generation's results are applied in a rAF. Lets a driver time the real
+  // keydown→results-applied path without any OS input injection.
+  const measureResolversRef = useRef<Map<number, (ms: number | null) => void>>(
+    new Map(),
+  );
 
   // Apply buffered result batches at most once per animation frame (§5.10).
   const applyBuffered = useCallback(() => {
@@ -61,7 +67,8 @@ export default function App(): ReactElement {
       setSelected(0);
       setGeneration(cur);
     }
-    if (markApplied(cur) !== null) setLat(statsSnapshot());
+    const applied = markApplied(cur);
+    if (applied !== null) setLat(statsSnapshot());
     // §10 M0 harness endpoint: this rAF committed `cur`'s results. The final
     // flag says whether the committed set includes the generation's final
     // batch — the harness pairs `applied gen=N final=1` with the results
@@ -70,6 +77,12 @@ export default function App(): ReactElement {
     // exactly one final batch, so today this is always 1).
     const sawFinal = fresh.some((p) => p.isFinal);
     ipc.m0Mark(`applied gen=${cur} final=${sawFinal ? 1 : 0}`);
+    // Fulfil a self-measurement waiter for this generation.
+    const resolve = measureResolversRef.current.get(cur);
+    if (resolve) {
+      measureResolversRef.current.delete(cur);
+      resolve(applied);
+    }
   }, []);
 
   const scheduleApply = useCallback(() => {
@@ -133,6 +146,33 @@ export default function App(): ReactElement {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
+  // §10 M0 non-injecting self-measurement. Drives one real search generation
+  // and resolves with keydown→results-applied ms (or null on timeout/no
+  // results). Same path a keystroke takes — markKeydown, the pipe round trip,
+  // the rAF apply — but triggered in-process, so it injects NO OS input and
+  // needs no elevated ETW session or window focus.
+  const measureOne = useCallback(
+    (text: string) =>
+      new Promise<number | null>((resolve) => {
+        const gen = ++genRef.current;
+        markKeydown(gen, performance.now());
+        const timer = window.setTimeout(() => {
+          if (measureResolversRef.current.delete(gen)) resolve(null);
+        }, 2000);
+        measureResolversRef.current.set(gen, (ms) => {
+          window.clearTimeout(timer);
+          resolve(ms);
+        });
+        void ipc.search(gen, text).catch(() => {
+          if (measureResolversRef.current.delete(gen)) {
+            window.clearTimeout(timer);
+            resolve(null);
+          }
+        });
+      }),
+    [],
+  );
+
   // First frame rendered → tell the shell the renderer is warm (§5.4).
   useEffect(() => {
     startThrottleProbe();
@@ -141,6 +181,43 @@ export default function App(): ReactElement {
     });
     return () => cancelAnimationFrame(id);
   }, []);
+
+  // §10 M0 non-injecting self-measurement, driven entirely in-page: if the
+  // shell was started with a spec (`queries;iterations`), warm up, then time
+  // each query prefix's keydown→results-applied and report. Each prefix is one
+  // sample, bucketed by length — the shape `yspot-m0 type` produces, but with
+  // no OS input injection, no ETW session, and no window focus needed.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const spec = await ipc.m0Spec();
+      ipc.m0Report(JSON.stringify({ stage: "spec", spec }));
+      if (!spec || cancelled) return;
+      const [qsCsv, itStr] = spec.split(";");
+      const iterations = Math.max(1, parseInt(itStr ?? "15", 10) || 15);
+      const queries = qsCsv
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      // Let the connection settle and warm the caches with one pass.
+      await new Promise((r) => setTimeout(r, 1500));
+      for (const q of queries) await measureOne(q);
+      const rows: { q: string; plen: number; ms: number }[] = [];
+      for (let it = 0; it < iterations && !cancelled; it++) {
+        for (const q of queries) {
+          for (let k = 1; k <= q.length; k++) {
+            const ms = await measureOne(q.slice(0, k));
+            if (ms !== null) rows.push({ q, plen: k, ms });
+            await new Promise((r) => setTimeout(r, 15));
+          }
+        }
+      }
+      if (!cancelled) ipc.m0Report(JSON.stringify({ iterations, rows }));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [measureOne]);
 
   const resetResults = useCallback((gen: number) => {
     appliedGenRef.current = gen;

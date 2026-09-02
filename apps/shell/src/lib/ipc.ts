@@ -87,3 +87,20 @@ export function onWindowHidden(cb: () => void): Promise<UnlistenFn> {
 export function m0Mark(text: string): void {
   void invoke("m0_mark", { text }).catch(() => undefined);
 }
+
+/**
+ * Report the §10 M0 self-measurement result (keydown→results samples) to the
+ * shell, which logs it. Non-injecting path; see App.tsx.
+ */
+export function m0Report(json: string): void {
+  void invoke("m0_report", { json }).catch(() => undefined);
+}
+
+/**
+ * The §10 M0 self-measurement request (`queries;iterations`), or "" when not
+ * requested. Read once on startup; if set, the frontend drives its own real
+ * search path and reports via {@link m0Report}.
+ */
+export function m0Spec(): Promise<string> {
+  return invoke<string>("m0_spec").catch(() => "");
+}
