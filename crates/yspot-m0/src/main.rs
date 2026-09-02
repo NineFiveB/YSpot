@@ -150,32 +150,45 @@ fn print_stats(
 
 /// Ensure the launcher process is running and in the given visibility state,
 /// toggling it via the real Alt+Space path if needed.
+///
+/// The summon is RETRIED: injected Alt+Space is not perfectly reliable when
+/// the harness has been hammering the input path (a whole toggle run before
+/// a type run leaves it flaky), so up to six chords are sent, each confirmed
+/// by the visibility poll rather than the marker — polling `IsWindowVisible`
+/// is what the caller actually needs true, and it recovers even if the marker
+/// was missed.
 fn ensure_visible(session: &Session, want_visible: bool) -> Result<()> {
-    let Some(visible) = input::launcher_visible() else {
+    if input::launcher_visible().is_none() {
         bail!(
             "no YSpot launcher window (title \"YSpot\", process yspot-shell) — start the shell \
              first (apps/shell: npm run build && cargo run -p yspot-shell --release)"
         );
-    };
-    if visible == want_visible {
-        return Ok(());
     }
-    session.drain();
-    let t0 = input::qpc();
-    if !input::send_alt_space() {
-        bail!("SendInput(Alt+Space) failed");
+    for attempt in 0..6 {
+        if input::launcher_visible() == Some(want_visible) {
+            return Ok(());
+        }
+        session.drain();
+        if !input::send_alt_space() {
+            bail!("SendInput(Alt+Space) failed");
+        }
+        // Poll visibility for up to 1.5 s; the marker path is a fast exit but
+        // the poll is the authority.
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            if input::launcher_visible() == Some(want_visible) {
+                std::thread::sleep(Duration::from_millis(120));
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        log::warn!("ensure_visible({want_visible}): attempt {attempt} did not take");
     }
-    let want = if want_visible { "shown" } else { "hidden" };
-    session
-        .wait_for(
-            Duration::from_secs(2),
-            |e| matches!(e, Event::Marker { text, qpc } if text == want && *qpc > t0),
-        )
-        .with_context(|| {
-            format!("no `{want}` marker after Alt+Space — is this the M0 shell build?")
-        })?;
-    std::thread::sleep(Duration::from_millis(150));
-    Ok(())
+    bail!(
+        "could not bring the launcher {} after six Alt+Space chords — injected-input \
+         reliability limit (see docs/M0.md)",
+        if want_visible { "up" } else { "down" }
+    )
 }
 
 /// Endpoints of one measurement step, derived from a QPC-SORTED view of every
