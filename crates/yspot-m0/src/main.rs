@@ -183,99 +183,110 @@ fn ensure_visible(session: &Session, want_visible: bool) -> Result<()> {
 /// promise cross-buffer timestamp order, so sequential consume-and-discard
 /// waits can eat an out-of-order event a later wait needed; collecting first
 /// and ordering by timestamp makes delivery order irrelevant.
+///
+/// Every field is a running MINIMUM qpc over the qualifying events, updated in
+/// O(1) as each event streams in (see [`StepOut::feed`]). Taking the minimum
+/// rather than the first-arrived is what makes it robust to real-time ETW's
+/// bounded cross-buffer reordering — a qualifying event that arrives late but
+/// timestamps earlier still lowers the endpoint — WITHOUT sorting a
+/// tens-of-thousands-strong DWM firehose on every arrival.
 #[derive(Default, Clone, Copy)]
 struct StepOut {
-    /// First `results … final=1` marker after t0: (qpc, gen).
+    /// `results … final=1` marker after t0: (min qpc, its gen).
     results: Option<(i64, u64)>,
-    /// First `applied gen=<same> final=1` marker after results. Gen-paired so
-    /// a commit belonging to another generation can never be attributed here.
+    /// `applied … final=1` marker whose gen matches `results` and qpc > it.
     applied: Option<i64>,
-    /// First accepted Dwm-Core event after applied.
+    /// First accepted Dwm-Core event after `applied`.
     pixels: Option<i64>,
     /// `shown` marker after t0 (toggle flow).
     shown: Option<i64>,
-    /// First accepted Dwm-Core event after shown (toggle flow).
+    /// First accepted Dwm-Core event after `shown` (toggle flow).
     shown_pixels: Option<i64>,
 }
 
-fn derive(events: &[Event], t0: i64, ids: &Option<Vec<u16>>) -> StepOut {
-    let mut sorted: Vec<&Event> = events.iter().collect();
-    sorted.sort_by_key(|e| e.qpc());
-    let mut out = StepOut::default();
-    for e in sorted {
-        match e {
-            Event::Marker { text, qpc } => {
-                if out.results.is_none()
-                    && *qpc > t0
-                    && text.starts_with("results ")
-                    && marker_field(text, "final") == Some(1)
-                {
-                    if let Some(gen) = marker_field(text, "gen") {
-                        out.results = Some((*qpc, gen));
-                    }
-                } else if out.applied.is_none()
-                    && text.starts_with("applied ")
-                    && marker_field(text, "final") == Some(1)
-                {
-                    if let Some((r_qpc, gen)) = out.results {
-                        if *qpc > r_qpc && marker_field(text, "gen") == Some(gen) {
-                            out.applied = Some(*qpc);
-                        }
-                    }
-                } else if out.shown.is_none() && text == "shown" && *qpc > t0 {
-                    out.shown = Some(*qpc);
-                }
-            }
-            Event::Dwm { qpc, id, .. } => {
-                if dwm_allows(ids, *id) {
-                    if out.pixels.is_none() {
-                        if let Some(a) = out.applied {
-                            if *qpc > a {
-                                out.pixels = Some(*qpc);
-                            }
-                        }
-                    }
-                    if out.shown_pixels.is_none() {
-                        if let Some(s) = out.shown {
-                            if *qpc > s {
-                                out.shown_pixels = Some(*qpc);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+fn min_opt(slot: &mut Option<i64>, v: i64) {
+    if slot.map(|cur| v < cur).unwrap_or(true) {
+        *slot = Some(v);
     }
-    out
 }
 
-/// Collect events until `done(out)` or timeout, re-deriving on every arrival.
+impl StepOut {
+    /// Fold one event in. Causal order (marker written before the composition
+    /// it triggers) means `results`/`applied`/`shown` are known before their
+    /// dependent DWM events arrive, so the O(1) running-min updates below are
+    /// exact in the normal case and off only by ETW's sub-millisecond
+    /// reordering.
+    fn feed(&mut self, ev: &Event, t0: i64, ids: &Option<Vec<u16>>) {
+        match ev {
+            Event::Marker { text, qpc } if *qpc > t0 => {
+                if text.starts_with("results ") && marker_field(text, "final") == Some(1) {
+                    if let Some(gen) = marker_field(text, "gen") {
+                        if self.results.map(|(q, _)| *qpc < q).unwrap_or(true) {
+                            self.results = Some((*qpc, gen));
+                        }
+                    }
+                } else if text.starts_with("applied ") && marker_field(text, "final") == Some(1) {
+                    if let Some((r_qpc, gen)) = self.results {
+                        if *qpc > r_qpc && marker_field(text, "gen") == Some(gen) {
+                            min_opt(&mut self.applied, *qpc);
+                        }
+                    }
+                } else if text == "shown" {
+                    min_opt(&mut self.shown, *qpc);
+                }
+            }
+            Event::Dwm { qpc, id, .. } if dwm_allows(ids, *id) => {
+                if let Some(a) = self.applied {
+                    if *qpc > a {
+                        min_opt(&mut self.pixels, *qpc);
+                    }
+                }
+                if let Some(s) = self.shown {
+                    if *qpc > s {
+                        min_opt(&mut self.shown_pixels, *qpc);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Stream events until `done(out)` or timeout, folding each into `out` in O(1)
+/// via [`StepOut::feed`] — no accumulation, no sorting. `on_dwm` observes every
+/// Dwm-Core (id, keyword) for the id histogram the toggle flow prints.
+///
+/// This is what keeps up with the composition-keyword firehose: tens of
+/// thousands of DWM events per cycle, each an O(1) fold, so the main thread
+/// never falls behind and never misses the marker it is waiting for.
 fn collect_step(
     session: &Session,
     t0: i64,
     timeout: Duration,
     ids: &Option<Vec<u16>>,
     done: impl Fn(&StepOut) -> bool,
-) -> (StepOut, Vec<Event>) {
+    mut on_dwm: impl FnMut(u16, u64),
+) -> StepOut {
     let deadline = Instant::now() + timeout;
-    let mut events: Vec<Event> = Vec::new();
+    let mut out = StepOut::default();
     session.flush();
     loop {
-        let out = derive(&events, t0, ids);
-        if done(&out) {
-            return (out, events);
-        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return (out, events);
+            return out;
         }
-        match session.rx.recv_timeout(left.min(Duration::from_millis(50))) {
-            Ok(ev) => events.push(ev),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => session.flush(),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let out = derive(&events, t0, ids);
-                return (out, events);
+        match session.rx.recv_timeout(left.min(Duration::from_millis(20))) {
+            Ok(ev) => {
+                if let Event::Dwm { id, keyword, .. } = &ev {
+                    on_dwm(*id, *keyword);
+                }
+                out.feed(&ev, t0, ids);
+                if done(&out) {
+                    return out;
+                }
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => session.flush(),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return out,
         }
     }
 }
@@ -320,15 +331,13 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
     // With shows as the only visible changes, ids whose count tracks the cycle
     // count are the composition-pass candidates — this is what `--dwm-ids`
     // gets pinned from, with no separate choreography.
-    let mut dwm_hist: std::collections::BTreeMap<u16, (usize, u64)> = Default::default();
-    let mut note_dwm = |evs: &[Event]| {
-        for ev in evs {
-            if let Event::Dwm { id, keyword, .. } = ev {
-                let e = dwm_hist.entry(*id).or_insert((0, 0));
-                e.0 += 1;
-                e.1 |= keyword;
-            }
-        }
+    let dwm_hist: std::cell::RefCell<std::collections::BTreeMap<u16, (usize, u64)>> =
+        Default::default();
+    let note_dwm = |id: u16, keyword: u64| {
+        let mut h = dwm_hist.borrow_mut();
+        let e = h.entry(id).or_insert((0, 0));
+        e.0 += 1;
+        e.1 |= keyword;
     };
 
     for cycle in 0..cycles {
@@ -337,10 +346,14 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         if !input::send_alt_space() {
             bail!("SendInput(Alt+Space) failed");
         }
-        let (out, evs) = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
-            o.shown.is_some() && o.shown_pixels.is_some()
-        });
-        note_dwm(&evs);
+        let out = collect_step(
+            &session,
+            t0,
+            Duration::from_secs(2),
+            &ids,
+            |o| o.shown.is_some() && o.shown_pixels.is_some(),
+            &note_dwm,
+        );
         match out.shown {
             Some(s) => to_shown.push(input::ticks_to_ms(s - t0, freq)),
             None => {
@@ -359,7 +372,9 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         // The throttle probe reports on the first rAF after show; give it a
         // short tail window of its own.
         for ev in session.collect(Duration::from_millis(400)) {
-            note_dwm(std::slice::from_ref(&ev));
+            if let Event::Dwm { id, keyword, .. } = &ev {
+                note_dwm(*id, *keyword);
+            }
             if let Event::Marker { text, .. } = ev {
                 if text.starts_with("rafgap ") {
                     rafgaps.push(text);
@@ -427,7 +442,7 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
          to pin via --dwm-ids:",
         etw::DWM_KEYWORDS_MEASURE
     );
-    for (id, (n, kw)) in &dwm_hist {
+    for (id, (n, kw)) in dwm_hist.borrow().iter() {
         println!("  id {id:>4}: {n:>6}  keyword 0x{kw:X}");
     }
     Ok(())
@@ -488,9 +503,14 @@ fn cmd_type(args: &[String]) -> Result<()> {
                 if !input::send_char(ch) {
                     bail!("SendInput({ch:?}) failed");
                 }
-                let (out, _evs) = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
-                    o.results.is_some() && o.applied.is_some() && o.pixels.is_some()
-                });
+                let out = collect_step(
+                    &session,
+                    t0,
+                    Duration::from_secs(2),
+                    &ids,
+                    |o| o.results.is_some() && o.applied.is_some() && o.pixels.is_some(),
+                    |_, _| {},
+                );
                 let Some((r_qpc, _)) = out.results else {
                     b.censored += 1;
                     continue;
