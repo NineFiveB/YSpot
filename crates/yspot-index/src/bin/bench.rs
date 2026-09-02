@@ -1083,10 +1083,12 @@ const RAM_ACCOUNTING_NOTE: &str = "\
 /// Printed with the fuzzy survivor table.
 const SURVIVOR_NOTE: &str = "\
 fuzzy prefilter selectivity — candidates the class-superset filter admits, against the §3.4
-cap on how many the density scorer will verify. This is the one failure mode the latency table
-above CANNOT show: when the cap binds, the excess candidates are never scored, so the cost is a
-MISSING RESULT rather than a slow one, and every class still passes its budget. `capped` counts
-the class's distinct queries whose candidate set the cap truncated. Tracked as issue #7.
+cap on how many the density scorer is guaranteed to verify. This is the one failure mode the
+latency table above CANNOT show: when the cap binds AND the page filled (or the soft deadline
+expired) first, the excess candidates are never scored, so the cost is a MISSING RESULT rather
+than a slow one, and every class still passes its budget. The drain continues past the cap
+while the page has room (§3.4 approximation ruling, issue #7), so `capped` counts the class's
+distinct queries whose candidate set the cap MAY truncate — the tripwire, not a proven loss.
 Measured with an EMPTY page, so it is the prefilter's own selectivity and an UPPER BOUND on what
 a real search truncates: mid-search the tier also skips slots a better tier already claimed and
 those below the running score floor's depth ceiling. A zero row means the tier never runs for

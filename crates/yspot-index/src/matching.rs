@@ -34,6 +34,7 @@
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
+use std::time::{Duration, Instant};
 
 use memchr::memmem;
 
@@ -55,6 +56,24 @@ const SCAN_POLL_CHUNK: usize = 1 << 20;
 
 /// Max fuzzy candidates scored per query (§3.4 prefilter bound).
 pub const FUZZY_CAP: usize = 20_000;
+
+/// Issue #7 ruling (M1): the fuzzy tier is normatively APPROXIMATE when its
+/// candidate set overloads [`FUZZY_CAP`] — exactness was measured unreachable
+/// (verify-all over budget, scalar scorer ceiling 1.39×, and the tightest
+/// class-positional bound still exceeds the cap; see the issue). The one
+/// regime the cap hurt most is also the one with budget to spare: a query
+/// whose genuine matches are RARE leaves the page unfilled after the retained
+/// set is verified, and its tail is rejection-heavy — the cheapest kind of
+/// candidate to verify. So past the cap the drain keeps verifying while the
+/// page has room, up to this much wall-clock since the search began. A query
+/// that fills its page (the dense regimes) never continues, so the §2.5
+/// latency budget is unaffected by construction; the deadline caps the sparse
+/// case at roughly the §2.5 service allotment.
+const FUZZY_SOFT_DEADLINE: Duration = Duration::from_millis(8);
+
+/// Tail candidates verified between deadline checks during the continuation.
+/// At ~60–90 ns a verification, one stride is ≈30–50 µs of overshoot at worst.
+const DEADLINE_STRIDE: usize = 512;
 
 /// Where the [`FUZZY_CAP`] budget runs out: the depth it is exhausted at, and
 /// how many candidates of exactly that depth still fit. Deeper candidates, and
@@ -98,15 +117,20 @@ fn fuzzy_cap_cut(
 pub struct FuzzySurvivors {
     /// Slots whose character-class set is a superset of the query's.
     pub survivors: usize,
-    /// Of those, how many the cap leaves room to verify. Equal to `survivors`
-    /// whenever the cap does not bind.
+    /// Of those, how many the cap's retained set covers. Equal to `survivors`
+    /// whenever the cap does not bind. The live drain may verify MORE than
+    /// this: when the page still has room after the retained set, it continues
+    /// into the tail until [`FUZZY_SOFT_DEADLINE`] (issue #7 ruling), so this
+    /// is the guaranteed floor, not the runtime count.
     pub verified: usize,
 }
 
 impl FuzzySurvivors {
     /// Whether [`FUZZY_CAP`] truncated this query's candidate set — i.e. some
     /// genuine subsequence match may be missing from the page rather than
-    /// merely ranked below it.
+    /// merely ranked below it. Since the drain continues past the cap while
+    /// the page has room (issue #7 ruling), a capped query actually LOSES
+    /// results only when its page filled or the deadline expired first.
     pub fn capped(&self) -> bool {
         self.verified < self.survivors
     }
@@ -886,6 +910,9 @@ pub(crate) fn search(
         return Vec::new();
     }
 
+    // Anchors the fuzzy continuation deadline (issue #7 ruling): taken before
+    // any tier runs, so time spent by Pass A/B counts against it.
+    let t0 = Instant::now();
     let rank_key = &ix.rank_key;
     // Slot -> name, so callers express the filter over names rather than over
     // the index's internal numbering.
@@ -1138,20 +1165,36 @@ pub(crate) fn search(
 
         let (cut, mut quota) = fuzzy_cap_cut(&by_depth, survivors);
 
+        let deadline = t0 + FUZZY_SOFT_DEADLINE;
+        let mut overtime = false;
+        let mut extra = 0usize;
         let mut scored = 0usize;
         for_each_class_superset(bsi, wps, words, qmask, |slot| {
             if !admits(&sel, slot) {
                 return true;
             }
             let d = (rank_key[slot as usize] & RANK_DEPTH_MAX) as usize;
-            if d > cut {
-                return true;
-            }
-            if d == cut {
-                if quota == 0 {
+            let retained = d < cut || (d == cut && quota > 0);
+            if retained {
+                if d == cut {
+                    quota -= 1;
+                }
+            } else {
+                // Past the cap: the §3.4 approximation ruling (issue #7).
+                // Dense queries filled the page out of the retained set and
+                // stop right here; a page with room means genuine matches are
+                // rare and the tail is rejection-heavy — cheap — so keep
+                // verifying it until the wall-clock deadline. `full()` and not
+                // the floor: a full page only improves from here, while an
+                // unfilled one is missing results we may still hold.
+                if sel.full() || overtime {
                     return true;
                 }
-                quota -= 1;
+                extra += 1;
+                if extra.is_multiple_of(DEADLINE_STRIDE) && Instant::now() >= deadline {
+                    overtime = true;
+                    return true;
+                }
             }
             scored += 1;
             if scored.is_multiple_of(CANCEL_STRIDE) && is_cancelled() {
@@ -1484,6 +1527,44 @@ mod tests {
         // The number this makes visible: what fraction never reaches the
         // density scorer at all.
         assert!(p.survivors - p.verified == 5_000);
+    }
+
+    /// Issue #7 ruling: past the cap, the drain keeps verifying while the page
+    /// has room. The retained set here is all class-superset junk (`cba…`
+    /// carries a, b and c but never in subsequence order), so under the old
+    /// behavior the page came back EMPTY; the genuine matches sit just past
+    /// the cap and only the continuation reaches them. They are shaped to be
+    /// fuzzy-only — `xaqbqc…` has no `abc` substring and no `abc` initials —
+    /// and placed directly after the cap so they are verified before the first
+    /// deadline check, keeping the test deterministic on slow builds.
+    #[test]
+    fn the_fuzzy_drain_continues_past_the_cap_while_the_page_has_room() {
+        let mut v = ix();
+        for i in 0..FUZZY_CAP as u64 {
+            v.add(i + 1, 999, &format!("cba{i}"), 0);
+        }
+        for i in 0..30u64 {
+            v.add(100_000 + i, 999, &format!("xaqbqc{i}"), 0);
+        }
+        v.finalize();
+
+        // The static probe still reports the truncation — `verified` is the
+        // guaranteed floor, not the runtime count.
+        let p = v.fuzzy_survivor_probe("abc");
+        assert!(p.capped());
+        assert_eq!(p.verified, FUZZY_CAP);
+
+        let hits = v.search("abc", 10, &no_cancel);
+        assert_eq!(
+            hits.len(),
+            10,
+            "the page must fill from matches past the cap; empty means the \
+             continuation did not run"
+        );
+        assert!(
+            hits.iter().all(|h| h.frn >= 100_000),
+            "every hit is one of the genuine tail matches"
+        );
     }
 
     #[test]
