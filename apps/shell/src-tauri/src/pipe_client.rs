@@ -1,8 +1,21 @@
 //! Named-pipe client to `yspot-indexd` (SPEC.md §4.1, relay per §4.6).
 //!
-//! One background thread owns connect → Hello/HelloAck → read loop, with a
-//! 1 s → 10 s capped reconnect backoff. Writers go through
-//! `Mutex<Option<File>>` (commands run on Tauri's thread pool).
+//! ONE background thread owns the handle outright: connect → Hello/HelloAck →
+//! a pump loop that alternates draining queued commands (writes) with
+//! `PeekNamedPipe`-guarded reads, with a 1 s → 10 s capped reconnect backoff.
+//! Commands from Tauri's thread pool only ever ENQUEUE.
+//!
+//! Why single-threaded ownership is load-bearing, not style: the pipe is
+//! opened synchronously, and Windows serializes synchronous I/O per FILE
+//! OBJECT — which `try_clone` duplicates a handle to rather than escaping. The
+//! previous shape (dedicated read thread blocked in `ReadFile`, writes from
+//! command threads) deadlocked on the FIRST `SearchQuery`: the write waited
+//! behind the outstanding read, the read waited for a reply the service could
+//! not send because the request never left this process. The exact
+//! client-side twin of the service bug fixed in dd228ee — issue #9's full
+//! remedy (`FILE_FLAG_OVERLAPPED`) lands with the M1 service wrapper; until
+//! then the peek-before-read poll below costs at most [`POLL_IDLE_CAP`] of
+//! added arrival latency against the §2.5 20 ms budget.
 //!
 //! TODO(M1, §4.1 client hardening): verify the server before first write —
 //! `GetNamedPipeServerProcessId` + pipe owner SID == S-1-5-18 via
@@ -10,8 +23,9 @@
 
 use std::fs::File;
 use std::io;
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,8 +35,16 @@ use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY, INVALID_HAND
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
 };
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use windows_sys::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
 use yspot_proto::{Filters, Message, ResultItem, MAX_FRAME_S2C, PIPE_NAME, PROTO_VERSION};
+
+/// Pump-loop sleep while traffic is flowing.
+const POLL_ACTIVE: Duration = Duration::from_millis(1);
+/// Pump-loop sleep cap when idle. Bounds the worst-case delay between a frame
+/// arriving at the pipe and this client reading it — i.e. the measurement and
+/// UX cost of polling instead of overlapped I/O. Kept at 2 ms so it stays
+/// noise against the §2.5 budget; the CPU cost of ≤500 wakeups/s is nil.
+const POLL_IDLE_CAP: Duration = Duration::from_millis(2);
 
 const MAX_RESULTS: u32 = 50;
 const BACKOFF_START: Duration = Duration::from_secs(1);
@@ -81,7 +103,10 @@ struct ConnState {
 // ---------------------------------------------------------------------------
 
 pub struct PipeClient {
-    writer: Mutex<Option<File>>,
+    /// Command queue into the pump thread — the only path to the pipe.
+    cmd_tx: Sender<Message>,
+    /// The pump thread takes this once at spawn.
+    cmd_rx: Mutex<Option<Receiver<Message>>>,
     req_id: AtomicU64,
     current_gen: AtomicU64,
     connected: AtomicBool,
@@ -89,8 +114,10 @@ pub struct PipeClient {
 
 impl PipeClient {
     pub fn new() -> Self {
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
         PipeClient {
-            writer: Mutex::new(None),
+            cmd_tx,
+            cmd_rx: Mutex::new(Some(cmd_rx)),
             req_id: AtomicU64::new(1),
             current_gen: AtomicU64::new(0),
             connected: AtomicBool::new(false),
@@ -105,22 +132,22 @@ impl PipeClient {
         self.req_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn send(&self, msg: &Message) -> Result<(), String> {
-        // Poison-tolerant (see run_loop): recover the inner Option<File>.
-        let mut guard = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_mut() {
-            Some(file) => yspot_proto::write_msg(file, msg).map_err(|e| {
-                log::warn!("pipe write failed: {e}");
-                format!("index service write failed: {e}")
-            }),
-            None => Err("index service not connected".to_string()),
+    /// Enqueue for the pump thread. The connected check keeps the old error
+    /// semantics for callers; a message racing a disconnect merely sits in the
+    /// queue, and the pump drains stale commands before each new handshake.
+    fn send(&self, msg: Message) -> Result<(), String> {
+        if !self.is_connected() {
+            return Err("index service not connected".to_string());
         }
+        self.cmd_tx
+            .send(msg)
+            .map_err(|_| "index service pump thread gone".to_string())
     }
 
     /// §4.6 `search`: filename query, empty scopes, default filters, 50 rows.
     pub fn search(&self, gen: u64, text: String) -> Result<(), String> {
         self.current_gen.store(gen, Ordering::SeqCst);
-        self.send(&Message::SearchQuery {
+        self.send(Message::SearchQuery {
             id: self.next_id(),
             gen,
             text,
@@ -133,12 +160,12 @@ impl PipeClient {
     /// §4.3 `Cancel` for the current generation ("stop entirely" — window hidden).
     pub fn cancel_current(&self) -> Result<(), String> {
         let gen = self.current_gen.load(Ordering::SeqCst);
-        self.send(&Message::Cancel { gen })
+        self.send(Message::Cancel { gen })
     }
 
     /// §4.6 `getIndexStatus` relay: reply arrives as an `index:status` event.
     pub fn request_status(&self) -> Result<(), String> {
-        self.send(&Message::IndexStatusReq { id: self.next_id() })
+        self.send(Message::IndexStatusReq { id: self.next_id() })
     }
 }
 
@@ -151,29 +178,27 @@ pub fn spawn(app: AppHandle, client: Arc<PipeClient>) {
 }
 
 fn run_loop(app: AppHandle, client: Arc<PipeClient>) {
+    // The pump owns the command receiver for the life of the process.
+    let cmd_rx = client
+        .cmd_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("pipe pump spawned twice");
     let mut backoff = BACKOFF_START;
     loop {
         match connect_and_handshake() {
             Ok(file) => {
                 backoff = BACKOFF_START;
-                let reader = match file.try_clone() {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("pipe handle clone failed: {e}");
-                        std::thread::sleep(backoff);
-                        continue;
-                    }
-                };
-                // Poison-tolerant: the guarded value is just an Option<File>,
-                // never left half-written — a panic elsewhere must not desync
-                // `connected` from the actual writer state.
-                *client.writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(file);
+                // Commands queued while disconnected are stale by definition
+                // (their generations were superseded, their callers told the
+                // service was down); a new conversation starts empty.
+                while cmd_rx.try_recv().is_ok() {}
                 client.connected.store(true, Ordering::SeqCst);
                 emit_conn_state(&app, true);
 
-                read_loop(&app, &client, reader);
+                pump_loop(&app, &client, &cmd_rx, file);
 
-                *client.writer.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 client.connected.store(false, Ordering::SeqCst);
                 emit_conn_state(&app, false);
             }
@@ -184,6 +209,28 @@ fn run_loop(app: AppHandle, client: Arc<PipeClient>) {
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_CAP);
     }
+}
+
+/// Bytes currently readable on the pipe without blocking, or an error when the
+/// pipe has died (broken/closed — the reconnect signal).
+fn readable_bytes(file: &File) -> io::Result<u32> {
+    let mut avail: u32 = 0;
+    // SAFETY: valid pipe handle for the duration of the call; only
+    // TotalBytesAvail is requested, all buffer pointers are documented-null.
+    let ok = unsafe {
+        PeekNamedPipe(
+            file.as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut avail,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(avail)
 }
 
 pub(crate) fn emit_conn_state(app: &AppHandle, connected: bool) {
@@ -258,18 +305,60 @@ fn connect_and_handshake() -> Result<File, String> {
     }
 }
 
-fn read_loop(app: &AppHandle, client: &PipeClient, mut file: File) {
+/// The single owner of the pipe handle: drain queued commands (writes), then
+/// read whatever frames have arrived, then sleep briefly. Writes can never
+/// wait behind a blocked read because nothing here blocks — reads happen only
+/// after `PeekNamedPipe` says bytes are available. A partially-arrived frame
+/// makes `read_msg` block for the remainder, which is bounded by the service
+/// finishing a `write_msg` it has already started.
+fn pump_loop(app: &AppHandle, client: &PipeClient, cmd_rx: &Receiver<Message>, mut file: File) {
+    let mut idle = POLL_ACTIVE;
     loop {
-        match yspot_proto::read_msg(&mut file, MAX_FRAME_S2C) {
-            Ok(Some(msg)) => handle_msg(app, client, msg),
-            Ok(None) => {
-                log::info!("indexd pipe closed by service");
-                return;
+        let mut active = false;
+
+        loop {
+            match cmd_rx.try_recv() {
+                Ok(msg) => {
+                    if let Err(e) = yspot_proto::write_msg(&mut file, &msg) {
+                        log::warn!("indexd pipe write error: {e}");
+                        return;
+                    }
+                    active = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
-            Err(e) => {
-                log::warn!("indexd pipe read error: {e}");
-                return;
+        }
+
+        loop {
+            match readable_bytes(&file) {
+                Ok(0) => break,
+                Ok(_) => match yspot_proto::read_msg(&mut file, MAX_FRAME_S2C) {
+                    Ok(Some(msg)) => {
+                        handle_msg(app, client, msg);
+                        active = true;
+                    }
+                    Ok(None) => {
+                        log::info!("indexd pipe closed by service");
+                        return;
+                    }
+                    Err(e) => {
+                        log::warn!("indexd pipe read error: {e}");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    log::info!("indexd pipe gone: {e}");
+                    return;
+                }
             }
+        }
+
+        if active {
+            idle = POLL_ACTIVE;
+        } else {
+            std::thread::sleep(idle);
+            idle = (idle * 2).min(POLL_IDLE_CAP);
         }
     }
 }
