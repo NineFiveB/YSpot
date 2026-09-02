@@ -161,8 +161,6 @@ fn ensure_visible(session: &Session, want_visible: bool) -> Result<()> {
         return Ok(());
     }
     session.drain();
-    // Keep the chord off any console's system menu — see park_focus.
-    input::park_focus();
     let t0 = input::qpc();
     if !input::send_alt_space() {
         bail!("SendInput(Alt+Space) failed");
@@ -306,6 +304,7 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         None
     };
 
+    input::unlock_foreground();
     let session = Session::start(DWM_KEYWORDS_MEASURE)?;
     let freq = input::qpf();
     ensure_visible(&session, false)?;
@@ -334,11 +333,6 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
 
     for cycle in 0..cycles {
         session.drain();
-        // Park BEFORE every summon: on dismiss §5.2 restores focus to what we
-        // parked, but the very first cycle (and any recovery path) starts from
-        // an unknown foreground window — often this harness's own console,
-        // whose system menu would eat the chord.
-        input::park_focus();
         let t0 = input::qpc();
         if !input::send_alt_space() {
             bail!("SendInput(Alt+Space) failed");
@@ -462,6 +456,7 @@ fn cmd_type(args: &[String]) -> Result<()> {
         None
     };
 
+    input::unlock_foreground();
     let session = Session::start(DWM_KEYWORDS_MEASURE)?;
     let freq = input::qpf();
     // A fresh hide→show cycle, not just "visible": the input keeps its text

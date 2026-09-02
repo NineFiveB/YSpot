@@ -12,7 +12,8 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_MENU, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
+    FindWindowW, GetWindowThreadProcessId, IsWindowVisible, SystemParametersInfoW, SPIF_SENDCHANGE,
+    SPI_SETFOREGROUNDLOCKTIMEOUT,
 };
 
 pub fn qpc() -> i64 {
@@ -88,34 +89,34 @@ pub fn send_escape() -> bool {
     send(&[key(VK_ESCAPE, 0, 0), key(VK_ESCAPE, 0, KEYEVENTF_KEYUP)])
 }
 
-/// Park keyboard focus on the desktop (Progman) before injecting Alt+Space.
+/// Disable the foreground-lock timeout for this session, so the launcher's own
+/// `SetForegroundWindow` on summon is never refused.
 ///
-/// The chord does two things at once: it fires the global RegisterHotKey AND
-/// lands on whatever window has focus — and on a console window Alt+Space
-/// opens the SYSTEM MENU, putting the focused thread into a modal menu loop
-/// that eats the following injections. In an automated elevated run the
-/// focused window is typically the harness's own console; the first field run
-/// of this harness died exactly that way (the menu interaction generated a
-/// console close, 0xC000013A, which took the console, the script, and the
-/// service with it). The desktop has no system-menu response to Alt+Space,
-/// and once the launcher shows it takes foreground itself; on dismiss, §5.2's
-/// focus restore hands focus back to the desktop we parked — so one park per
-/// summon keeps every injection away from console menus.
+/// Why it is needed, learned the hard way: an earlier version parked focus on
+/// the desktop before every injected Alt+Space (to keep the chord off a
+/// console's system menu). Rapidly alternating `SetForegroundWindow(desktop)`
+/// with the shell's `SetForegroundWindow(self)` tripped Windows' foreground
+/// lock after ~5 cycles; from then on hotkeys queued undelivered and every
+/// cycle censored — until the harness stopped, when the backlog drained in one
+/// burst. Running each step in a hidden console removed the console-menu
+/// problem the parking existed for, so the parking is gone; this replaces it,
+/// clearing the lock timeout once so no rapid foreground change can arm it.
 ///
-/// Best-effort: SetForegroundWindow can be refused by the foreground lock;
-/// the caller has usually just injected input, which is what makes this
-/// process eligible.
-pub fn park_focus() {
-    let class: Vec<u16> = "Progman".encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: NUL-terminated class name; null title matches any.
-    let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
-    if hwnd.is_null() {
-        log::warn!("park_focus: no Progman window");
-        return;
-    }
-    // SAFETY: hwnd was just returned; refusal is tolerated (best effort).
-    if unsafe { SetForegroundWindow(hwnd) } == 0 {
-        log::debug!("park_focus: SetForegroundWindow(Progman) refused");
+/// Best-effort and self-reverting is not attempted: the value is process-wide
+/// and the harness is short-lived; a stale 0 until the next login is harmless.
+pub fn unlock_foreground() {
+    // SAFETY: SPI_SETFOREGROUNDLOCKTIMEOUT takes the new timeout in pvParam
+    // (as a usize), not a pointer; 0 ms disables the lock.
+    let ok = unsafe {
+        SystemParametersInfoW(
+            SPI_SETFOREGROUNDLOCKTIMEOUT,
+            0,
+            std::ptr::null_mut::<usize>() as *mut _,
+            SPIF_SENDCHANGE,
+        )
+    };
+    if ok == 0 {
+        log::debug!("unlock_foreground: SystemParametersInfoW refused");
     }
 }
 
