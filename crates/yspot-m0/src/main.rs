@@ -308,6 +308,11 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
     );
+    // DWM is OFF unless asked for: its Composition firehose defers WM_HOTKEY
+    // delivery on an elevated injector and censors the run. The gated endpoint
+    // (`hotkey → shown`, the <50 ms proxy) is a marker and needs no DWM; only
+    // the informational `hotkey → visible` pixels column does, so it is opt-in.
+    let with_dwm = flag(args, "--with-dwm");
     let ids = dwm_ids(args);
     let advisory = if ids.is_none() {
         Some("DWM IDs unpinned — run etw-dump and pass --dwm-ids")
@@ -316,7 +321,7 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
     };
 
     input::unlock_foreground();
-    let session = Session::start(DWM_KEYWORDS_MEASURE)?;
+    let session = Session::start(if with_dwm { DWM_KEYWORDS_MEASURE } else { 0 })?;
     let freq = input::qpf();
     ensure_visible(&session, false)?;
     std::thread::sleep(dwell_hidden);
@@ -346,28 +351,34 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         if !input::send_alt_space() {
             bail!("SendInput(Alt+Space) failed");
         }
+        // Done on the marker alone unless DWM is enabled; without it the pixels
+        // endpoint would never arrive and every cycle would burn the full 2 s.
         let out = collect_step(
             &session,
             t0,
             Duration::from_secs(2),
             &ids,
-            |o| o.shown.is_some() && o.shown_pixels.is_some(),
+            |o| o.shown.is_some() && (!with_dwm || o.shown_pixels.is_some()),
             &note_dwm,
         );
         match out.shown {
             Some(s) => to_shown.push(input::ticks_to_ms(s - t0, freq)),
             None => {
                 censored_shown += 1;
-                censored_present += 1;
+                if with_dwm {
+                    censored_present += 1;
+                }
                 log::warn!("cycle {cycle}: no `shown` marker");
                 std::thread::sleep(Duration::from_millis(300));
                 let _ = ensure_visible(&session, false);
                 continue;
             }
         }
-        match out.shown_pixels {
-            Some(p) => to_present.push(input::ticks_to_ms(p - t0, freq)),
-            None => censored_present += 1,
+        if with_dwm {
+            match out.shown_pixels {
+                Some(p) => to_present.push(input::ticks_to_ms(p - t0, freq)),
+                None => censored_present += 1,
+            }
         }
         // The throttle probe reports on the first rAF after show; give it a
         // short tail window of its own.
@@ -406,20 +417,25 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         dwell_hidden.as_millis(),
         dwell_visible.as_millis()
     );
+    // `shown` is the gated proxy for hotkey→visible (they differ by one
+    // composition, a few ms; the 50 ms budget has ample room). The true
+    // pixels endpoint is printed only when --with-dwm supplied it.
     print_stats(
         "hotkey → shown (marker)",
         &stats(to_shown),
-        None,
-        censored_shown,
-        None,
-    );
-    print_stats(
-        "hotkey → visible (DWM)",
-        &stats(to_present),
         Some(50.0),
-        censored_present,
-        advisory,
+        censored_shown,
+        Some("shown-marker proxy for hotkey→visible; +1 composition for pixels, pass --with-dwm"),
     );
+    if with_dwm {
+        print_stats(
+            "hotkey → visible (DWM)",
+            &stats(to_present),
+            Some(50.0),
+            censored_present,
+            advisory,
+        );
+    }
     println!();
     println!(
         "hidden-WebView2 rAF throttling (§10 M0 flagged item; reported by the frontend probe).\n\
@@ -436,14 +452,17 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         }
     }
     println!();
-    println!(
-        "DWM ids seen during measurement (keywords 0x{:X}); with {cycles} shows as the only \n\
-         visible changes, ids counting ≈ the cycle count are the composition-pass candidates \n\
-         to pin via --dwm-ids:",
-        etw::DWM_KEYWORDS_MEASURE
-    );
-    for (id, (n, kw)) in dwm_hist.borrow().iter() {
-        println!("  id {id:>4}: {n:>6}  keyword 0x{kw:X}");
+    if with_dwm {
+        println!();
+        println!(
+            "DWM ids seen during measurement (keywords 0x{:X}); with {cycles} shows as the only \n\
+             visible changes, ids counting ≈ the cycle count are the composition-pass candidates \n\
+             to pin via --dwm-ids:",
+            etw::DWM_KEYWORDS_MEASURE
+        );
+        for (id, (n, kw)) in dwm_hist.borrow().iter() {
+            println!("  id {id:>4}: {n:>6}  keyword 0x{kw:X}");
+        }
     }
     Ok(())
 }
@@ -464,6 +483,10 @@ fn cmd_type(args: &[String]) -> Result<()> {
     let iterations: usize = arg(args, "--iterations")
         .and_then(|v| v.parse().ok())
         .unwrap_or(30);
+    // DWM off by default — the gated endpoint here is `keydown → results`, a
+    // marker; only the informational `pixels` column needs composition events,
+    // and its firehose censors the run (see cmd_toggle). Opt in with --with-dwm.
+    let with_dwm = flag(args, "--with-dwm");
     let ids = dwm_ids(args);
     let advisory = if ids.is_none() {
         Some("DWM IDs unpinned — run etw-dump and pass --dwm-ids")
@@ -472,7 +495,7 @@ fn cmd_type(args: &[String]) -> Result<()> {
     };
 
     input::unlock_foreground();
-    let session = Session::start(DWM_KEYWORDS_MEASURE)?;
+    let session = Session::start(if with_dwm { DWM_KEYWORDS_MEASURE } else { 0 })?;
     let freq = input::qpf();
     // A fresh hide→show cycle, not just "visible": the input keeps its text
     // across hide/show, and a re-show selects it all, so the first injected
@@ -508,7 +531,11 @@ fn cmd_type(args: &[String]) -> Result<()> {
                     t0,
                     Duration::from_secs(2),
                     &ids,
-                    |o| o.results.is_some() && o.applied.is_some() && o.pixels.is_some(),
+                    |o| {
+                        o.results.is_some()
+                            && o.applied.is_some()
+                            && (!with_dwm || o.pixels.is_some())
+                    },
                     |_, _| {},
                 );
                 let Some((r_qpc, _)) = out.results else {
@@ -522,9 +549,11 @@ fn cmd_type(args: &[String]) -> Result<()> {
                 };
                 b.applied.push(input::ticks_to_ms(a_qpc - t0, freq));
                 b.raf_delta.push(input::ticks_to_ms(a_qpc - r_qpc, freq));
-                match out.pixels {
-                    Some(p) => b.pixels.push(input::ticks_to_ms(p - t0, freq)),
-                    None => b.pixels_censored += 1,
+                if with_dwm {
+                    match out.pixels {
+                        Some(p) => b.pixels.push(input::ticks_to_ms(p - t0, freq)),
+                        None => b.pixels_censored += 1,
+                    }
                 }
             }
             // Escape clears a non-empty query (§5.7) without dispatching a
@@ -571,13 +600,15 @@ fn cmd_type(args: &[String]) -> Result<()> {
                 0,
                 None,
             );
-            print_stats(
-                "    keydown → pixels (DWM)",
-                &stats(b.pixels.clone()),
-                None,
-                b.pixels_censored,
-                advisory,
-            );
+            if with_dwm {
+                print_stats(
+                    "    keydown → pixels (DWM)",
+                    &stats(b.pixels.clone()),
+                    None,
+                    b.pixels_censored,
+                    advisory,
+                );
+            }
         }
     }
     Ok(())

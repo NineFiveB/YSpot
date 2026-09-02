@@ -234,7 +234,19 @@ impl Session {
             };
         };
 
-        for (guid, keywords) in [(marker_guid(), 0u64), (DWM_CORE, dwm_keywords)] {
+        // The marker provider is always enabled; the DWM provider only when
+        // `dwm_keywords != 0`. Leaving DWM off is the default for the gated
+        // measurements: the marker endpoints (`shown`, `results`) need no
+        // composition events, and enabling Dwm-Core Composition floods the
+        // session hard enough that on an elevated injector it defers the
+        // shell's WM_HOTKEY delivery for the length of the run — the injected
+        // chords queue and drain in one burst at exit, censoring every cycle.
+        let providers: &[(GUID, u64)] = if dwm_keywords != 0 {
+            &[(marker_guid(), 0u64), (DWM_CORE, dwm_keywords)]
+        } else {
+            &[(marker_guid(), 0u64)]
+        };
+        for &(guid, keywords) in providers {
             // SAFETY: guid lives across the call; no enable parameters.
             let rc = unsafe {
                 EnableTraceEx2(
