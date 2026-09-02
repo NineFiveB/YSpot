@@ -17,9 +17,10 @@
 //! * **No pipe, no serialization, no §3.8 security trimming.** §2.5 allots
 //!   2 ms of the 10 ms to AccessCheck trimming, which this harness never
 //!   spends. Read every number here as a *lower bound* on the real service.
-//! * **CI runners are shared, throttled VMs.** §10 M0 requires numbers from
-//!   reference Machine A (NVMe/8-core) and Machine B (i5-5200U class). CI
-//!   results are a regression tripwire, not the sign-off measurement.
+//! * **CI runners are shared, throttled VMs.** §10 M0 signed off on numbers
+//!   from reference Machine A (NVMe/8-core); Machine B (i5-5200U class) is
+//!   deferred until the hardware exists. CI results are a regression
+//!   tripwire, not the sign-off measurement.
 //!
 //! Alongside the query classes it reports three things the classes cannot
 //! show on their own: a per-structure `ram_bytes` table (so §4.3's
@@ -1102,7 +1103,8 @@ const HEADER_CAVEAT: &str = "\
 Synthetic corpus, no MFT/USN I/O, no pipe, no §3.8 AccessCheck trimming (§2.5
 allots 2 ms of the 10 ms budget to trimming that is NOT spent here). These are
 LOWER BOUNDS on service latency. CI runners are shared, throttled VMs; SPEC §10
-M0 sign-off requires numbers from reference Machine A and Machine B.";
+M0 signed off on reference-Machine-A numbers (Machine B deferred by amendment) —
+these numbers are a regression tripwire, never sign-off.";
 
 /// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
 /// object cannot drift apart.
@@ -1352,7 +1354,10 @@ only by that one entry — the trigram postings that used to appear between them
             "'hits' is the mean returned result count, capped at max_results — it is NOT candidate \
              volume."
         );
-        println!("M0 sign-off still needs Machine A/B numbers on a real ≥1M-file NTFS volume.");
+        println!(
+            "M0 signed off on Machine A numbers at 1.09M real files; the Machine B column is \
+             deferred (docs/M0.md)."
+        );
     }
 
     fn to_json(&self) -> String {
