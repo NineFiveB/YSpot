@@ -10,6 +10,18 @@ publish.workspace = true
 [lib]
 name = "yspot_shell"
 
+[features]
+# Embedded-asset mode is the DEFAULT so a plain `cargo build --release`
+# produces a launcher that serves the built frontend from the binary.
+# Without this block, generate_context! silently falls back to the dev
+# context and the release webview navigates to build.devUrl
+# (http://localhost:5173) — a blank window on any machine not running the
+# Vite dev server, which is exactly how every M0 measurement pass found it.
+# `cargo tauri dev` disables default features itself and keeps using the
+# dev server.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

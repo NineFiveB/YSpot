@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_ESCAPE, VK_MENU, VK_SPACE,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowThreadProcessId, IsWindowVisible,
+    FindWindowW, GetWindowThreadProcessId, IsWindowVisible, SetForegroundWindow,
 };
 
 pub fn qpc() -> i64 {
@@ -86,6 +86,37 @@ pub fn send_alt_space() -> bool {
 
 pub fn send_escape() -> bool {
     send(&[key(VK_ESCAPE, 0, 0), key(VK_ESCAPE, 0, KEYEVENTF_KEYUP)])
+}
+
+/// Park keyboard focus on the desktop (Progman) before injecting Alt+Space.
+///
+/// The chord does two things at once: it fires the global RegisterHotKey AND
+/// lands on whatever window has focus — and on a console window Alt+Space
+/// opens the SYSTEM MENU, putting the focused thread into a modal menu loop
+/// that eats the following injections. In an automated elevated run the
+/// focused window is typically the harness's own console; the first field run
+/// of this harness died exactly that way (the menu interaction generated a
+/// console close, 0xC000013A, which took the console, the script, and the
+/// service with it). The desktop has no system-menu response to Alt+Space,
+/// and once the launcher shows it takes foreground itself; on dismiss, §5.2's
+/// focus restore hands focus back to the desktop we parked — so one park per
+/// summon keeps every injection away from console menus.
+///
+/// Best-effort: SetForegroundWindow can be refused by the foreground lock;
+/// the caller has usually just injected input, which is what makes this
+/// process eligible.
+pub fn park_focus() {
+    let class: Vec<u16> = "Progman".encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: NUL-terminated class name; null title matches any.
+    let hwnd = unsafe { FindWindowW(class.as_ptr(), std::ptr::null()) };
+    if hwnd.is_null() {
+        log::warn!("park_focus: no Progman window");
+        return;
+    }
+    // SAFETY: hwnd was just returned; refusal is tolerated (best effort).
+    if unsafe { SetForegroundWindow(hwnd) } == 0 {
+        log::debug!("park_focus: SetForegroundWindow(Progman) refused");
+    }
 }
 
 /// Whether the launcher window exists and is currently visible; `None` when

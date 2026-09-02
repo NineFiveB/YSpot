@@ -40,7 +40,14 @@ fn toggle(app: &AppHandle) {
     let Some(window) = app.get_webview_window("launcher") else {
         return;
     };
-    if window.is_visible().unwrap_or(false) {
+    let visible = window.is_visible().unwrap_or(false);
+    // Debug, not trace: when an automated M0 run wedges, whether each hotkey
+    // resolved to show or dismiss is the first question every time.
+    log::debug!(
+        "toggle: visible={visible} -> {}",
+        if visible { "dismiss" } else { "show" }
+    );
+    if visible {
         dismiss(app);
     } else {
         show(app);
@@ -86,6 +93,16 @@ fn show(app: &AppHandle) {
     if let Err(e) = app.emit("window:shown", ()) {
         log::warn!("emit window:shown failed: {e}");
     }
+    // What the webview is actually showing. One debug line per show, and it
+    // is the line that caught the blank-launcher bug: a release build without
+    // the `custom-protocol` feature navigates to build.devUrl
+    // (localhost:5173) instead of the embedded assets, and NOTHING else in
+    // the process betrays it — the window, hotkey, markers, and pipe all
+    // work over a webview showing a connection error.
+    match window.url() {
+        Ok(u) => log::debug!("webview url: {u}"),
+        Err(e) => log::debug!("webview url unavailable: {e}"),
+    }
 }
 
 fn dismiss(app: &AppHandle) {
@@ -95,6 +112,7 @@ fn dismiss(app: &AppHandle) {
     if !window.is_visible().unwrap_or(false) {
         return;
     }
+    log::debug!("dismiss: hiding");
     if let Err(e) = window.hide() {
         log::warn!("window hide failed: {e}");
     }
@@ -138,8 +156,14 @@ fn hide_window(app: AppHandle) -> Result<(), String> {
 fn m0_mark(text: String) -> Result<(), String> {
     const ALLOWED: [&str; 2] = ["applied ", "rafgap "];
     if !ALLOWED.iter().any(|p| text.starts_with(p)) || text.len() > 128 {
+        log::debug!("m0_mark rejected: {text:?}");
         return Err("m0_mark: unrecognized marker".to_string());
     }
+    // Debug on purpose: this line is the only process-local proof that the
+    // FRONTEND half of the instrumentation is alive — a webview serving stale
+    // cached JS produces Rust-side markers and silence here, which is
+    // indistinguishable from "working" in the ETW stream alone.
+    log::debug!("m0_mark: {text}");
     etw_mark::mark(&text);
     Ok(())
 }

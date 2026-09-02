@@ -68,8 +68,10 @@ pub fn marker_guid() -> GUID {
 pub enum Event {
     /// A shell marker string (`shown`, `applied gen=3`, …).
     Marker { qpc: i64, text: String },
-    /// Any Microsoft-Windows-Dwm-Core event.
-    Dwm { qpc: i64, id: u16 },
+    /// Any Microsoft-Windows-Dwm-Core event. `keyword` is the event's own
+    /// keyword mask — which enable-keywords it matches — recorded so a dump
+    /// can tell which ids survive the measurement session's narrow filter.
+    Dwm { qpc: i64, id: u16, keyword: u64 },
 }
 
 impl Event {
@@ -115,6 +117,7 @@ unsafe extern "system" fn on_event(rec: *mut EVENT_RECORD) {
         Event::Dwm {
             qpc,
             id: rec.EventHeader.EventDescriptor.Id,
+            keyword: rec.EventHeader.EventDescriptor.Keyword,
         }
     } else {
         return;

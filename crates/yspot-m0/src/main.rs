@@ -161,6 +161,8 @@ fn ensure_visible(session: &Session, want_visible: bool) -> Result<()> {
         return Ok(());
     }
     session.drain();
+    // Keep the chord off any console's system menu — see park_focus.
+    input::park_focus();
     let t0 = input::qpc();
     if !input::send_alt_space() {
         bail!("SendInput(Alt+Space) failed");
@@ -226,7 +228,7 @@ fn derive(events: &[Event], t0: i64, ids: &Option<Vec<u16>>) -> StepOut {
                     out.shown = Some(*qpc);
                 }
             }
-            Event::Dwm { qpc, id } => {
+            Event::Dwm { qpc, id, .. } => {
                 if dwm_allows(ids, *id) {
                     if out.pixels.is_none() {
                         if let Some(a) = out.applied {
@@ -256,24 +258,25 @@ fn collect_step(
     timeout: Duration,
     ids: &Option<Vec<u16>>,
     done: impl Fn(&StepOut) -> bool,
-) -> StepOut {
+) -> (StepOut, Vec<Event>) {
     let deadline = Instant::now() + timeout;
     let mut events: Vec<Event> = Vec::new();
     session.flush();
     loop {
         let out = derive(&events, t0, ids);
         if done(&out) {
-            return out;
+            return (out, events);
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return out;
+            return (out, events);
         }
         match session.rx.recv_timeout(left.min(Duration::from_millis(50))) {
             Ok(ev) => events.push(ev),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => session.flush(),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return derive(&events, t0, ids)
+                let out = derive(&events, t0, ids);
+                return (out, events);
             }
         }
     }
@@ -314,15 +317,36 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
     let mut censored_shown = 0usize;
     let mut censored_present = 0usize;
 
+    // DWM id histogram across the whole run: (count, keyword-mask union).
+    // With shows as the only visible changes, ids whose count tracks the cycle
+    // count are the composition-pass candidates — this is what `--dwm-ids`
+    // gets pinned from, with no separate choreography.
+    let mut dwm_hist: std::collections::BTreeMap<u16, (usize, u64)> = Default::default();
+    let mut note_dwm = |evs: &[Event]| {
+        for ev in evs {
+            if let Event::Dwm { id, keyword, .. } = ev {
+                let e = dwm_hist.entry(*id).or_insert((0, 0));
+                e.0 += 1;
+                e.1 |= keyword;
+            }
+        }
+    };
+
     for cycle in 0..cycles {
         session.drain();
+        // Park BEFORE every summon: on dismiss §5.2 restores focus to what we
+        // parked, but the very first cycle (and any recovery path) starts from
+        // an unknown foreground window — often this harness's own console,
+        // whose system menu would eat the chord.
+        input::park_focus();
         let t0 = input::qpc();
         if !input::send_alt_space() {
             bail!("SendInput(Alt+Space) failed");
         }
-        let out = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
+        let (out, evs) = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
             o.shown.is_some() && o.shown_pixels.is_some()
         });
+        note_dwm(&evs);
         match out.shown {
             Some(s) => to_shown.push(input::ticks_to_ms(s - t0, freq)),
             None => {
@@ -341,6 +365,7 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
         // The throttle probe reports on the first rAF after show; give it a
         // short tail window of its own.
         for ev in session.collect(Duration::from_millis(400)) {
+            note_dwm(std::slice::from_ref(&ev));
             if let Event::Marker { text, .. } = ev {
                 if text.starts_with("rafgap ") {
                     rafgaps.push(text);
@@ -401,6 +426,16 @@ fn cmd_toggle(args: &[String]) -> Result<()> {
             println!("  … {} more", rafgaps.len() - 12);
         }
     }
+    println!();
+    println!(
+        "DWM ids seen during measurement (keywords 0x{:X}); with {cycles} shows as the only \n\
+         visible changes, ids counting ≈ the cycle count are the composition-pass candidates \n\
+         to pin via --dwm-ids:",
+        etw::DWM_KEYWORDS_MEASURE
+    );
+    for (id, (n, kw)) in &dwm_hist {
+        println!("  id {id:>4}: {n:>6}  keyword 0x{kw:X}");
+    }
     Ok(())
 }
 
@@ -458,7 +493,7 @@ fn cmd_type(args: &[String]) -> Result<()> {
                 if !input::send_char(ch) {
                     bail!("SendInput({ch:?}) failed");
                 }
-                let out = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
+                let (out, _evs) = collect_step(&session, t0, Duration::from_secs(2), &ids, |o| {
                     o.results.is_some() && o.applied.is_some() && o.pixels.is_some()
                 });
                 let Some((r_qpc, _)) = out.results else {
@@ -719,7 +754,7 @@ fn cmd_etw_dump(args: &[String]) -> Result<()> {
     println!("dumping {seconds}s of marker + Dwm-Core events (wiggle the launcher meanwhile)…");
     let t_end = Instant::now() + Duration::from_secs(seconds);
     let mut first_qpc: Option<i64> = None;
-    let mut dwm_counts: std::collections::BTreeMap<u16, usize> = Default::default();
+    let mut dwm_counts: std::collections::BTreeMap<u16, (usize, u64)> = Default::default();
     while Instant::now() < t_end {
         session.flush();
         match session.rx.recv_timeout(Duration::from_millis(100)) {
@@ -728,8 +763,10 @@ fn cmd_etw_dump(args: &[String]) -> Result<()> {
                 let ms = input::ticks_to_ms(ev.qpc() - base, freq);
                 match &ev {
                     Event::Marker { text, .. } => println!("{ms:>10.3} ms  marker  {text}"),
-                    Event::Dwm { id, .. } => {
-                        *dwm_counts.entry(*id).or_default() += 1;
+                    Event::Dwm { id, keyword, .. } => {
+                        let e = dwm_counts.entry(*id).or_insert((0, 0));
+                        e.0 += 1;
+                        e.1 |= keyword;
                     }
                 }
             }
@@ -737,8 +774,8 @@ fn cmd_etw_dump(args: &[String]) -> Result<()> {
         }
     }
     println!("Dwm-Core event counts by id (keywords 0x{DWM_KEYWORDS_DUMP:X}):");
-    for (id, n) in dwm_counts {
-        println!("  id {id:>4}: {n}");
+    for (id, (n, kw)) in dwm_counts {
+        println!("  id {id:>4}: {n:>6}  keyword 0x{kw:X}");
     }
     println!(
         "pin the composition-pass IDs for this build by passing them to the measurement runs, \
