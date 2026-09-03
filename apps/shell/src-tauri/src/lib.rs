@@ -23,6 +23,7 @@ mod placement;
 mod settings;
 mod settings_catalog;
 mod tray;
+mod winman;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -157,6 +158,12 @@ pub(crate) fn show(app: &AppHandle) {
             catalog.refresh_async();
         }
     }
+    // §7.5: the window list is about to be read and is most likely to have
+    // changed since the last summon, so drop the cache now rather than
+    // serving a window that has since closed.
+    if let Some(win) = app.try_state::<Arc<winman::WindowCache>>() {
+        win.invalidate();
+    }
     // §5.2 step 1: record the foreground window before we take focus.
     focus::remember_foreground();
     // §5.3: recompute placement on every show.
@@ -247,6 +254,7 @@ struct ShellResults {
     apps: Vec<apps::AppMatch>,
     settings: Vec<settings_catalog::SettingMatch>,
     commands: Vec<commands::CommandMatch>,
+    windows: Vec<winman::WindowMatch>,
     calc: Option<CalcRow>,
 }
 
@@ -266,6 +274,7 @@ fn search(
     catalog: tauri::State<'_, Arc<AppCatalog>>,
     settings: tauri::State<'_, Arc<SettingsCatalog>>,
     builtins: tauri::State<'_, Arc<Vec<commands::Command>>>,
+    win_cache: tauri::State<'_, Arc<winman::WindowCache>>,
     frec: tauri::State<'_, Arc<Frecency>>,
     gen: u64,
     text: String,
@@ -295,16 +304,25 @@ fn search(
     }
     builtin_hits.sort_by(|a, b| b.score.total_cmp(&a.score));
 
+    // Open windows (§7.5). The enumeration is cached, so the per-keystroke
+    // cost is a match over a few dozen titles.
+    let mut window_hits = winman::match_query(&win_cache.snapshot(), &text, winman::MAX_RESULTS);
+    for it in &mut window_hits {
+        it.score += frec.bonus(&it.id);
+    }
+    window_hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+
     let calc = calc::evaluate(&text).map(|r| CalcRow {
         display: r.display,
         value: r.copy,
     });
 
     log::debug!(
-        "shell gen={gen}: {} app(s), {} setting(s), {} command(s), calc={}",
+        "shell gen={gen}: {} app(s), {} setting(s), {} command(s), {} window(s), calc={}",
         apps.len(),
         settings.len(),
         builtin_hits.len(),
+        window_hits.len(),
         calc.is_some()
     );
     if let Err(e) = app.emit(
@@ -314,6 +332,7 @@ fn search(
             apps,
             settings,
             commands: builtin_hits,
+            windows: window_hits,
             calc,
         },
     ) {
@@ -509,6 +528,9 @@ fn execute_action(
             }
             other => Err(format!("unknown command {other}")),
         },
+        // §7.5: switch, lay out, pin, minimize or close a window. Switching
+        // is what counts as use; a layout change is not a launch.
+        "window" => winman::act(&id, &action).map(|()| action == "open" || action == "switch"),
         "setting" => {
             let entry = settings
                 .find(&id)
@@ -771,6 +793,7 @@ pub fn run() {
         .manage(store)
         .manage(ViewState::default())
         .manage(Arc::new(commands::all()))
+        .manage(winman::WindowCache::new())
         .manage(pipe.clone())
         .manage(catalog.clone())
         .manage(frec)

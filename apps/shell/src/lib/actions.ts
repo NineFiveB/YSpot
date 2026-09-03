@@ -24,9 +24,38 @@ const FILE_ACTIONS: Action[] = [
   { id: "delete", title: "Delete to Recycle Bin", destructive: true },
 ];
 
+/**
+ * §7.5's window verbs. Switching is the primary one; the layout presets and
+ * the toggles live in the action panel, where a list is the right shape for
+ * fifteen of them.
+ */
+const WINDOW_ACTIONS: Action[] = [
+  { id: "open", title: "Switch to Window", shortcut: "Enter" },
+  { id: "left_half", title: "Left Half" },
+  { id: "right_half", title: "Right Half" },
+  { id: "top_half", title: "Top Half" },
+  { id: "bottom_half", title: "Bottom Half" },
+  { id: "maximize", title: "Maximize" },
+  { id: "center", title: "Center" },
+  { id: "left_third", title: "Left Third" },
+  { id: "center_third", title: "Center Third" },
+  { id: "right_third", title: "Right Third" },
+  { id: "left_two_thirds", title: "Left Two Thirds" },
+  { id: "right_two_thirds", title: "Right Two Thirds" },
+  { id: "top_left", title: "Top Left Quarter" },
+  { id: "top_right", title: "Top Right Quarter" },
+  { id: "bottom_left", title: "Bottom Left Quarter" },
+  { id: "bottom_right", title: "Bottom Right Quarter" },
+  { id: "topmost", title: "Always on Top" },
+  { id: "untopmost", title: "Not Always on Top" },
+  { id: "minimize", title: "Minimize" },
+  { id: "close", title: "Close Window", destructive: true },
+];
+
 /** Every action for a row, primary first. */
 export function actionsFor(row: Row): Action[] {
   if (row.kind === "file") return FILE_ACTIONS;
+  if (row.kind === "window") return WINDOW_ACTIONS;
   // §7.7: Enter copies the calculator's answer — there is nothing to open.
   if (row.kind === "calc") return [{ id: "copy", title: "Copy Result", shortcut: "Enter" }];
   if (row.kind === "setting" || row.kind === "command") {

@@ -58,6 +58,16 @@ export interface CommandItem {
   matchRanges: [number, number][];
 }
 
+/** One open window (§7.5). */
+export interface WindowItem {
+  /** The window handle as a string — stable for the window's lifetime. */
+  id: string;
+  title: string;
+  process: string;
+  score: number;
+  matchRanges: [number, number][];
+}
+
 /** The calculator's answer (§7.7), when the query is an expression. */
 export interface CalcItem {
   /** What the row shows, which may carry a unit or a base echo. */
@@ -76,6 +86,7 @@ export interface SearchShellPayload {
   apps: AppItem[];
   settings: SettingItem[];
   commands: CommandItem[];
+  windows: WindowItem[];
   calc: CalcItem | null;
 }
 
@@ -99,6 +110,15 @@ export type Row =
       score: number;
       matchRanges: [number, number][];
       value: string;
+    }
+  | {
+      kind: "window";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
     }
   | {
       kind: "command";
@@ -154,6 +174,18 @@ export function appRow(item: AppItem): Row {
     score: item.score,
     matchRanges: item.matchRanges,
     appKind: item.kind,
+  };
+}
+
+export function windowRow(item: WindowItem): Row {
+  return {
+    kind: "window",
+    key: `window:${item.id}`,
+    id: item.id,
+    name: item.title,
+    subtitle: item.process ? `Window — ${item.process}` : "Window",
+    score: item.score,
+    matchRanges: item.matchRanges,
   };
 }
 

@@ -49,6 +49,16 @@ const calcRow = (): Row => ({
   value: "42",
 });
 
+const windowRow = (): Row => ({
+  kind: "window",
+  key: "window:12345",
+  id: "12345",
+  name: "Inbox — Outlook",
+  subtitle: "Window — outlook.exe",
+  score: 0.9,
+  matchRanges: [],
+});
+
 const chord = (key: string, mods: Partial<{ ctrlKey: boolean; shiftKey: boolean; altKey: boolean }> = {}) => ({
   key,
   ctrlKey: false,
@@ -78,6 +88,36 @@ describe("actionsFor", () => {
     // Neither offers a destructive verb.
     expect(actionsFor(calcRow()).some((a) => a.destructive)).toBe(false);
     expect(actionsFor(settingRow()).some((a) => a.destructive)).toBe(false);
+  });
+
+  it("gives a window the §7.5 verbs, switching first and close destructive", () => {
+    const ids = actionsFor(windowRow()).map((a) => a.id);
+    expect(ids[0]).toBe("open");
+    // Every layout preset §7.5 names is offered.
+    for (const preset of [
+      "left_half",
+      "right_half",
+      "top_half",
+      "bottom_half",
+      "maximize",
+      "center",
+      "left_third",
+      "center_third",
+      "right_third",
+      "left_two_thirds",
+      "right_two_thirds",
+      "top_left",
+      "top_right",
+      "bottom_left",
+      "bottom_right",
+    ]) {
+      expect(ids).toContain(preset);
+    }
+    expect(ids).toContain("topmost");
+    expect(ids).toContain("minimize");
+    // Closing a window is the one destructive verb here.
+    const destructive = actionsFor(windowRow()).filter((a) => a.destructive);
+    expect(destructive.map((a) => a.id)).toEqual(["close"]);
   });
 
   it("covers every §7.3 file verb", () => {
@@ -123,8 +163,8 @@ describe("shortcutAction", () => {
     expect(shortcutAction(fileRow(), chord("Enter", { ctrlKey: true }))).toBeNull();
   });
 
-  it("gives calculator and settings rows no chords at all", () => {
-    for (const row of [calcRow(), settingRow()]) {
+  it("gives calculator, settings and window rows no chords at all", () => {
+    for (const row of [calcRow(), settingRow(), windowRow()]) {
       for (const key of ["c", "e", "Enter"]) {
         expect(shortcutAction(row, chord(key, { ctrlKey: true }))).toBeNull();
         expect(shortcutAction(row, chord(key, { ctrlKey: true, shiftKey: true }))).toBeNull();
@@ -133,7 +173,14 @@ describe("shortcutAction", () => {
   });
 
   it("only names actions the row actually offers", () => {
-    for (const row of [appRow("win32"), appRow("packaged"), fileRow(), settingRow(), calcRow()]) {
+    for (const row of [
+      appRow("win32"),
+      appRow("packaged"),
+      fileRow(),
+      settingRow(),
+      calcRow(),
+      windowRow(),
+    ]) {
       const offered = new Set(actionsFor(row).map((a) => a.id));
       for (const key of ["c", "C", "e", "E", "Enter", "q"]) {
         for (const mods of [{ ctrlKey: true }, { ctrlKey: true, shiftKey: true }]) {

@@ -109,6 +109,7 @@ export default function App(): ReactElement {
       st.apps = [
         ...(p.calc ? [ipc.calcRow(p.calc)] : []),
         ...p.apps.map(ipc.appRow),
+        ...p.windows.map(ipc.windowRow),
         ...p.commands.map(ipc.commandRow),
         ...p.settings.map(ipc.settingRow),
       ];
