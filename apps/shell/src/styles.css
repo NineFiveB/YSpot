@@ -488,3 +488,17 @@ mark {
   color: var(--fg);
   background: var(--row-hover);
 }
+
+/* §9.5's degraded-mode hint: unobtrusive, never a nag. */
+.fallback-note {
+  position: absolute;
+  left: 16px;
+  bottom: 6px;
+  right: 240px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}

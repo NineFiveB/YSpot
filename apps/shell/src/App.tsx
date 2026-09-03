@@ -63,6 +63,8 @@ export default function App(): ReactElement {
   const [selected, setSelected] = useState(0);
   const [generation, setGeneration] = useState(0);
   const [connected, setConnected] = useState(false);
+  /** §9.5's unobtrusive hint, or §3.1's "not searchable" notice. */
+  const [fallbackNote, setFallbackNote] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
   // §5.7's navigation stack, one level deep for now: the results list, or a
   // view opened in place. Esc pops back.
@@ -79,6 +81,7 @@ export default function App(): ReactElement {
   // the rAF below, so a burst of arrivals costs one render.
   const stateRef = useRef<GenState>(emptyGen(0));
   const filesBufferRef = useRef<ipc.SearchResultsPayload[]>([]);
+  const fallbackBufferRef = useRef<ipc.SearchFallbackPayload[]>([]);
   const shellBufferRef = useRef<ipc.SearchShellPayload[]>([]);
   const rafRef = useRef<number | null>(null);
   const keydownTsRef = useRef<number | null>(null);
@@ -105,8 +108,10 @@ export default function App(): ReactElement {
     const st = stateRef.current;
     const shell = shellBufferRef.current.filter((p) => p.gen === cur);
     const files = filesBufferRef.current.filter((p) => p.gen === cur);
+    const fallback = fallbackBufferRef.current.filter((p) => p.gen === cur);
     shellBufferRef.current = [];
     filesBufferRef.current = [];
+    fallbackBufferRef.current = [];
     if (shell.length === 0 && files.length === 0) return;
     for (const p of shell) {
       st.apps = [
@@ -120,6 +125,7 @@ export default function App(): ReactElement {
     // Service batches are strictly rank-descending — append-only (§5.11 r1).
     files.sort((a, b) => a.seq - b.seq);
     for (const p of files) st.files.push(...p.items.map(ipc.fileRow));
+    for (const p of fallback) st.files.push(...p.items.map(ipc.fallbackFileRow));
     commit(st);
     const isNewGen = appliedGenRef.current !== cur;
     if (isNewGen) {
@@ -182,6 +188,26 @@ export default function App(): ReactElement {
       }),
     );
     track(ipc.onIndexState((p) => setConnected(p.connected === true)));
+    track(
+      ipc.onSearchFallback((payload) => {
+        if (payload.gen !== genRef.current) return;
+        // Reuses the file buffer: these ARE the file results for this
+        // generation, just from the shell's own provider (§9.5).
+        filesBufferRef.current.push({
+          gen: payload.gen,
+          seq: 0,
+          isFinal: true,
+          items: [],
+        });
+        fallbackBufferRef.current.push(payload);
+        setFallbackNote(
+          payload.unavailable
+            ? `File search unavailable: ${payload.unavailable}`
+            : `${payload.reason} — install the full version for instant file search`,
+        );
+        scheduleApply();
+      }),
+    );
     track(ipc.onOpenSettingsView(() => setView("settings")));
     track(ipc.onOpenClipboardView(() => setView("clipboard")));
     track(ipc.onViewReset(() => setView("search")));
@@ -251,6 +277,8 @@ export default function App(): ReactElement {
       stateRef.current = emptyGen(gen);
       shellBufferRef.current = [];
       filesBufferRef.current = [];
+      fallbackBufferRef.current = [];
+      setFallbackNote(null);
       // Selection resets to row 0 only here — on a generation change (§5.11).
       setRows([]);
       setSelected(0);
@@ -517,6 +545,7 @@ export default function App(): ReactElement {
         generation={generation}
         onActivate={onActivate}
       />
+      {fallbackNote ? <div className="fallback-note">{fallbackNote}</div> : null}
       <div className="hud" aria-hidden="true">
         {hud}
       </div>

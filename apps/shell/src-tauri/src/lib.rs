@@ -21,6 +21,7 @@ mod icons;
 mod matcher;
 mod pipe_client;
 mod placement;
+mod search_fallback;
 mod settings;
 mod settings_catalog;
 mod tray;
@@ -34,6 +35,7 @@ use clipboard::ClipboardStore;
 use frecency::Frecency;
 use icons::IconCache;
 use pipe_client::PipeClient;
+use search_fallback::{FileSearch, WindowsSearch};
 use serde::Serialize;
 use settings::{Settings, SettingsStore};
 use settings_catalog::SettingsCatalog;
@@ -341,7 +343,13 @@ fn search(
         log::warn!("emit search:shell failed: {e}");
     }
     // The service half is enqueued after, so a slow pipe cannot delay the
-    // rows the shell already has.
+    // rows the shell already has. With no service — portable mode (§9.5), or
+    // one that has not come up yet — the shell answers file search itself
+    // through the same provider §3.1 routes unsupported scopes to.
+    if !pipe.is_connected() {
+        run_fallback_search(&app, gen, text, "fast indexing off");
+        return Ok(Accepted { accepted: true });
+    }
     pipe.search(gen, text).map_err(|e| {
         log::warn!("search cmd failed: {e}");
         e
@@ -575,6 +583,84 @@ fn execute_action(
             Err(e)
         }
     }
+}
+
+/// Results from the shell's own Windows Search provider (§3.1, §9.5), which
+/// answers when there is no service (portable mode) or when the service says
+/// a scope is not one it indexes.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FallbackResults {
+    gen: u64,
+    items: Vec<FallbackItem>,
+    /// Why the shell answered instead of the service — shown as §9.5's
+    /// unobtrusive hint, never a nag.
+    reason: String,
+    /// Set when Windows Search itself could not answer: §3.1 requires this
+    /// to read as "not searchable", never as an empty result.
+    unavailable: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct FallbackItem {
+    path: String,
+    name: String,
+}
+
+/// Run the shell-side file search for one generation and emit its results.
+///
+/// The single entry point §9.5 asks for: portable mode and §3.1's `107`
+/// routing are the same code path, not two implementations.
+pub(crate) fn run_fallback_search(app: &AppHandle, gen: u64, text: String, reason: &str) {
+    let app = app.clone();
+    let reason = reason.to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(provider) = app.try_state::<Arc<dyn FileSearch>>() else {
+            return;
+        };
+        let payload = match provider.search(&text, 50) {
+            Ok(hits) => FallbackResults {
+                gen,
+                items: hits
+                    .into_iter()
+                    .map(|h| FallbackItem {
+                        path: h.path,
+                        name: h.name,
+                    })
+                    .collect(),
+                reason,
+                unavailable: None,
+            },
+            Err(search_fallback::SearchError::Unavailable(m)) => FallbackResults {
+                gen,
+                items: Vec::new(),
+                reason,
+                unavailable: Some(m),
+            },
+            Err(e) => {
+                log::warn!("fallback search failed: {e}");
+                FallbackResults {
+                    gen,
+                    items: Vec::new(),
+                    reason,
+                    unavailable: Some(e.to_string()),
+                }
+            }
+        };
+        log::debug!(
+            "fallback gen={gen}: {} hit(s){}",
+            payload.items.len(),
+            payload
+                .unavailable
+                .as_ref()
+                .map(|m| format!(" (unavailable: {m})"))
+                .unwrap_or_default()
+        );
+        if let Err(e) = app.emit("search:fallback", payload) {
+            log::warn!("emit search:fallback failed: {e}");
+        }
+    });
 }
 
 /// §7.4 clipboard history, for the view that shows it. An empty query lists
@@ -811,6 +897,9 @@ pub fn run() {
 
     let store = Arc::new(SettingsStore::open());
     let clip = ClipboardStore::open();
+    // Behind the §11 Risk 6 trait, so the day Windows Search is not the
+    // answer any more, only this line changes.
+    let fallback: Arc<dyn FileSearch> = Arc::new(WindowsSearch);
     let pipe = Arc::new(PipeClient::new());
     let catalog = AppCatalog::new();
     let frec = Frecency::open();
@@ -848,6 +937,7 @@ pub fn run() {
         )
         .manage(store)
         .manage(clip.clone())
+        .manage(fallback)
         .manage(ViewState::default())
         .manage(Arc::new(commands::all()))
         .manage(winman::WindowCache::new())

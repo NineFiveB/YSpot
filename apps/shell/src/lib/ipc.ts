@@ -50,6 +50,25 @@ export interface SettingItem {
   matchRanges: [number, number][];
 }
 
+/**
+ * File results from the shell's own Windows Search provider (§3.1, §9.5) —
+ * portable mode, or a scope the service does not index.
+ */
+export interface SearchFallbackPayload {
+  gen: number;
+  items: { path: string; name: string }[];
+  /** Why the shell answered instead of the service. */
+  reason: string;
+  /** Set when Windows Search itself could not answer (§3.1: never silent). */
+  unavailable: string | null;
+}
+
+export function onSearchFallback(
+  cb: (payload: SearchFallbackPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<SearchFallbackPayload>("search:fallback", (e) => cb(e.payload));
+}
+
 /** One built-in YSpot command (§5.9, §7.6). */
 export interface CommandItem {
   id: string;
@@ -227,6 +246,25 @@ export function calcRow(item: CalcItem): Row {
     score: 2,
     matchRanges: [],
     value: item.value,
+  };
+}
+
+/**
+ * A file the shell's own provider found. It has no volume/FRN identity — the
+ * service is what mints those — so the path is the stable key.
+ */
+export function fallbackFileRow(item: { path: string; name: string }): Row {
+  return {
+    kind: "file",
+    key: `file:path:${item.path}`,
+    id: item.path,
+    name: item.name,
+    subtitle: item.path,
+    // Below every catalog tier: these are unranked, so they should not
+    // outrank a real match the shell scored.
+    score: 0.5,
+    matchRanges: [],
+    path: item.path,
   };
 }
 

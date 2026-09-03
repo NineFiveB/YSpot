@@ -114,6 +114,9 @@ pub struct PipeClient {
     epoch: AtomicU64,
     req_id: AtomicU64,
     current_gen: AtomicU64,
+    /// The text of the current generation, kept so a `107 SCOPE_UNSUPPORTED`
+    /// reply can be re-asked of the shell's own provider (§3.1).
+    current_text: Mutex<String>,
     connected: AtomicBool,
 }
 
@@ -127,6 +130,7 @@ impl PipeClient {
             epoch: AtomicU64::new(0),
             req_id: AtomicU64::new(1),
             current_gen: AtomicU64::new(0),
+            current_text: Mutex::new(String::new()),
             connected: AtomicBool::new(false),
         }
     }
@@ -157,6 +161,7 @@ impl PipeClient {
     /// §4.6 `search`: filename query, empty scopes, default filters, 50 rows.
     pub fn search(&self, gen: u64, text: String) -> Result<(), String> {
         self.current_gen.store(gen, Ordering::SeqCst);
+        *self.current_text.lock().unwrap_or_else(|e| e.into_inner()) = text.clone();
         self.send(Message::SearchQuery {
             id: self.next_id(),
             gen,
@@ -187,6 +192,17 @@ impl PipeClient {
     /// §4.3 `ResumeIndexing`.
     pub fn resume_indexing(&self) -> Result<(), String> {
         self.send(Message::ResumeIndexing { id: self.next_id() })
+    }
+
+    /// The query text of the current generation (§3.1's 107 re-ask).
+    pub fn current_query(&self) -> (u64, String) {
+        (
+            self.current_gen.load(Ordering::SeqCst),
+            self.current_text
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
     }
 
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Option<ConnWriter>> {
@@ -382,6 +398,16 @@ fn handle_msg(app: &AppHandle, client: &PipeClient, msg: Message) {
             message,
             retryable,
         } => {
+            // §3.1: a scope the service does not index is not an error to
+            // report, it is a scope to ask Windows Search about instead.
+            if code == yspot_proto::codes::SCOPE_UNSUPPORTED {
+                let (current, text) = client.current_query();
+                if gen == Some(current) && !text.is_empty() {
+                    log::debug!("gen {current}: scope unsupported, routing to Windows Search");
+                    crate::run_fallback_search(app, current, text, "unsupported scope");
+                    return;
+                }
+            }
             log::warn!(
                 "service error code {code} (id {id:?}, gen {gen:?}, retryable {retryable}): {message}"
             );
