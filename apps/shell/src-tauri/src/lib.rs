@@ -10,6 +10,7 @@
 mod apps;
 mod autostart;
 mod calc;
+mod clipboard;
 mod com;
 mod commands;
 mod etw_mark;
@@ -29,6 +30,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use apps::AppCatalog;
+use clipboard::ClipboardStore;
 use frecency::Frecency;
 use icons::IconCache;
 use pipe_client::PipeClient;
@@ -501,7 +503,7 @@ fn execute_action(
     // than the end of the errand, and Settings opens IN the launcher, so
     // dismissing would close the thing the user just asked for.
     let stays_open = matches!(action.as_str(), "copy_path" | "copy_file" | "copy")
-        || (kind == "command" && id == "yspot.settings");
+        || (kind == "command" && matches!(id.as_str(), "yspot.settings" | "yspot.clipboard"));
     if !stays_open {
         // Dismissed BEFORE the action so focus lands on whatever the action
         // raises (§5.2 hands focus back to the previous foreground window,
@@ -521,6 +523,7 @@ fn execute_action(
         }
         "command" => match id.as_str() {
             "yspot.settings" => show_settings(&app).map(|()| false),
+            "yspot.clipboard" => show_view(&app, "view:clipboard").map(|()| false),
             "yspot.quit" => {
                 log::info!("quit from the launcher; the indexing service keeps running (§5.5)");
                 app.exit(0);
@@ -572,6 +575,53 @@ fn execute_action(
             Err(e)
         }
     }
+}
+
+/// §7.4 clipboard history, for the view that shows it. An empty query lists
+/// the most recent entries, which is what opening the view should do.
+#[tauri::command]
+fn clipboard_list(
+    clip: tauri::State<'_, Arc<ClipboardStore>>,
+    query: String,
+) -> Vec<clipboard::ClipMatch> {
+    clip.match_query(&query, clipboard::MAX_RESULTS)
+}
+
+/// §7.4 paste: hide the launcher, hand focus back to where it came from,
+/// write the entry to the clipboard and inject Ctrl+V.
+#[tauri::command]
+fn clipboard_paste(
+    app: AppHandle,
+    clip: tauri::State<'_, Arc<ClipboardStore>>,
+    id: i64,
+) -> Result<(), String> {
+    let text = clip
+        .content(id)
+        .ok_or_else(|| format!("clipboard entry {id} is gone"))?;
+    // Dismiss FIRST: the paste restores the previous foreground window, and
+    // that cannot happen while the launcher still holds focus.
+    dismiss(&app);
+    clipboard::paste(&text)
+}
+
+#[tauri::command]
+fn clipboard_delete(clip: tauri::State<'_, Arc<ClipboardStore>>, id: i64) -> Result<(), String> {
+    clip.delete(id)
+}
+
+#[tauri::command]
+fn clipboard_clear(clip: tauri::State<'_, Arc<ClipboardStore>>) -> Result<(), String> {
+    clip.clear()
+}
+
+#[tauri::command]
+fn clipboard_enabled(clip: tauri::State<'_, Arc<ClipboardStore>>) -> bool {
+    clip.is_enabled()
+}
+
+#[tauri::command]
+fn clipboard_set_enabled(clip: tauri::State<'_, Arc<ClipboardStore>>, enabled: bool) {
+    clip.set_enabled(enabled);
 }
 
 /// §5.9 Settings: the current settings plus what the UI needs to render
@@ -637,16 +687,21 @@ fn open_settings(app: AppHandle) -> Result<(), String> {
 }
 
 fn show_settings(app: &AppHandle) -> Result<(), String> {
-    // Bring the launcher up first if it is hidden — a Settings request from
-    // the tray arrives with no window on screen.
+    show_view(app, "view:settings")
+}
+
+/// Open one of the launcher's in-place views (§5.9 as amended, §5.7's
+/// navigation stack). The launcher is summoned first if it is hidden — a
+/// request from the tray arrives with no window on screen.
+fn show_view(app: &AppHandle, event: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("launcher") {
         if !window.is_visible().unwrap_or(false) {
             show(app);
         }
     }
-    app.emit("view:settings", ())
-        .map_err(|e| format!("emit view:settings: {e}"))?;
-    log::info!("Settings opened in the launcher (§5.9, amended)");
+    app.emit(event, ())
+        .map_err(|e| format!("emit {event}: {e}"))?;
+    log::info!("{event} opened in the launcher");
     Ok(())
 }
 
@@ -755,6 +810,7 @@ pub fn run() {
     }
 
     let store = Arc::new(SettingsStore::open());
+    let clip = ClipboardStore::open();
     let pipe = Arc::new(PipeClient::new());
     let catalog = AppCatalog::new();
     let frec = Frecency::open();
@@ -791,6 +847,7 @@ pub fn run() {
                 .build(),
         )
         .manage(store)
+        .manage(clip.clone())
         .manage(ViewState::default())
         .manage(Arc::new(commands::all()))
         .manage(winman::WindowCache::new())
@@ -808,6 +865,12 @@ pub fn run() {
             get_settings,
             save_settings,
             open_settings,
+            clipboard_list,
+            clipboard_paste,
+            clipboard_delete,
+            clipboard_clear,
+            clipboard_enabled,
+            clipboard_set_enabled,
             set_launcher_height,
             set_in_view,
             get_autostart,
@@ -840,6 +903,10 @@ pub fn run() {
             if let Err(e) = tray::build(app.handle()) {
                 log::error!("tray icon could not be created: {e}");
             }
+
+            // §7.4: the capture listener owns a message-only window and its
+            // own message loop, so it runs on a thread of its own.
+            clipboard::spawn_listener(clip.clone());
 
             // `yspot.exe --settings` opens the Settings window directly, for
             // a shortcut or a script; the launcher itself stays hidden.

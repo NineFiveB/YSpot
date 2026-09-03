@@ -40,6 +40,11 @@ pub fn all() -> Vec<Command> {
             "YSpot Settings",
             &["preferences", "options", "hotkey", "configure"][..],
         ),
+        (
+            "yspot.clipboard",
+            "Clipboard History",
+            &["paste", "clipboard", "copied", "history"][..],
+        ),
         ("yspot.quit", "Quit YSpot", &["exit", "close yspot"][..]),
     ]
     .into_iter()
@@ -95,6 +100,9 @@ mod tests {
         assert!(names("preferences").contains(&"YSpot Settings".to_string()));
         assert!(names("hotkey").contains(&"YSpot Settings".to_string()));
         assert!(names("quit").contains(&"Quit YSpot".to_string()));
+        // §7.4's history is reached the same way.
+        assert!(names("clipboard").contains(&"Clipboard History".to_string()));
+        assert!(names("paste").contains(&"Clipboard History".to_string()));
     }
 
     #[test]

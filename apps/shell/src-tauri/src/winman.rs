@@ -199,6 +199,12 @@ fn process_name(hwnd: HWND) -> Option<String> {
     let mut pid = 0u32;
     // SAFETY: valid window handle; `pid` is a valid out-slot.
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    process_name_of_pid(pid)
+}
+
+/// Executable name of a process id — also how §7.4 names the app that put
+/// something on the clipboard.
+pub fn process_name_of_pid(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }

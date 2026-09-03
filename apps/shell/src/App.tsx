@@ -15,6 +15,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement,
 } from "react";
+import Clipboard from "./Clipboard";
 import Settings from "./Settings";
 import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
@@ -34,6 +35,7 @@ const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 /** Logical window heights per view (§5.3 scales these by the monitor's DPI). */
 const SEARCH_HEIGHT = 480;
 const SETTINGS_HEIGHT = 620;
+const CLIPBOARD_HEIGHT = 600;
 
 /** Everything one generation has produced so far. */
 interface GenState {
@@ -64,7 +66,8 @@ export default function App(): ReactElement {
   const [panelOpen, setPanelOpen] = useState(false);
   // §5.7's navigation stack, one level deep for now: the results list, or a
   // view opened in place. Esc pops back.
-  const [inSettings, setInSettings] = useState(false);
+  const [view, setView] = useState<"search" | "settings" | "clipboard">("search");
+  const inSettings = view !== "search";
   const [lat, setLat] = useState<LatencySnapshot>(statsSnapshot());
 
   const inputRef = useRef<HTMLInputElement>(null);
@@ -179,8 +182,9 @@ export default function App(): ReactElement {
       }),
     );
     track(ipc.onIndexState((p) => setConnected(p.connected === true)));
-    track(ipc.onOpenSettingsView(() => setInSettings(true)));
-    track(ipc.onViewReset(() => setInSettings(false)));
+    track(ipc.onOpenSettingsView(() => setView("settings")));
+    track(ipc.onOpenClipboardView(() => setView("clipboard")));
+    track(ipc.onViewReset(() => setView("search")));
     track(
       ipc.onWindowShown(() => {
         noteShown();
@@ -208,15 +212,19 @@ export default function App(): ReactElement {
   // The shell also learns which surface is up, so blur dismisses the results
   // list without closing a view whose dropdown just took focus.
   useEffect(() => {
-    void ipc
-      .setLauncherHeight(inSettings ? SETTINGS_HEIGHT : SEARCH_HEIGHT)
-      .catch(() => undefined);
-    void ipc.setInView(inSettings).catch(() => undefined);
-  }, [inSettings]);
+    const height =
+      view === "settings"
+        ? SETTINGS_HEIGHT
+        : view === "clipboard"
+          ? CLIPBOARD_HEIGHT
+          : SEARCH_HEIGHT;
+    void ipc.setLauncherHeight(height).catch(() => undefined);
+    void ipc.setInView(view !== "search").catch(() => undefined);
+  }, [view]);
 
   // Leaving Settings puts focus back where §5.7 wants it: the query field.
-  const closeSettings = useCallback(() => {
-    setInSettings(false);
+  const closeView = useCallback(() => {
+    setView("search");
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, []);
 
@@ -469,10 +477,14 @@ export default function App(): ReactElement {
 
   // §5.7's navigation stack: a view opened in place replaces the results
   // list, and Esc inside it pops back to the query.
-  if (inSettings) {
+  if (view !== "search") {
     return (
       <div className="app">
-        <Settings onClose={closeSettings} />
+        {view === "settings" ? (
+          <Settings onClose={closeView} />
+        ) : (
+          <Clipboard onClose={closeView} />
+        )}
       </div>
     );
   }

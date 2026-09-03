@@ -318,6 +318,53 @@ export function setLauncherHeight(logicalHeight: number): Promise<unknown> {
   return invoke("set_launcher_height", { logicalHeight });
 }
 
+// ---------------------------------------------------------------------------
+// §7.4 clipboard history.
+
+export interface ClipItem {
+  id: number;
+  kind: "text" | "files";
+  /** The first part of the entry; the full content stays in the shell. */
+  preview: string;
+  /** The app it was copied from, when the shell could resolve one. */
+  source: string;
+  /** Unix seconds. */
+  ts: number;
+  score: number;
+  matchRanges: [number, number][];
+}
+
+/** An empty query lists the most recent entries. */
+export function clipboardList(query: string): Promise<ClipItem[]> {
+  return invoke<ClipItem[]>("clipboard_list", { query });
+}
+
+/** §7.4 paste: dismiss, restore focus, write the clipboard, inject Ctrl+V. */
+export function clipboardPaste(id: number): Promise<unknown> {
+  return invoke("clipboard_paste", { id });
+}
+
+export function clipboardDelete(id: number): Promise<unknown> {
+  return invoke("clipboard_delete", { id });
+}
+
+export function clipboardClear(): Promise<unknown> {
+  return invoke("clipboard_clear");
+}
+
+export function clipboardEnabled(): Promise<boolean> {
+  return invoke<boolean>("clipboard_enabled");
+}
+
+export function clipboardSetEnabled(enabled: boolean): Promise<unknown> {
+  return invoke("clipboard_set_enabled", { enabled });
+}
+
+/** The shell asking the launcher to show its clipboard view (§7.4). */
+export function onOpenClipboardView(cb: () => void): Promise<UnlistenFn> {
+  return listen("view:clipboard", () => cb());
+}
+
 /** The shell asking the launcher to show its Settings view (§5.9). */
 export function onOpenSettingsView(cb: () => void): Promise<UnlistenFn> {
   return listen("view:settings", () => cb());
