@@ -107,6 +107,18 @@ fn rebind_hotkey(
 #[derive(Default)]
 struct WarmState(AtomicBool);
 
+/// Whether the launcher is showing a view opened in place (Settings) rather
+/// than the results list.
+///
+/// Blur is a dismissal path for the results list (§5.2 step 3): you clicked
+/// away, you meant to leave. It is the wrong rule for a view with controls
+/// in it — a native `<select>` dropdown takes focus out of the webview, and
+/// dismissing there would close Settings the moment the user tried to change
+/// the theme. In a view, the launcher closes on Esc or the hotkey, not on
+/// losing focus.
+#[derive(Default)]
+struct ViewState(AtomicBool);
+
 #[derive(Serialize)]
 struct Accepted {
     accepted: bool,
@@ -203,6 +215,12 @@ fn dismiss(app: &AppHandle) {
     if let Err(e) = window.hide() {
         log::warn!("window hide failed: {e}");
     }
+    // A view does not survive the window being dismissed: the next summon is
+    // a fresh search, which is what the hotkey means.
+    if let Some(v) = app.try_state::<ViewState>() {
+        v.0.store(false, Ordering::SeqCst);
+    }
+    let _ = app.emit("view:reset", ());
     // §5.2 step 3: hand focus back exactly where it was.
     focus::restore_foreground();
     etw_mark::mark("hidden");
@@ -614,6 +632,13 @@ fn show_settings(app: &AppHandle) -> Result<(), String> {
 /// its top edge and its horizontal position (§5.3's placement, recomputed
 /// for the new height). The frontend calls this when it switches between the
 /// results list and a taller view.
+/// The frontend telling the shell which surface it is showing, so blur can
+/// mean "dismiss" for the results list and nothing for a view with controls.
+#[tauri::command]
+fn set_in_view(view: tauri::State<'_, ViewState>, in_view: bool) {
+    view.0.store(in_view, Ordering::SeqCst);
+}
+
 #[tauri::command]
 fn set_launcher_height(app: AppHandle, logical_height: u32) -> Result<(), String> {
     let Some(window) = app.get_webview_window("launcher") else {
@@ -744,6 +769,7 @@ pub fn run() {
                 .build(),
         )
         .manage(store)
+        .manage(ViewState::default())
         .manage(Arc::new(commands::all()))
         .manage(pipe.clone())
         .manage(catalog.clone())
@@ -760,6 +786,7 @@ pub fn run() {
             save_settings,
             open_settings,
             set_launcher_height,
+            set_in_view,
             get_autostart,
             set_autostart,
             get_status,
@@ -814,7 +841,12 @@ pub fn run() {
                 let handle = app.handle().clone();
                 window.on_window_event(move |event| {
                     if let tauri::WindowEvent::Focused(false) = event {
-                        dismiss(&handle);
+                        let in_view = handle
+                            .try_state::<ViewState>()
+                            .is_some_and(|v| v.0.load(Ordering::SeqCst));
+                        if !in_view {
+                            dismiss(&handle);
+                        }
                     }
                 });
             }

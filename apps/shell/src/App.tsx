@@ -179,6 +179,7 @@ export default function App(): ReactElement {
     );
     track(ipc.onIndexState((p) => setConnected(p.connected === true)));
     track(ipc.onOpenSettingsView(() => setInSettings(true)));
+    track(ipc.onViewReset(() => setInSettings(false)));
     track(
       ipc.onWindowShown(() => {
         noteShown();
@@ -203,10 +204,13 @@ export default function App(): ReactElement {
 
   // The launcher grows to fit whatever view it is showing, and shrinks back
   // when that view closes (§5.3 recomputes the placement for the height).
+  // The shell also learns which surface is up, so blur dismisses the results
+  // list without closing a view whose dropdown just took focus.
   useEffect(() => {
     void ipc
       .setLauncherHeight(inSettings ? SETTINGS_HEIGHT : SEARCH_HEIGHT)
       .catch(() => undefined);
+    void ipc.setInView(inSettings).catch(() => undefined);
   }, [inSettings]);
 
   // Leaving Settings puts focus back where §5.7 wants it: the query field.

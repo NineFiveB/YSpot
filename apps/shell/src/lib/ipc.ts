@@ -291,6 +291,20 @@ export function onOpenSettingsView(cb: () => void): Promise<UnlistenFn> {
   return listen("view:settings", () => cb());
 }
 
+/** The window was dismissed: any view opened in place is gone (§5.2). */
+export function onViewReset(cb: () => void): Promise<UnlistenFn> {
+  return listen("view:reset", () => cb());
+}
+
+/**
+ * Tell the shell which surface is showing. Blur dismisses the results list
+ * (§5.2 step 3) but must not close a view with controls in it — a native
+ * dropdown takes focus out of the webview.
+ */
+export function setInView(inView: boolean): Promise<unknown> {
+  return invoke("set_in_view", { inView });
+}
+
 export function setAutostart(enabled: boolean): Promise<unknown> {
   return invoke("set_autostart", { enabled });
 }
