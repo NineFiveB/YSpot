@@ -40,7 +40,7 @@ use memchr::memmem;
 
 use crate::index::{
     class_mask, fold, has_control_byte, ArenaRec, Entry, VolumeIndex, BSI_CLASSES, DEPTH_PEN,
-    FOLDED_DELIM, OWNER_SHIFT, RANK_DEPTH_MAX,
+    FOLDED_DELIM, HEAD_STRIDE, OWNER_SHIFT, RANK_DEPTH_MAX,
 };
 use crate::Hit;
 
@@ -157,7 +157,21 @@ const FUZZY_QBUF: usize = 64;
 thread_local! {
     static ARENA_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INITIALS_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static HEAD_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+#[cfg(test)]
+fn note_head_scan() {
+    HEAD_SCANS.with(|c| c.set(c.get() + 1));
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn note_head_scan() {}
+
+/// Cancellation is polled every this many slots of the head column: a full
+/// pass over 1M slots is ~1 ms, so this is a handful of polls per pass.
+const HEAD_POLL_SLOTS: usize = 1 << 16;
 
 #[cfg(test)]
 fn note_arena_scan() {
@@ -766,6 +780,11 @@ impl Ord for Scored {
 /// retains it. Drain, dedup by slot keeping the max, sort, truncate to K —
 /// identical to ranking everything, with no heap-position bookkeeping.
 ///
+/// A single-byte query adds a third offerer — the head pass answers the
+/// exact/prefix tiers and Pass A, when it still runs, offers the same record's
+/// word-boundary/substring hit — so `search` sizes the heap at 3K for it. The
+/// argument is the same with 3 in place of 2.
+///
 /// **Why the rules are STRICT.** [`Scored::cmp`] breaks equal scores by LOWER
 /// `eidx`, so an offer whose score merely EQUALS the floor can still displace
 /// the current 2K-th. `≥`/`≤` rules would discard those tie-break winners —
@@ -780,7 +799,7 @@ struct Selector<'a> {
     /// over-fetch a guessed multiple and still silently under-returns when the
     /// filter is selective enough that the guess was wrong.
     accept: &'a dyn Fn(u32) -> bool,
-    /// `2·max_results`.
+    /// `offers_per_slot · max_results`.
     cap: usize,
     /// Score of the current 2K-th best offer. Meaningful only once the heap is
     /// full; monotonically non-decreasing from then on, which is what makes the
@@ -792,8 +811,13 @@ struct Selector<'a> {
 }
 
 impl<'a> Selector<'a> {
-    fn new(max_results: usize, slots: usize, accept: &'a dyn Fn(u32) -> bool) -> Self {
-        let cap = max_results.saturating_mul(2).max(1);
+    fn new(
+        max_results: usize,
+        offers_per_slot: usize,
+        slots: usize,
+        accept: &'a dyn Fn(u32) -> bool,
+    ) -> Self {
+        let cap = max_results.saturating_mul(offers_per_slot).max(1);
         Self {
             accept,
             heap: BinaryHeap::with_capacity(cap),
@@ -883,6 +907,43 @@ impl<'a> Selector<'a> {
     }
 }
 
+/// The single-byte query's exact and prefix tiers, from the head column.
+///
+/// `head[2·slot]` is the first byte of the slot's folded record and
+/// `head[2·slot + 1]` the second, or NUL when the name is one byte long — the
+/// same two bytes Pass A's [`classify`] reads either side of a hit at a
+/// record's start (`0x00 q 0x00` exact, `0x00 q x` prefix). A tombstone's
+/// pair is zeroed, and `q` is never NUL, so dead slots cannot match. Returns
+/// whether the search was cancelled.
+fn head_pass(
+    ix: &VolumeIndex,
+    rank_key: &[u8],
+    q: u8,
+    sel: &mut Selector,
+    is_cancelled: &dyn Fn() -> bool,
+) -> bool {
+    let head = &ix.head[..];
+    debug_assert_eq!(head.len(), ix.entries.len() * HEAD_STRIDE);
+    for (slot, pair) in head.as_chunks::<HEAD_STRIDE>().0.iter().enumerate() {
+        if slot % HEAD_POLL_SLOTS == HEAD_POLL_SLOTS - 1 && is_cancelled() {
+            return true;
+        }
+        if pair[0] != q {
+            continue;
+        }
+        let tier = if pair[1] == FOLDED_DELIM {
+            Tier::Exact
+        } else {
+            Tier::Prefix
+        };
+        if sel.rejects(tier_upper_bound(tier)) {
+            continue;
+        }
+        sel.offer(rank_key, slot as u32, tier, tier_base(tier));
+    }
+    false
+}
+
 /// Tiered search over one volume index (§3.4); called from
 /// [`VolumeIndex::search`]. Returns up to `max_results` hits, best first.
 pub(crate) fn search(
@@ -917,11 +978,33 @@ pub(crate) fn search(
     // Slot -> name, so callers express the filter over names rather than over
     // the index's internal numbering.
     let accept_slot = |slot: u32| accept(ix.name_of_entry(&ix.entries[slot as usize]));
-    let mut sel = Selector::new(max_results, ix.entries.len(), &accept_slot);
-    let finder = memmem::Finder::new(fq.as_bytes());
     let qlen = fq.len();
+    // A single-byte query has a third offerer (the head pass below), so its
+    // heap must hold 3K to keep the top-K argument — see [`Selector`].
+    let short = qlen == 1;
+    let mut sel = Selector::new(
+        max_results,
+        if short { 3 } else { 2 },
+        ix.entries.len(),
+        &accept_slot,
+    );
+    let finder = memmem::Finder::new(fq.as_bytes());
     let mut processed = 0usize;
     let mut cancelled = is_cancelled();
+
+    // Head pass (issue #11): a single-byte query's exact and prefix tiers,
+    // read off the 2 B/entry head column instead of the arena. Such a query
+    // hits nearly every arena record, and the arena scan's per-hit loop —
+    // not the scan itself — was the first keystroke's 7-17 ms at 1M entries.
+    // A record's exact/prefix tier is decided by its first two bytes, so this
+    // pass offers exactly what Pass A would have offered for every record
+    // that STARTS with the byte; Pass A then runs only if the floor still
+    // admits the lower tiers, and skips those start hits when it does, so no
+    // record is offered twice for the same hit.
+    if short && !cancelled {
+        note_head_scan();
+        cancelled = head_pass(ix, rank_key, fq.as_bytes()[0], &mut sel, is_cancelled);
+    }
 
     // Pass A: one scan of the folded name arena classifies the
     // exact / prefix / word-boundary / substring tiers per hit.
@@ -938,7 +1021,15 @@ pub(crate) fn search(
     // THIS pass and no other: they describe the ARENA. Pass C never asks a
     // contiguity question at all, and Pass B asks one about a different column,
     // which is why it carries its own sets rather than borrowing these.
-    if !cancelled && ix.arena_may_contain(fq.as_bytes()) {
+    //
+    // For a single-byte query the head pass has already offered every exact
+    // and prefix hit, so this scan is only worth its cost while a
+    // word-boundary hit (the best tier it can still contribute) could reach
+    // the page — the same whole-pass rule Pass B applies with its own bound.
+    if !cancelled
+        && (!short || !sel.rejects(tier_upper_bound(Tier::WordBoundary)))
+        && ix.arena_may_contain(fq.as_bytes())
+    {
         note_arena_scan();
         let arena = ix.folded_arena.as_bytes();
         // Hoisted out of the hit loop: three slices read in ascending order,
@@ -990,6 +1081,12 @@ pub(crate) fn search(
                     break 'scan;
                 }
                 let tier = classify(arena[hit - 1], arena[hit + qlen]);
+                // Already offered by the head pass, which saw the same two
+                // fence bytes; offering it again would be a third offer for
+                // the record on top of the word-boundary one below.
+                if short && matches!(tier, Tier::Exact | Tier::Prefix) {
+                    continue;
+                }
                 // The reject that makes the tail cheap: two L1 bytes and one
                 // float compare, no mapping, no column touch, no entry read.
                 if sel.rejects(tier_upper_bound(tier)) {
@@ -1256,6 +1353,11 @@ mod tests {
         fuzzy_density(name, &qc)
     }
 
+    /// Head-column passes started since the last call, and reset.
+    pub(crate) fn head_scans_since() -> usize {
+        HEAD_SCANS.with(|c| c.replace(0))
+    }
+
     /// Pass A arena scans started since the last call, and reset.
     fn arena_scans_since() -> usize {
         ARENA_SCANS.with(|c| c.replace(0))
@@ -1307,6 +1409,121 @@ mod tests {
         assert_eq!(hits[1].frn, 12);
         assert!(approx(hits[0].score, 0.9));
         assert!(approx(hits[1].score, 0.9 / 1.04));
+    }
+
+    // -----------------------------------------------------------------
+    // The head pass (issue #11): a single-byte query's exact/prefix tiers
+    // come from the 2 B/entry head column, and the arena is scanned only
+    // while a lower tier could still reach the page.
+    // -----------------------------------------------------------------
+
+    /// The common case at scale: enough shallow prefix hits fill the page
+    /// above the word-boundary bound, so Pass A never runs — and the page is
+    /// still exactly the reference's.
+    #[test]
+    fn single_byte_query_fills_its_page_without_touching_the_arena() {
+        let mut v = ix();
+        for i in 0..20u64 {
+            v.add(100 + i, 999, &format!("m{i}.txt"), 0); // prefix, depth 0
+        }
+        v.add(200, 999, "x-m.txt", 0); // word boundary: 0.8, must lose
+        v.add(201, 999, "am.txt", 0); // substring: 0.55, must lose
+        let (_, _) = (arena_scans_since(), head_scans_since());
+        let hits = v.search("m", 4, &no_cancel);
+        assert_eq!(head_scans_since(), 1);
+        assert_eq!(
+            arena_scans_since(),
+            0,
+            "the head pass filled the page; no arena scan"
+        );
+        assert_eq!(hits.len(), 4);
+        assert!(hits
+            .iter()
+            .all(|h| approx(h.score, 0.9) && (100..120).contains(&h.frn)));
+        let reference = reference_search(&v, "m", 4);
+        assert_eq!(
+            hits.iter().map(|h| (h.frn, h.score)).collect::<Vec<_>>(),
+            reference
+                .iter()
+                .map(|h| (h.frn, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A rare byte cannot fill the page from prefix hits alone, so the arena
+    /// scan runs for the lower tiers — and it must not re-offer the start
+    /// hits the head pass already offered (the 3K heap and the skip).
+    #[test]
+    fn single_byte_query_falls_through_to_the_arena_for_the_lower_tiers() {
+        let mut v = ix();
+        v.add(1, 999, "q", 0); // exact 1.0
+        v.add(2, 999, "q.txt", 0); // prefix 0.9
+        v.add(3, 999, "x-q.txt", 0); // word boundary 0.8
+        v.add(4, 999, "aq.txt", 0); // substring 0.55
+        v.add(5, 999, "q-q-q.txt", 0); // prefix AND word boundary: offered by both passes, once each
+        let (_, _) = (arena_scans_since(), head_scans_since());
+        let hits = v.search("q", 8, &no_cancel);
+        assert_eq!(head_scans_since(), 1);
+        assert_eq!(
+            arena_scans_since(),
+            1,
+            "the page had room below 0.8, so Pass A ran"
+        );
+        let got: Vec<(u64, f32)> = hits.iter().map(|h| (h.frn, h.score)).collect();
+        assert_eq!(got.len(), 5, "{got:?}");
+        assert_eq!(got[0].0, 1);
+        assert!(approx(got[0].1, 1.0));
+        assert_eq!(
+            (got[1].0, got[2].0),
+            (2, 5),
+            "prefix ties break by entry index"
+        );
+        assert!(approx(got[1].1, 0.9) && approx(got[2].1, 0.9));
+        assert_eq!(got[3].0, 3);
+        assert!(approx(got[3].1, 0.8));
+        assert_eq!(got[4].0, 4);
+        assert!(approx(got[4].1, 0.55));
+        let reference = reference_search(&v, "q", 8);
+        assert_eq!(
+            got,
+            reference
+                .iter()
+                .map(|h| (h.frn, h.score))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The head column follows the entry through delete and rename, so a
+    /// single-byte query never answers with a file that is gone or renamed.
+    #[test]
+    fn head_column_follows_delete_and_rename() {
+        let mut v = ix();
+        v.add(1, 999, "m.txt", 0);
+        v.add(2, 999, "n.txt", 0);
+        assert_eq!(v.search("m", 8, &no_cancel).len(), 1);
+        v.apply(crate::UsnEvent::Delete { frn: 1 });
+        assert!(
+            v.search("m", 8, &no_cancel).is_empty(),
+            "deleted file still in the head tier"
+        );
+        v.apply(crate::UsnEvent::Rename {
+            frn: 2,
+            new_parent_frn: 999,
+            new_name: "z.txt".into(),
+        });
+        assert!(
+            v.search("n", 8, &no_cancel).is_empty(),
+            "renamed file still under its old head"
+        );
+        let z = v.search("z", 8, &no_cancel);
+        assert_eq!(z.len(), 1);
+        assert_eq!(z[0].frn, 2);
+        assert!(approx(z[0].score, 0.9));
+        // A recycled slot takes the new occupant's head pair.
+        v.add(3, 999, "m2.txt", 0);
+        let m = v.search("m", 8, &no_cancel);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].frn, 3);
     }
 
     #[test]
@@ -2612,6 +2829,24 @@ mod tests {
             v.entries.len() * INITIALS_STRIDE,
             "{ctx}: initials length"
         );
+        assert_eq!(
+            v.head.len(),
+            v.entries.len() * HEAD_STRIDE,
+            "{ctx}: head length"
+        );
+        // The head pair is exactly the folded record's first two bytes for a
+        // live slot and all-NUL for a tombstone — what makes the head pass
+        // agree with Pass A's classifier, and what keeps deleted files out.
+        for (slot, e) in v.entries.iter().enumerate() {
+            let pair = &v.head[slot * HEAD_STRIDE..(slot + 1) * HEAD_STRIDE];
+            if e.is_dead() {
+                assert_eq!(pair, &[0, 0], "{ctx}: slot {slot} dead but head pair set");
+            } else {
+                let rec = v.folded_of_entry(e).as_bytes();
+                let want = [rec[0], rec.get(1).copied().unwrap_or(0)];
+                assert_eq!(pair, &want, "{ctx}: slot {slot} head pair");
+            }
+        }
 
         // The Pass B gate's whole soundness claim: the presence sets are a
         // SUPERSET of the initials column's n-grams. This is the direct check

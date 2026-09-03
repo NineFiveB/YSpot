@@ -75,6 +75,10 @@ pub(crate) const RANK_DEPTH_MAX: u8 = 127;
 /// `rank_key` bit 7: the entry carries HIDDEN or SYSTEM (§3.4's ×0.85).
 const RANK_PENALIZED: u8 = 0x80;
 
+/// Bytes per slot in [`VolumeIndex::head`]: the first two bytes of the folded
+/// record, NUL-padded.
+pub(crate) const HEAD_STRIDE: usize = 2;
+
 /// `depth_penalty × hidden_penalty` for every [`VolumeIndex::rank_key`] value,
 /// so the §3.4 score is `base × DEPTH_PEN[rank_key[slot]]`: one L2 read into a
 /// 1 B/entry column, one L1 table lookup and one multiply.
@@ -343,6 +347,8 @@ pub struct RamBreakdown {
     pub owner: u64,
     /// Folded segment initials, [`INITIALS_STRIDE`] B per slot.
     pub initials: u64,
+    /// First two folded bytes per slot, [`HEAD_STRIDE`] B per slot (issue #11).
+    pub head: u64,
     /// Bit-sliced character-class index, 8 B per slot. Replaced the
     /// byte-trigram postings, which measured 96 B/entry at 1M.
     pub charclass_bsi: u64,
@@ -368,6 +374,7 @@ impl RamBreakdown {
             + self.arena_recs
             + self.owner
             + self.initials
+            + self.head
             + self.charclass_bsi
             + self.presence
     }
@@ -436,6 +443,20 @@ pub struct VolumeIndex {
     /// the tier: the column is scanned with no liveness check, and a folded
     /// query can never contain a NUL (invariant I3) so a zeroed lane is inert.
     pub(crate) initials: Vec<u8>,
+    /// The first two bytes of each slot's folded record, [`HEAD_STRIDE`] per
+    /// slot and NUL-padded (a one-byte name is `[b, 0]`). Indexed by slot.
+    ///
+    /// This is the single-byte query's entire prefix/exact tier (issue #11).
+    /// A one-byte query hits nearly every arena record, and at 1M entries the
+    /// arena scan's per-hit loop — not the scan — cost 7-17 ms of the first
+    /// keystroke of every search. The exact and prefix tiers of such a query
+    /// are decided by the record's first two bytes alone (`0x00 q 0x00` is
+    /// exact, `0x00 q x` is prefix), so this column answers them in one
+    /// streaming pass of 2 B/entry, and the arena is scanned only when the
+    /// resulting floor still admits the lower tiers. Maintained at the same
+    /// two choke points as [`Self::initials`]; a tombstone's pair is zeroed,
+    /// which keeps it inert because a folded query never carries a NUL.
+    pub(crate) head: Vec<u8>,
     /// Bit-sliced character-class index: [`BSI_CLASSES`] slices of
     /// [`Self::bsi_words`] `u64`s laid end to end, slice `c` starting at
     /// `c · bsi_words`, its bit `i` set iff slot `i`'s folded name contains a
@@ -573,6 +594,7 @@ impl VolumeIndex {
             arena_recs: Vec::new(),
             owner: Vec::new(),
             initials: Vec::new(),
+            head: Vec::new(),
             charclass_bsi: Vec::new(),
             bsi_words: 0,
             tri_present: vec![0u64; TRI_WORDS].into_boxed_slice(),
@@ -743,6 +765,7 @@ impl VolumeIndex {
         self.arena_recs.shrink_to_fit();
         self.owner.shrink_to_fit();
         self.initials.shrink_to_fit();
+        self.head.shrink_to_fit();
         // Length is 64 whole slices either way, so this hands back allocator
         // overshoot without disturbing the stride.
         self.charclass_bsi.shrink_to_fit();
@@ -1085,10 +1108,13 @@ impl VolumeIndex {
             self.rank_key[ns] = self.rank_key[old];
             let (from, to) = (old * INITIALS_STRIDE, ns * INITIALS_STRIDE);
             self.initials.copy_within(from..from + INITIALS_STRIDE, to);
+            let (from, to) = (old * HEAD_STRIDE, ns * HEAD_STRIDE);
+            self.head.copy_within(from..from + HEAD_STRIDE, to);
         }
         self.entries.truncate(new_len);
         self.rank_key.truncate(new_len);
         self.initials.truncate(new_len * INITIALS_STRIDE);
+        self.head.truncate(new_len * HEAD_STRIDE);
 
         // Pass 3: the arenas, walked in `arena_recs` order so both ascend. A
         // record is live iff its slot survived AND the slot still points at it
@@ -1224,6 +1250,7 @@ impl VolumeIndex {
         self.entries.shrink_to_fit();
         self.rank_key.shrink_to_fit();
         self.initials.shrink_to_fit();
+        self.head.shrink_to_fit();
         self.arena_recs.shrink_to_fit();
         self.owner.shrink_to_fit();
         self.name_arena.shrink_to_fit();
@@ -1394,6 +1421,15 @@ impl VolumeIndex {
         // superset invariant hold at every intermediate point rather than only
         // at function exit.
         self.note_initials_lane(&lane);
+        // The head pair is read off the folded record `intern` just appended:
+        // exactly the two bytes Pass A's classifier would see after the
+        // record's opening fence, so the head pass and the arena scan agree
+        // on the exact/prefix tier by construction.
+        let head: [u8; HEAD_STRIDE] = {
+            let (off, len) = (folded_off as usize, folded_len as usize);
+            let rec = &self.folded_arena.as_bytes()[off..off + len];
+            [rec[0], rec.get(1).copied().unwrap_or(FOLDED_DELIM)]
+        };
         let e = Entry {
             frn,
             parent_frn,
@@ -1423,18 +1459,25 @@ impl VolumeIndex {
                 if self.initials.capacity() - self.initials.len() < INITIALS_STRIDE {
                     self.initials.reserve_exact(chunk * INITIALS_STRIDE);
                 }
+                if self.head.capacity() - self.head.len() < HEAD_STRIDE {
+                    self.head.reserve_exact(chunk * HEAD_STRIDE);
+                }
             }
             self.entries.push(e);
             self.rank_key.push(key);
             self.initials.extend_from_slice(&lane);
+            self.head.extend_from_slice(&head);
         } else {
             self.entries[slot as usize] = e;
             self.rank_key[slot as usize] = key;
             let off = slot as usize * INITIALS_STRIDE;
             self.initials[off..off + INITIALS_STRIDE].copy_from_slice(&lane);
+            let off = slot as usize * HEAD_STRIDE;
+            self.head[off..off + HEAD_STRIDE].copy_from_slice(&head);
         }
         debug_assert_eq!(self.rank_key.len(), self.entries.len());
         debug_assert_eq!(self.initials.len(), self.entries.len() * INITIALS_STRIDE);
+        debug_assert_eq!(self.head.len(), self.entries.len() * HEAD_STRIDE);
         // Character classes and arena n-grams, both read off the record
         // `intern` has just appended. Disjoint field borrows, so the folded
         // arena is read while the sets it feeds are written.
@@ -1557,6 +1600,10 @@ impl VolumeIndex {
         // camel queries with a deleted file until the slot was recycled.
         let lane = slot as usize * INITIALS_STRIDE;
         self.initials[lane..lane + INITIALS_STRIDE].fill(FOLDED_DELIM);
+        // Same rule for the head pair: the head pass has no liveness check
+        // either, and a NUL first byte can never equal a query byte.
+        let pair = slot as usize * HEAD_STRIDE;
+        self.head[pair..pair + HEAD_STRIDE].fill(FOLDED_DELIM);
         // ORDER IS LOAD-BEARING: the class mask is read from the STILL-LIVE
         // record, so it must be taken before `erase_folded` NUL-fills it.
         // Reversed, every clear would compute the mask of a run of NULs — one
@@ -1822,6 +1869,7 @@ impl VolumeIndex {
             arena_recs: (self.arena_recs.capacity() * std::mem::size_of::<ArenaRec>()) as u64,
             owner: (self.owner.capacity() * std::mem::size_of::<u32>()) as u64,
             initials: self.initials.capacity() as u64,
+            head: self.head.capacity() as u64,
             charclass_bsi: (self.charclass_bsi.capacity() * std::mem::size_of::<u64>()) as u64,
             presence,
         }
@@ -2568,6 +2616,9 @@ mod tests {
         // per slot, written by the mutation that minted the slot.
         assert_eq!(b.initials, v.initials.capacity() as u64);
         assert!(b.initials >= (1000 * INITIALS_STRIDE) as u64);
+        // And the head column, written by the same mutation.
+        assert_eq!(b.head, v.head.capacity() as u64);
+        assert!(b.head >= (1000 * HEAD_STRIDE) as u64);
         // The fuzzy prefilter is a column now, not a posting map a query
         // builds: charged whole before any search runs, and 64 slices wide.
         assert_eq!(

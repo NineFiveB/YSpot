@@ -733,6 +733,9 @@ struct QuerySet {
     initials2: Vec<String>,
     initials3: Vec<String>,
     substring: Vec<String>,
+    /// The corpus's most frequent first bytes: the first keystroke of a
+    /// search, and the query that hits the most records (issue #11).
+    single_byte: Vec<String>,
 }
 
 fn push_unique(v: &mut Vec<String>, s: String) {
@@ -749,6 +752,27 @@ fn push_unique(v: &mut Vec<String>, s: String) {
 /// non-NFC generated name would yield a query that cannot match itself.
 fn build_queries(entries: &[GenEntry], ix: &VolumeIndex) -> QuerySet {
     let mut q = QuerySet::default();
+    // Single-byte queries are the most frequent first bytes of the whole
+    // corpus, folded: the worst case for a class whose cost tracks how many
+    // records start with (and contain) the byte.
+    let mut first = [0usize; 256];
+    for e in entries {
+        if let Some(name) = ix.name_of(e.frn) {
+            if let Some(&b) = yspot_index::index::fold(name).as_bytes().first() {
+                if b.is_ascii_alphanumeric() {
+                    first[b as usize] += 1;
+                }
+            }
+        }
+    }
+    let mut by_count: Vec<(usize, u8)> = (0..=255u8)
+        .filter(|&b| first[b as usize] > 0)
+        .map(|b| (first[b as usize], b))
+        .collect();
+    by_count.sort_unstable_by(|a, b| b.cmp(a));
+    for (_, b) in by_count.into_iter().take(QUERIES_PER_CLASS) {
+        q.single_byte.push((b as char).to_string());
+    }
     let step = (entries.len() / 20_000).max(1);
     for e in entries.iter().step_by(step) {
         if e.flags & flags::DIR != 0 {
@@ -1110,7 +1134,7 @@ these numbers are a regression tripwire, never sign-off.";
 
 /// The `RamBreakdown` fields in print/JSON order, so the table and the JSON
 /// object cannot drift apart.
-fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 11] {
+fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 12] {
     [
         ("entries", b.entries),
         ("name_arena", b.name_arena),
@@ -1121,6 +1145,7 @@ fn ram_rows(b: &RamBreakdown) -> [(&'static str, u64); 11] {
         ("arena_recs", b.arena_recs),
         ("owner", b.owner),
         ("initials", b.initials),
+        ("head", b.head),
         ("charclass_bsi", b.charclass_bsi),
         ("presence", b.presence),
     ]
@@ -1675,6 +1700,14 @@ fn run(cfg: &Config) -> Report {
         measure_class(&ix, "prefix", "tier 0.9, 6 chars", queries.prefix, it, mr),
         measure_class(
             &ix,
+            "single-byte",
+            "first keystroke; most frequent first bytes; head column (issue #11)",
+            queries.single_byte,
+            it,
+            mr,
+        ),
+        measure_class(
+            &ix,
             "word-boundary",
             "tier 0.8",
             queries.word_boundary,
@@ -1857,6 +1890,7 @@ mod tests {
             ("initials2", &q.initials2),
             ("initials3", &q.initials3),
             ("substring", &q.substring),
+            ("single_byte", &q.single_byte),
             ("fuzzy", &corpus.fuzzy_queries),
         ];
         for (name, qs) in classes {
@@ -1980,7 +2014,7 @@ mod tests {
         let r = run(&cfg);
         assert_eq!(r.inserted, r.corpus_generated);
         assert!(r.ram_warm >= r.ram_cold);
-        assert_eq!(r.classes.len(), 9);
+        assert_eq!(r.classes.len(), 10);
         assert!(r.classes.iter().all(|c| !c.queries.is_empty()));
         // The breakdown must account for every reported byte, or §4.3's
         // attribution is fiction.
