@@ -15,7 +15,9 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement,
 } from "react";
+import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
+import { actionsFor, shortcutAction } from "./lib/actions";
 import * as ipc from "./lib/ipc";
 import { mergeRows, selectionIndex } from "./lib/merge";
 import {
@@ -53,9 +55,11 @@ export default function App(): ReactElement {
   const [selected, setSelected] = useState(0);
   const [generation, setGeneration] = useState(0);
   const [connected, setConnected] = useState(false);
+  const [panelOpen, setPanelOpen] = useState(false);
   const [lat, setLat] = useState<LatencySnapshot>(statsSnapshot());
 
   const inputRef = useRef<HTMLInputElement>(null);
+  const panelOpenRef = useRef(false);
   const genRef = useRef(0);
   const appliedGenRef = useRef(0);
   // Per-generation accumulation; mutated off the render path and committed in
@@ -182,6 +186,9 @@ export default function App(): ReactElement {
   useEffect(() => {
     const handler = (e: KeyboardEvent): void => {
       keydownTsRef.current = performance.now();
+      // §5.7's refocus rule hands over to the action panel while it is open:
+      // the panel owns the keyboard until Esc closes it.
+      if (panelOpenRef.current) return;
       const el = inputRef.current;
       if (el && document.activeElement !== el && !e.isComposing) {
         el.focus();
@@ -312,7 +319,7 @@ export default function App(): ReactElement {
   );
 
   const activateIndex = useCallback(
-    (index: number, action: "open" | "runas" = "open") => {
+    (index: number, action = "open") => {
       const row = rows[index];
       if (!row) return;
       void ipc.executeAction(row, action).catch((err) => {
@@ -320,6 +327,21 @@ export default function App(): ReactElement {
       });
     },
     [rows],
+  );
+
+  const closePanel = useCallback(() => {
+    panelOpenRef.current = false;
+    setPanelOpen(false);
+    inputRef.current?.focus();
+  }, []);
+
+  const runPanelAction = useCallback(
+    (actionId: string) => {
+      const index = Math.max(0, Math.min(selected, rows.length - 1));
+      closePanel();
+      activateIndex(index, actionId);
+    },
+    [activateIndex, closePanel, rows.length, selected],
   );
   // Stable identity for memoized rows: rows must not re-render just because
   // the items array (and thus this closure) was replaced (§5.6).
@@ -351,11 +373,33 @@ export default function App(): ReactElement {
         break;
       case "Enter": {
         e.preventDefault();
-        // Ctrl+Enter is the secondary action: run as administrator, which
-        // §7.1 offers for Win32 apps only.
         const row = rows[clampSel(selected)];
-        const admin = e.ctrlKey && row?.kind === "app" && row.appKind === "win32";
-        activateIndex(clampSel(selected), admin ? "runas" : "open");
+        if (!row) break;
+        // A modifier chord runs its action directly (§5.7: every action is
+        // keyboard-reachable, the common ones without the panel).
+        const direct = shortcutAction(row, e);
+        activateIndex(clampSel(selected), direct ?? "open");
+        break;
+      }
+      case "k":
+      case "K":
+        // §5.7: Ctrl+K opens the action panel over the selected row.
+        if (e.ctrlKey && !e.altKey && rows[clampSel(selected)]) {
+          e.preventDefault();
+          panelOpenRef.current = true;
+          setPanelOpen(true);
+        }
+        break;
+      case "c":
+      case "C":
+      case "e":
+      case "E": {
+        const row = rows[clampSel(selected)];
+        const direct = row ? shortcutAction(row, e) : null;
+        if (direct) {
+          e.preventDefault();
+          activateIndex(clampSel(selected), direct);
+        }
         break;
       }
       case "Escape":
@@ -415,6 +459,14 @@ export default function App(): ReactElement {
       <div className="hud" aria-hidden="true">
         {hud}
       </div>
+      {panelOpen && selectedItem ? (
+        <ActionPanel
+          actions={actionsFor(selectedItem)}
+          subject={selectedItem.name}
+          onRun={runPanelAction}
+          onClose={closePanel}
+        />
+      ) : null}
     </div>
   );
 }

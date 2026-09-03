@@ -54,6 +54,11 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # The §7.3 file actions drive the real clipboard and the real Recycle
+      # Bin, so they are #[ignore]d for developers and gate here instead.
+      - name: "Side-effecting shell tests (clipboard, Recycle Bin)"
+        run: cargo test -p yspot-shell -- --ignored
+
       # SPEC §10 M0 wants measured evidence for the §3.4 matching path before
       # feature work proceeds. Advisory on purpose — no --strict yet: a shared,
       # throttled runner is not reference Machine A/B, so this is a regression

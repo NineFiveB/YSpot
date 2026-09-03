@@ -182,3 +182,94 @@ mark {
   opacity: 0.85;
   pointer-events: none;
 }
+
+/* Ctrl+K action panel (§5.7): a secondary palette over the selected row. */
+.action-panel-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 12px;
+}
+
+.action-panel {
+  width: 320px;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.action-panel-title {
+  padding: 8px 12px;
+  font-size: 11px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.action-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.action-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 7px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+.action-row-selected {
+  background: var(--row-selected);
+}
+
+.action-row-destructive .action-title {
+  color: #d64545;
+}
+
+@media (prefers-color-scheme: dark) {
+  .action-row-destructive .action-title {
+    color: #f28b82;
+  }
+}
+
+.action-shortcut {
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.action-empty {
+  color: var(--muted);
+  justify-content: center;
+}
+
+.action-filter {
+  border: none;
+  border-top: 1px solid var(--border);
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 13px;
+  padding: 8px 12px;
+}
+
+.action-filter::placeholder {
+  color: var(--muted);
+}

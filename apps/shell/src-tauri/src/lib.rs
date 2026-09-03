@@ -10,6 +10,7 @@
 mod apps;
 mod com;
 mod etw_mark;
+mod file_actions;
 mod focus;
 mod frecency;
 mod icons;
@@ -321,8 +322,12 @@ fn m0_report(json: String) -> Result<(), String> {
 ///
 /// `kind` selects the provider (`"app"` or `"file"`), `id` is that
 /// provider's stable id (§5.6: AUMID for apps, `volumeIdx:frn` for files),
-/// and `action` is `"open"` or `"runas"`. Files carry their path because the
-/// shell holds no file catalog of its own — the service's row is the record.
+/// and `action` names the verb (§7.1, §7.3). Files carry their path because
+/// the shell holds no file catalog of its own — the service's row is the
+/// record.
+///
+/// Every file action runs here, in the unelevated shell, never in the
+/// elevated service (§7.3).
 #[tauri::command]
 fn execute_action(
     app: AppHandle,
@@ -334,25 +339,56 @@ fn execute_action(
     action: Option<String>,
 ) -> Result<(), String> {
     let action = action.unwrap_or_else(|| "open".to_string());
-    match kind.as_str() {
+    // Clipboard actions leave the launcher up: copying a path is usually a
+    // step, not the end of the errand. Everything that hands the user to
+    // another window dismisses first, so the launcher is not left floating
+    // over what it just opened.
+    let stays_open = matches!(action.as_str(), "copy_path" | "copy_file");
+    if !stays_open {
+        // Dismissed BEFORE the action so focus lands on whatever the action
+        // raises (§5.2 hands focus back to the previous foreground window,
+        // and a dialog opened after that would otherwise fight it).
+        dismiss(&app);
+    }
+    let result = match kind.as_str() {
         "app" => {
             let entries = catalog.snapshot();
             let entry = entries
                 .iter()
                 .find(|e| e.aumid == id)
-                .ok_or_else(|| format!("unknown app {id}"))?;
-            apps::launch(&entry.aumid, entry.kind, action == "runas")?;
-            frec.record(&id, "app");
+                .ok_or_else(|| format!("unknown app {id}"));
+            entry.and_then(|entry| {
+                apps::launch(&entry.aumid, entry.kind, action == "runas").map(|()| true)
+            })
         }
-        "file" => {
-            let path = path.ok_or_else(|| "file action needs a path".to_string())?;
-            shell_open(&path)?;
-            frec.record(&id, "file");
+        "file" => match path {
+            None => Err("file action needs a path".to_string()),
+            Some(path) => match action.as_str() {
+                "open" => shell_open(&path).map(|()| true),
+                "open_with" => file_actions::open_with(&path).map(|()| false),
+                "reveal" => file_actions::reveal(&path).map(|()| false),
+                "copy_path" => file_actions::copy_path(&path).map(|()| false),
+                "copy_file" => file_actions::copy_file(&path).map(|()| false),
+                "delete" => file_actions::delete_to_recycle_bin(&path).map(|()| false),
+                other => Err(format!("unknown file action {other}")),
+            },
+        },
+        other => Err(format!("unknown result kind {other}")),
+    };
+    match result {
+        // Only a launch counts as use (§7.1 frecency is launch count); copying
+        // a path or revealing a folder is not what the ranking is about.
+        Ok(counts_as_launch) => {
+            if counts_as_launch {
+                frec.record(&id, &kind);
+            }
+            Ok(())
         }
-        other => return Err(format!("unknown result kind {other}")),
+        Err(e) => {
+            log::warn!("action {action} on {kind} {id} failed: {e}");
+            Err(e)
+        }
     }
-    dismiss(&app);
-    Ok(())
 }
 
 #[tauri::command]

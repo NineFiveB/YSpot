@@ -121,11 +121,8 @@ export function frontendReady(): Promise<unknown> {
   return invoke("frontend_ready");
 }
 
-/** §4.6 `executeAction` on the selected row. */
-export function executeAction(
-  row: Row,
-  action: "open" | "runas" = "open",
-): Promise<unknown> {
+/** §4.6 `executeAction` on the selected row; `action` is a §7.1/§7.3 verb. */
+export function executeAction(row: Row, action = "open"): Promise<unknown> {
   return invoke("execute_action", {
     kind: row.kind,
     id: row.id,
