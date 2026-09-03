@@ -178,6 +178,17 @@ impl PipeClient {
         self.send(Message::IndexStatusReq { id: self.next_id() })
     }
 
+    /// §4.3 `PauseIndexing`: machine-wide, any interactive user may ask, and
+    /// the service logs it. Backs the §5.5 tray toggle.
+    pub fn pause_indexing(&self) -> Result<(), String> {
+        self.send(Message::PauseIndexing { id: self.next_id() })
+    }
+
+    /// §4.3 `ResumeIndexing`.
+    pub fn resume_indexing(&self) -> Result<(), String> {
+        self.send(Message::ResumeIndexing { id: self.next_id() })
+    }
+
     fn lock_writer(&self) -> std::sync::MutexGuard<'_, Option<ConnWriter>> {
         self.writer.lock().unwrap_or_else(|e| e.into_inner())
     }

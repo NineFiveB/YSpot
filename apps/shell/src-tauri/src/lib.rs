@@ -4,10 +4,11 @@
 //! the §7.1 app catalog, the §7.1 per-user frecency store, and the §4.6
 //! command surface.
 //!
-//! Still deferred: single-instance mutex + show forwarding (§5.5), tray
-//! icon, hotkey conflict dialog and rebinding UI (§5.1), autostart (§5.4).
+//! Still deferred: hotkey conflict dialog and rebinding UI (§5.1), the
+//! Settings window (§5.9).
 
 mod apps;
+mod autostart;
 mod com;
 mod etw_mark;
 mod file_actions;
@@ -16,6 +17,7 @@ mod frecency;
 mod icons;
 mod pipe_client;
 mod placement;
+mod tray;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -45,7 +47,7 @@ struct Accepted {
 // ---------------------------------------------------------------------------
 // Window lifecycle (§5.2 focus model).
 
-fn toggle(app: &AppHandle) {
+pub(crate) fn toggle(app: &AppHandle) {
     let Some(window) = app.get_webview_window("launcher") else {
         return;
     };
@@ -63,7 +65,7 @@ fn toggle(app: &AppHandle) {
     }
 }
 
-fn show(app: &AppHandle) {
+pub(crate) fn show(app: &AppHandle) {
     let Some(window) = app.get_webview_window("launcher") else {
         return;
     };
@@ -391,6 +393,21 @@ fn execute_action(
     }
 }
 
+/// §5.4 autostart state, for the Settings UI (§5.9) and the tray toggle.
+#[tauri::command]
+fn get_autostart() -> bool {
+    autostart::is_enabled()
+}
+
+#[tauri::command]
+fn set_autostart(enabled: bool) -> Result<(), String> {
+    if enabled {
+        autostart::enable()
+    } else {
+        autostart::disable()
+    }
+}
+
 #[tauri::command]
 fn get_status(pipe: tauri::State<'_, Arc<PipeClient>>) -> Result<(), String> {
     // Reply is relayed asynchronously as an `index:status` event.
@@ -433,12 +450,25 @@ pub fn run() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     etw_mark::init();
 
+    if autostart::started_hidden() {
+        // §5.4 warm start: the window is created hidden either way (the
+        // Tauri config marks it invisible), so the flag only records why.
+        log::info!("started with --hidden (autostart): warming the renderer, staying invisible");
+    }
+
     let pipe = Arc::new(PipeClient::new());
     let catalog = AppCatalog::new();
     let frec = Frecency::open();
     let icon_cache = IconCache::new();
 
     tauri::Builder::default()
+        // §5.5 single instance: a second launch forwards a show to the
+        // running shell and exits, so running the exe again summons the
+        // launcher instead of starting a rival that fights for the hotkey.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            log::info!("second instance launched; summoning this one (§5.5)");
+            show(app);
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -460,6 +490,8 @@ pub fn run() {
             frontend_ready,
             execute_action,
             app_icon,
+            get_autostart,
+            set_autostart,
             get_status,
             m0_mark,
             m0_report,
@@ -471,6 +503,13 @@ pub fn run() {
             // with a stale catalog triggers one too. All off-thread.
             catalog.refresh_async();
             catalog.spawn_periodic();
+
+            // §5.5: the tray icon is the shell's only always-available
+            // surface, so a failure to create it is worth an error rather
+            // than a silent absence — but not worth refusing to run.
+            if let Err(e) = tray::build(app.handle()) {
+                log::error!("tray icon could not be created: {e}");
+            }
 
             match app.global_shortcut().register(alt_space()) {
                 Ok(()) => log::info!("registered Alt+Space (RegisterHotKey via plugin, §5.1)"),
@@ -491,8 +530,6 @@ pub fn run() {
                 });
             }
 
-            // Single-instance enforcement (§5.5 CreateMutexW + show forwarding)
-            // is deferred to M1.
             Ok(())
         })
         .run(tauri::generate_context!())
