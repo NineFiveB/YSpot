@@ -15,6 +15,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactElement,
 } from "react";
+import Settings from "./Settings";
 import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
 import { actionsFor, shortcutAction } from "./lib/actions";
@@ -29,6 +30,10 @@ import {
 import { noteHidden, noteShown, startThrottleProbe } from "./lib/throttle";
 
 const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
+
+/** Logical window heights per view (§5.3 scales these by the monitor's DPI). */
+const SEARCH_HEIGHT = 480;
+const SETTINGS_HEIGHT = 620;
 
 /** Everything one generation has produced so far. */
 interface GenState {
@@ -57,10 +62,14 @@ export default function App(): ReactElement {
   const [generation, setGeneration] = useState(0);
   const [connected, setConnected] = useState(false);
   const [panelOpen, setPanelOpen] = useState(false);
+  // §5.7's navigation stack, one level deep for now: the results list, or a
+  // view opened in place. Esc pops back.
+  const [inSettings, setInSettings] = useState(false);
   const [lat, setLat] = useState<LatencySnapshot>(statsSnapshot());
 
   const inputRef = useRef<HTMLInputElement>(null);
   const panelOpenRef = useRef(false);
+  const inSettingsRef = useRef(false);
   const genRef = useRef(0);
   const appliedGenRef = useRef(0);
   // Per-generation accumulation; mutated off the render path and committed in
@@ -76,6 +85,8 @@ export default function App(): ReactElement {
   const measureResolversRef = useRef<Map<number, (ms: number | null) => void>>(
     new Map(),
   );
+
+  inSettingsRef.current = inSettings;
 
   /** Recompute the display list and selection from the generation state. */
   const commit = useCallback((st: GenState) => {
@@ -98,6 +109,7 @@ export default function App(): ReactElement {
       st.apps = [
         ...(p.calc ? [ipc.calcRow(p.calc)] : []),
         ...p.apps.map(ipc.appRow),
+        ...p.commands.map(ipc.commandRow),
         ...p.settings.map(ipc.settingRow),
       ];
     }
@@ -166,6 +178,7 @@ export default function App(): ReactElement {
       }),
     );
     track(ipc.onIndexState((p) => setConnected(p.connected === true)));
+    track(ipc.onOpenSettingsView(() => setInSettings(true)));
     track(
       ipc.onWindowShown(() => {
         noteShown();
@@ -188,14 +201,28 @@ export default function App(): ReactElement {
     };
   }, [scheduleApply]);
 
+  // The launcher grows to fit whatever view it is showing, and shrinks back
+  // when that view closes (§5.3 recomputes the placement for the height).
+  useEffect(() => {
+    void ipc
+      .setLauncherHeight(inSettings ? SETTINGS_HEIGHT : SEARCH_HEIGHT)
+      .catch(() => undefined);
+  }, [inSettings]);
+
+  // Leaving Settings puts focus back where §5.7 wants it: the query field.
+  const closeSettings = useCallback(() => {
+    setInSettings(false);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  }, []);
+
   // Capture-phase keydown: typing always goes to the query field (§5.7), and
   // the raw keydown timestamp feeds the latency HUD (§5.10 instrument).
   useEffect(() => {
     const handler = (e: KeyboardEvent): void => {
       keydownTsRef.current = performance.now();
-      // §5.7's refocus rule hands over to the action panel while it is open:
-      // the panel owns the keyboard until Esc closes it.
-      if (panelOpenRef.current) return;
+      // §5.7's refocus rule hands over while another surface owns the
+      // keyboard: the action panel, or a view opened in place.
+      if (panelOpenRef.current || inSettingsRef.current) return;
       const el = inputRef.current;
       if (el && document.activeElement !== el && !e.isComposing) {
         el.focus();
@@ -434,6 +461,16 @@ export default function App(): ReactElement {
     `${rows.length} results (${shellCount} from the shell)`,
     connected ? "indexd: connected" : "indexd: offline",
   ].join(" · ");
+
+  // §5.7's navigation stack: a view opened in place replaces the results
+  // list, and Esc inside it pops back to the query.
+  if (inSettings) {
+    return (
+      <div className="app">
+        <Settings onClose={closeSettings} />
+      </div>
+    );
+  }
 
   return (
     <div className="app">

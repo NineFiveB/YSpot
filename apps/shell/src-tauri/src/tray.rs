@@ -10,10 +10,9 @@
 //! lifecycle belongs to Settings and the service manager, not to a tray menu
 //! (§5.5).
 //!
-//! Deviation from §5.5's menu list, recorded in `docs/M1.md`: there is no
-//! Settings… entry yet because the Settings window is Phase 2, and "Start
-//! with Windows" stands in for the autostart toggle that §5.9 puts in
-//! Settings and onboarding. Both move when those land.
+//! One addition to §5.5's menu list: "Start with Windows" stands in for the
+//! autostart toggle §5.9 puts in Settings and onboarding, so the setting is
+//! reachable before onboarding exists. Recorded in `docs/M1.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,6 +25,7 @@ use crate::autostart;
 use crate::pipe_client::PipeClient;
 
 const ID_OPEN: &str = "open";
+const ID_SETTINGS: &str = "settings";
 const ID_PAUSE: &str = "pause";
 const ID_AUTOSTART: &str = "autostart";
 const ID_QUIT: &str = "quit";
@@ -42,6 +42,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     app.manage(paused.clone());
 
     let open = MenuItem::with_id(app, ID_OPEN, "Open YSpot", true, None::<&str>)?;
+    let settings = MenuItem::with_id(app, ID_SETTINGS, "Settings…", true, None::<&str>)?;
     let pause = MenuItem::with_id(app, ID_PAUSE, "Pause indexing", true, None::<&str>)?;
     let autostart_item = CheckMenuItem::with_id(
         app,
@@ -56,6 +57,7 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         app,
         &[
             &open,
+            &settings,
             &PredefinedMenuItem::separator(app)?,
             &pause,
             &autostart_item,
@@ -104,6 +106,11 @@ fn on_menu(
 ) {
     match event.id().as_ref() {
         ID_OPEN => crate::show(app),
+        ID_SETTINGS => {
+            if let Err(e) = crate::show_settings(app) {
+                log::error!("tray: could not open Settings: {e}");
+            }
+        }
         ID_PAUSE => {
             let Some(state) = app.try_state::<Arc<PauseState>>() else {
                 return;

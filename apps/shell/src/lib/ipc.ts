@@ -50,6 +50,14 @@ export interface SettingItem {
   matchRanges: [number, number][];
 }
 
+/** One built-in YSpot command (§5.9, §7.6). */
+export interface CommandItem {
+  id: string;
+  name: string;
+  score: number;
+  matchRanges: [number, number][];
+}
+
 /** The calculator's answer (§7.7), when the query is an expression. */
 export interface CalcItem {
   /** What the row shows, which may carry a unit or a base echo. */
@@ -67,6 +75,7 @@ export interface SearchShellPayload {
   gen: number;
   apps: AppItem[];
   settings: SettingItem[];
+  commands: CommandItem[];
   calc: CalcItem | null;
 }
 
@@ -90,6 +99,15 @@ export type Row =
       score: number;
       matchRanges: [number, number][];
       value: string;
+    }
+  | {
+      kind: "command";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
     }
   | {
       kind: "setting";
@@ -136,6 +154,18 @@ export function appRow(item: AppItem): Row {
     score: item.score,
     matchRanges: item.matchRanges,
     appKind: item.kind,
+  };
+}
+
+export function commandRow(item: CommandItem): Row {
+  return {
+    kind: "command",
+    key: `command:${item.id}`,
+    id: item.id,
+    name: item.name,
+    subtitle: "YSpot",
+    score: item.score,
+    matchRanges: item.matchRanges,
   };
 }
 
@@ -209,6 +239,60 @@ export function executeAction(row: Row, action = "open"): Promise<unknown> {
 /** §7.1 icon for an app row, as a PNG data URI. Off the query path (§5.10). */
 export function appIcon(id: string, px: number): Promise<string> {
   return invoke<string>("app_icon", { id, px });
+}
+
+// ---------------------------------------------------------------------------
+// §5.9 Settings window.
+
+/** The summon chord (§5.1); `code` is a `KeyboardEvent.code`. */
+export interface Hotkey {
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  win: boolean;
+  code: string;
+}
+
+export interface Settings {
+  hotkey: Hotkey;
+  theme: "system" | "light" | "dark";
+  [key: string]: unknown;
+}
+
+export interface SettingsView {
+  settings: Settings;
+  autostart: boolean;
+  hotkeyWarning: string | null;
+}
+
+export function getSettings(): Promise<SettingsView> {
+  return invoke<SettingsView>("get_settings");
+}
+
+/** Save through the shell (§5.9); a hotkey change is rebound first. */
+export function saveSettings(next: Settings): Promise<SettingsView> {
+  return invoke<SettingsView>("save_settings", { next });
+}
+
+export function openSettings(): Promise<unknown> {
+  return invoke("open_settings");
+}
+
+/**
+ * Grow or shrink the launcher in place (§5.3 placement, recomputed): the
+ * window fits the view it is showing rather than a fixed results list.
+ */
+export function setLauncherHeight(logicalHeight: number): Promise<unknown> {
+  return invoke("set_launcher_height", { logicalHeight });
+}
+
+/** The shell asking the launcher to show its Settings view (§5.9). */
+export function onOpenSettingsView(cb: () => void): Promise<UnlistenFn> {
+  return listen("view:settings", () => cb());
+}
+
+export function setAutostart(enabled: boolean): Promise<unknown> {
+  return invoke("set_autostart", { enabled });
 }
 
 export function getStatus(): Promise<unknown> {

@@ -11,6 +11,7 @@ mod apps;
 mod autostart;
 mod calc;
 mod com;
+mod commands;
 mod etw_mark;
 mod file_actions;
 mod focus;
@@ -19,6 +20,7 @@ mod icons;
 mod matcher;
 mod pipe_client;
 mod placement;
+mod settings;
 mod settings_catalog;
 mod tray;
 
@@ -30,14 +32,76 @@ use frecency::Frecency;
 use icons::IconCache;
 use pipe_client::PipeClient;
 use serde::Serialize;
+use settings::{Settings, SettingsStore};
 use settings_catalog::SettingsCatalog;
+use std::str::FromStr;
 use tauri::{AppHandle, Emitter, Manager};
+
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
-/// §5.1 default binding. The plugin does not expose MOD_NOREPEAT, so holding
-/// the chord can retrigger the toggle — acceptable for M0, rebinding is M1.
-fn alt_space() -> Shortcut {
-    Shortcut::new(Some(Modifiers::ALT), Code::Space)
+/// Parse a §5.1 chord into the plugin's shortcut type.
+///
+/// The plugin does not expose `MOD_NOREPEAT`, so holding the chord can
+/// retrigger the toggle; the toggle is idempotent enough that this is a
+/// cosmetic wart rather than a correctness one.
+fn shortcut_of(hotkey: &settings::Hotkey) -> Option<Shortcut> {
+    let mut mods = Modifiers::empty();
+    if hotkey.ctrl {
+        mods |= Modifiers::CONTROL;
+    }
+    if hotkey.alt {
+        mods |= Modifiers::ALT;
+    }
+    if hotkey.shift {
+        mods |= Modifiers::SHIFT;
+    }
+    if hotkey.win {
+        mods |= Modifiers::SUPER;
+    }
+    let code = Code::from_str(&hotkey.code).ok()?;
+    Some(Shortcut::new(Some(mods), code))
+}
+
+/// Register `hotkey`, replacing whatever is bound now.
+///
+/// §5.1's atomicity rule: unregister the old chord, register the new one,
+/// and if that fails put the old one back — a failed rebind must not leave
+/// the launcher unreachable.
+fn rebind_hotkey(
+    app: &AppHandle,
+    old: Option<&settings::Hotkey>,
+    next: &settings::Hotkey,
+) -> Result<(), String> {
+    let shortcut = shortcut_of(next).ok_or_else(|| format!("unknown key {:?}", next.code))?;
+    if let Some(reason) = next.rejection() {
+        return Err(reason.to_string());
+    }
+    let manager = app.global_shortcut();
+    let previous = old.and_then(shortcut_of);
+    if let Some(p) = previous {
+        let _ = manager.unregister(p);
+    }
+    match manager.register(shortcut) {
+        Ok(()) => {
+            log::info!("hotkey bound to {} (§5.1)", next.accelerator());
+            Ok(())
+        }
+        Err(e) => {
+            // Put the old chord back before reporting, so the launcher stays
+            // reachable while the user picks another one.
+            if let Some(p) = previous {
+                let _ = manager.register(p);
+            }
+            let owner = next
+                .likely_owner()
+                .map(|o| format!(" It is probably held by {o}."))
+                .unwrap_or_default();
+            Err(format!(
+                "{} could not be registered.{owner} ({e})",
+                next.accelerator()
+            ))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -164,6 +228,7 @@ struct ShellResults {
     gen: u64,
     apps: Vec<apps::AppMatch>,
     settings: Vec<settings_catalog::SettingMatch>,
+    commands: Vec<commands::CommandMatch>,
     calc: Option<CalcRow>,
 }
 
@@ -182,6 +247,7 @@ fn search(
     pipe: tauri::State<'_, Arc<PipeClient>>,
     catalog: tauri::State<'_, Arc<AppCatalog>>,
     settings: tauri::State<'_, Arc<SettingsCatalog>>,
+    builtins: tauri::State<'_, Arc<Vec<commands::Command>>>,
     frec: tauri::State<'_, Arc<Frecency>>,
     gen: u64,
     text: String,
@@ -205,15 +271,22 @@ fn search(
     }
     settings.sort_by(|a, b| b.score.total_cmp(&a.score));
 
+    let mut builtin_hits = commands::match_query(&builtins, &text, commands::MAX_RESULTS);
+    for it in &mut builtin_hits {
+        it.score += frec.bonus(&it.id);
+    }
+    builtin_hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+
     let calc = calc::evaluate(&text).map(|r| CalcRow {
         display: r.display,
         value: r.copy,
     });
 
     log::debug!(
-        "shell gen={gen}: {} app(s), {} setting(s), calc={}",
+        "shell gen={gen}: {} app(s), {} setting(s), {} command(s), calc={}",
         apps.len(),
         settings.len(),
+        builtin_hits.len(),
         calc.is_some()
     );
     if let Err(e) = app.emit(
@@ -222,6 +295,7 @@ fn search(
             gen,
             apps,
             settings,
+            commands: builtin_hits,
             calc,
         },
     ) {
@@ -386,7 +460,11 @@ fn execute_action(
     // step, not the end of the errand. Everything that hands the user to
     // another window dismisses first, so the launcher is not left floating
     // over what it just opened.
-    let stays_open = matches!(action.as_str(), "copy_path" | "copy_file" | "copy");
+    // Actions that keep the launcher up: copying is usually a step rather
+    // than the end of the errand, and Settings opens IN the launcher, so
+    // dismissing would close the thing the user just asked for.
+    let stays_open = matches!(action.as_str(), "copy_path" | "copy_file" | "copy")
+        || (kind == "command" && id == "yspot.settings");
     if !stays_open {
         // Dismissed BEFORE the action so focus lands on whatever the action
         // raises (§5.2 hands focus back to the previous foreground window,
@@ -404,6 +482,15 @@ fn execute_action(
                 apps::launch(&entry.aumid, entry.kind, action == "runas").map(|()| true)
             })
         }
+        "command" => match id.as_str() {
+            "yspot.settings" => show_settings(&app).map(|()| false),
+            "yspot.quit" => {
+                log::info!("quit from the launcher; the indexing service keeps running (§5.5)");
+                app.exit(0);
+                Ok(false)
+            }
+            other => Err(format!("unknown command {other}")),
+        },
         "setting" => {
             let entry = settings
                 .find(&id)
@@ -445,6 +532,103 @@ fn execute_action(
             Err(e)
         }
     }
+}
+
+/// §5.9 Settings: the current settings plus what the UI needs to render
+/// them honestly (whether autostart is really on, what the hotkey warns
+/// about).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsView {
+    settings: Settings,
+    autostart: bool,
+    hotkey_warning: Option<String>,
+}
+
+#[tauri::command]
+fn get_settings(store: tauri::State<'_, Arc<SettingsStore>>) -> SettingsView {
+    let settings = store.get();
+    SettingsView {
+        hotkey_warning: settings.hotkey.warning().map(str::to_string),
+        autostart: autostart::is_enabled(),
+        settings,
+    }
+}
+
+/// §5.9: every mutation goes through the shell. A changed hotkey is rebound
+/// atomically before anything is persisted, so the file can never name a
+/// chord the running shell does not hold.
+#[tauri::command]
+fn save_settings(
+    app: AppHandle,
+    store: tauri::State<'_, Arc<SettingsStore>>,
+    next: Settings,
+) -> Result<SettingsView, String> {
+    let current = store.get();
+    if next.hotkey != current.hotkey {
+        rebind_hotkey(&app, Some(&current.hotkey), &next.hotkey)?;
+    }
+    let warning = next.hotkey.warning().map(str::to_string);
+    store.save(next.clone())?;
+    // The launcher window is listening: a theme change applies at once
+    // rather than at the next restart.
+    if let Err(e) = app.emit("settings:changed", &next) {
+        log::warn!("emit settings:changed failed: {e}");
+    }
+    Ok(SettingsView {
+        settings: next,
+        autostart: autostart::is_enabled(),
+        hotkey_warning: warning,
+    })
+}
+
+/// Settings opens INSIDE the launcher, as a view the search window grows to
+/// fit, rather than as a separate framed window.
+///
+/// SPEC §5.9 called for a separate window; this is a deliberate amendment
+/// (recorded there and in `docs/M1.md`). A launcher you already have open,
+/// with your hands on the keys, should not throw a second window at the
+/// taskbar to change a hotkey — you search for the thing, you get it in
+/// place, and Esc takes you back to the query. §5.7 already models exactly
+/// that as the navigation stack Esc pops.
+#[tauri::command]
+fn open_settings(app: AppHandle) -> Result<(), String> {
+    show_settings(&app)
+}
+
+fn show_settings(app: &AppHandle) -> Result<(), String> {
+    // Bring the launcher up first if it is hidden — a Settings request from
+    // the tray arrives with no window on screen.
+    if let Some(window) = app.get_webview_window("launcher") {
+        if !window.is_visible().unwrap_or(false) {
+            show(app);
+        }
+    }
+    app.emit("view:settings", ())
+        .map_err(|e| format!("emit view:settings: {e}"))?;
+    log::info!("Settings opened in the launcher (§5.9, amended)");
+    Ok(())
+}
+
+/// Resize the launcher in place to `logical_height` logical pixels, keeping
+/// its top edge and its horizontal position (§5.3's placement, recomputed
+/// for the new height). The frontend calls this when it switches between the
+/// results list and a taller view.
+#[tauri::command]
+fn set_launcher_height(app: AppHandle, logical_height: u32) -> Result<(), String> {
+    let Some(window) = app.get_webview_window("launcher") else {
+        return Ok(());
+    };
+    let logical = logical_height.clamp(120, 2000) as i32;
+    let Some(p) = placement::compute_placement_of_height(logical) else {
+        return Err("placement computation failed".to_string());
+    };
+    window
+        .set_size(tauri::PhysicalSize::new(p.width, p.height))
+        .map_err(|e| format!("set_size: {e}"))?;
+    window
+        .set_position(tauri::PhysicalPosition::new(p.x, p.y))
+        .map_err(|e| format!("set_position: {e}"))
 }
 
 /// §5.4 autostart state, for the Settings UI (§5.9) and the tray toggle.
@@ -523,6 +707,7 @@ pub fn run() {
         log::info!("started with --hidden (autostart): warming the renderer, staying invisible");
     }
 
+    let store = Arc::new(SettingsStore::open());
     let pipe = Arc::new(PipeClient::new());
     let catalog = AppCatalog::new();
     let frec = Frecency::open();
@@ -532,20 +717,34 @@ pub fn run() {
         // §5.5 single instance: a second launch forwards a show to the
         // running shell and exits, so running the exe again summons the
         // launcher instead of starting a rival that fights for the hotkey.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            log::info!("second instance launched; summoning this one (§5.5)");
-            show(app);
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // §5.5: a second launch summons the running shell rather than
+            // starting a rival. `--settings` is the one argument that means
+            // something else — it is how a shortcut or a script opens the
+            // Settings window without going through the tray.
+            if argv.iter().any(|a| a == "--settings") {
+                log::info!("second instance asked for Settings (§5.9)");
+                if let Err(e) = show_settings(app) {
+                    log::error!("could not open Settings: {e}");
+                }
+            } else {
+                log::info!("second instance launched; summoning this one (§5.5)");
+                show(app);
+            }
         }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
-                .with_handler(|app, shortcut, event| {
+                .with_handler(|app, _shortcut, event| {
                     // Nothing on this path performs IPC or disk I/O (§5.1).
-                    if matches!(event.state(), ShortcutState::Pressed) && shortcut == &alt_space() {
+                    // Only one chord is ever registered, so a press is ours.
+                    if matches!(event.state(), ShortcutState::Pressed) {
                         toggle(app);
                     }
                 })
                 .build(),
         )
+        .manage(store)
+        .manage(Arc::new(commands::all()))
         .manage(pipe.clone())
         .manage(catalog.clone())
         .manage(frec)
@@ -557,6 +756,10 @@ pub fn run() {
             frontend_ready,
             execute_action,
             app_icon,
+            get_settings,
+            save_settings,
+            open_settings,
+            set_launcher_height,
             get_autostart,
             set_autostart,
             get_status,
@@ -588,13 +791,22 @@ pub fn run() {
                 log::error!("tray icon could not be created: {e}");
             }
 
-            match app.global_shortcut().register(alt_space()) {
-                Ok(()) => log::info!("registered Alt+Space (RegisterHotKey via plugin, §5.1)"),
-                Err(e) => log::error!(
-                    "Alt+Space registration failed: {e}. Likely owners: PowerToys Run \
-                     (Alt+Space), Copilot (Alt+Space on some Win11 builds). The conflict \
-                     dialog and rebinding flow are M1 (§5.1)."
-                ),
+            // `yspot.exe --settings` opens the Settings window directly, for
+            // a shortcut or a script; the launcher itself stays hidden.
+            if std::env::args().any(|a| a == "--settings") {
+                if let Err(e) = show_settings(app.handle()) {
+                    log::error!("could not open Settings: {e}");
+                }
+            }
+
+            // §5.1: the binding persists in settings and re-registers on
+            // every start.
+            let hotkey = app.state::<Arc<SettingsStore>>().get().hotkey;
+            if let Err(e) = rebind_hotkey(app.handle(), None, &hotkey) {
+                log::error!(
+                    "hotkey registration failed: {e} Rebind it in Settings \
+                     (tray → Settings…, or the `settings` query)."
+                );
             }
 
             // Dismiss on focus loss (§5.2 step 3: blur is a dismissal path).

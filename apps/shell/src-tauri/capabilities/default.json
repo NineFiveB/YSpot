@@ -1,8 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Launcher window capabilities for M0: core IPC (invoke/listen) plus global-shortcut management.",
-  "windows": ["launcher"],
+  "description": "Launcher window capabilities: core IPC (invoke/listen) plus global-shortcut management. Settings is a view inside this window, not a second one.",
+  "windows": [
+    "launcher"
+  ],
   "permissions": [
     "core:default",
     "core:event:default",

@@ -25,6 +25,13 @@ pub struct Placement {
 /// §5.3 chain: `GetCursorPos` → `MonitorFromPoint(MONITOR_DEFAULTTONEAREST)`
 /// → `GetMonitorInfoW().rcWork` → [`compute_from`].
 pub fn compute_placement() -> Option<Placement> {
+    compute_placement_of_height(LOGICAL_HEIGHT)
+}
+
+/// The same, for a window of a different logical height — the launcher grows
+/// to fit an in-place view such as Settings, keeping its top edge where the
+/// user is already looking.
+pub fn compute_placement_of_height(logical_height: i32) -> Option<Placement> {
     // SAFETY: plain out-parameter Win32 calls; POINT/MONITORINFO are POD and
     // valid zero-initialized; cbSize is set before GetMonitorInfoW.
     unsafe {
@@ -46,7 +53,7 @@ pub fn compute_placement() -> Option<Placement> {
             dpi_x = 96;
         }
         let _ = dpi_y; // X and Y effective DPI are always equal.
-        Some(compute_from(
+        Some(compute_from_height(
             (
                 mi.rcWork.left,
                 mi.rcWork.top,
@@ -54,13 +61,18 @@ pub fn compute_placement() -> Option<Placement> {
                 mi.rcWork.bottom,
             ),
             dpi_x,
+            logical_height,
         ))
     }
 }
 
 /// Pure layout math, separated for unit testing. `work` is
-/// `(left, top, right, bottom)` of the monitor work area in physical px.
-pub fn compute_from(work: (i32, i32, i32, i32), dpi: u32) -> Placement {
+/// `(left, top, right, bottom)` of the monitor work area in physical px, and
+/// `logical_height` is how tall the window should be. The top
+/// edge stays at §5.3's 20% of the work area whatever the height, so growing
+/// the window does not move what the user is reading; the height is clamped
+/// so a tall view cannot run off the bottom of the work area.
+pub fn compute_from_height(work: (i32, i32, i32, i32), dpi: u32, logical_height: i32) -> Placement {
     let (left, top, right, bottom) = work;
     let work_w = (right - left).max(1);
     let work_h = (bottom - top).max(1);
@@ -72,10 +84,16 @@ pub fn compute_from(work: (i32, i32, i32, i32), dpi: u32) -> Placement {
     if width > max_width {
         width = max_width;
     }
-    let height = scale(LOGICAL_HEIGHT);
+    let y = top + work_h / 5;
+    // Clamp to what is left below the top edge, so a tall view (Settings
+    // opening in place) cannot run off the bottom of the work area.
+    let mut height = scale(logical_height);
+    let max_height = (bottom - y).max(1);
+    if height > max_height {
+        height = max_height;
+    }
 
     let x = left + (work_w - width) / 2;
-    let y = top + work_h / 5;
 
     Placement {
         x,
@@ -88,6 +106,12 @@ pub fn compute_from(work: (i32, i32, i32, i32), dpi: u32) -> Placement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The launcher at its default height — what every test but the
+    /// grow-in-place one is about.
+    fn compute_from(work: (i32, i32, i32, i32), dpi: u32) -> Placement {
+        compute_from_height(work, dpi, LOGICAL_HEIGHT)
+    }
 
     #[test]
     fn centered_at_96dpi() {
@@ -121,6 +145,23 @@ mod tests {
         let p = compute_from((-1920, 100, 0, 1180), 96);
         assert_eq!(p.x, -1920 + (1920 - 680) / 2);
         assert_eq!(p.y, 100 + 1080 / 5);
+    }
+
+    #[test]
+    fn a_taller_view_keeps_the_top_edge_and_clamps_to_the_work_area() {
+        let work = (0, 0, 1920, 1040);
+        let normal = compute_from(work, 96);
+        let tall = compute_from_height(work, 96, 620);
+        // The top edge does not move when the window grows in place.
+        assert_eq!(tall.y, normal.y);
+        assert_eq!(tall.x, normal.x);
+        assert_eq!(tall.height, 620);
+        // A height that would overrun the work area is clamped to what fits
+        // below the top edge, never negative and never off-screen.
+        let huge = compute_from_height(work, 96, 5000);
+        assert_eq!(huge.y, normal.y);
+        assert_eq!(huge.height as i32, 1040 - normal.y);
+        assert!((huge.y + huge.height as i32) <= 1040);
     }
 
     #[test]

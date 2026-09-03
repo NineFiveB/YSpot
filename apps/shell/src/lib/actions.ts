@@ -29,7 +29,9 @@ export function actionsFor(row: Row): Action[] {
   if (row.kind === "file") return FILE_ACTIONS;
   // §7.7: Enter copies the calculator's answer — there is nothing to open.
   if (row.kind === "calc") return [{ id: "copy", title: "Copy Result", shortcut: "Enter" }];
-  if (row.kind === "setting") return [{ id: "open", title: "Open", shortcut: "Enter" }];
+  if (row.kind === "setting" || row.kind === "command") {
+    return [{ id: "open", title: "Open", shortcut: "Enter" }];
+  }
   const list: Action[] = [{ id: "open", title: "Open", shortcut: "Enter" }];
   // §7.1: "Run as administrator" is Win32 only — a packaged app cannot be
   // activated elevated, so the entry is not offered rather than offered and
