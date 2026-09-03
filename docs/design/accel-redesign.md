@@ -190,6 +190,11 @@ One ascending pass over `arena_recs` drives everything, because live records app
 
 ## Byte accounting
 
+> **Superseded parameter (issue #10, M1).** Sections A–D below are computed at
+> L = 23 B, which was derived, not measured. Real volumes measure L = 30–35 B
+> (§F). Every "headroom" figure in A–D is therefore optimistic by ~15–25
+> B/entry; §F restates the totals at the measured range and revisits Step 12.
+
 Parameters. n = 1,000,000 live entries. L = **23 B** average name, used for BOTH arenas.
 
 Derivation of L (the judges split 17 vs 26; neither is derived): the measured cold figure is 188,743,680 B at 1,329,180 entries. `ram_bytes` computes `entries.capacity()*32 + name.capacity() + folded.capacity() + frn_map.capacity()*16`. At 1.33M: `entries` capacity 2^21 -> 67,108,864 B; `frn_map.capacity()` = 1,835,008 -> x16 = 29,360,128 B. Residual for BOTH arenas = 92,274,688 B of **capacity** = 34.7 B/entry each. `String` grows by doubling, so mean slack over the doubling interval is ~1.5x, giving ~23 B/entry of payload each. That is a derivation, not a guess, and it sits between the two disputed figures.
@@ -392,6 +397,81 @@ Cost model behind these (per candidate, replacing today's ~800 ns): reject-witho
 - 11. NOT A BEHAVIOR CHANGE, BUT MUST BE ARGUED IN REVIEW BECAUSE IT IS THE MAIN LATENCY MECHANISM. Pass skipping and hit rejection are result-preserving. `tier_upper_bound(t)` is an exact upper bound on any score tier t can produce (depth_penalty <= 1, hidden_penalty <= 1). Both rules use STRICT `>` / `<`, which is REQUIRED: `Scored::cmp` (matching.rs:465-469) is `score.total_cmp(...).then_with(|| other.eidx.cmp(&self.eidx))`, so on equal score a LOWER eidx compares Greater and legitimately displaces the current K-th; a `>=` rule would silently discard those tie-break winners. The 2K-capacity heap plus drain-dedup is exactly sufficient (proof: each of the K-1 better distinct slots contributes at most 2 offers, so the K-th best distinct slot's best offer ranks at worst 2K-1). The fuzzy bound MUST be hard-coded as 0.5, never `tier_base(Fuzzy)` = 0.3, which is documented in the source as a floor. The differential test in Step 4 is the proof obligation; the existing tests cannot catch a violation.
 
 - 12. NEW DEGRADATION MODE, LOGGED AND COUNTED. The design intentionally has NO per-tier candidate cap (unlike one candidate design), because truncating a tier drops an arbitrary subset. The only bounded-work valves are the existing FUZZY_CAP (now depth-prioritized) and `is_cancelled`, whose partial-results semantics SPEC 3.4 already permits. If a hard `CANDIDATE_BUDGET` safety valve is later added for pathological inputs, it must be logged, counted, and signed off separately - it is not part of this plan.
+
+### F. Re-derivation at measured L (issue #10, M1)
+
+Three real-corpus measurements of the mean name length, all `ram_breakdown()`
+on the index as built:
+
+| corpus | entries | L (name arena B/entry) | total B/entry | source |
+|---|---:|---:|---:|---|
+| `C:\` walk, unelevated, user-file-heavy subtrees | 554,032 | **34.6** | 165.38 | issue #10 |
+| `C:\` walk, unelevated, same machine, fuller walk (head column present) | 755,774 | **30.0** | 148.66 | `yspot-indexd` startup log, 2026-09-03 |
+| `C:\` MFT enumeration incl. a 250k short-name synthetic corpus | 1,093,055 | ≈ 25 (backed out) | 143.0 | `docs/M0.md` sign-off |
+
+So L is **volume-dependent in the 25–35 B range**, and the synthetic bench
+corpus (L ≈ 19) sits below every real point. The model's L = 23 was at the
+bottom of the real range, not the middle.
+
+**Validation of the model at L = 30.** The 755k walk measured 148.66 B/entry
+with `frn_map` at 23.59 (hashbrown holding 2^20 buckets, which it keeps up to
+~917k live entries). Restated at the 1M row count the model assumes — map at
+2^21 buckets (35.65) — that is **160.7 B/entry**, against the model's 163.9 at
+L = 30 with the head column (below). The model is within 2% once the map's
+power-of-two cliff is accounted for; its only systematic overshoot is the
+4.19 B/entry allocation slack, which `finalize()` hands back.
+
+**The head column (issue #11)** adds row 7b: `head: Vec<u8>`, stride 2,
+**2.00 B/entry** steady, ×1.125 at the trigger. It is in every total below.
+
+Rows 2, 3 and 6 scale with L at 2.0625 B/entry per byte of L (name, folded
++ NUL, and 4 B of `owner` per 64 B of folded arena); at the compaction
+trigger the arenas carry 25% stale bytes, so the slope there is 2.578.
+
+| L | Phase A steady | Phase A at trigger | **Phase A peak** | Phase B steady | Phase B at trigger | Phase B peak |
+|---:|---:|---:|---:|---:|---:|---:|
+| 23 (plan) | 149.5 | 170.5 | 175.0 (87.5%) | 122.2 | 143.2 | 147.7 |
+| 25 (MFT run) | 153.6 | 175.6 | 180.1 (90.1%) | 126.3 | 148.4 | 152.9 |
+| **30 (755k walk)** | **163.9** | **188.5** | **193.0 (96.5%)** | 136.6 | 161.3 | 165.8 |
+| **34.6 (554k walk)** | **173.4** | **200.4** | **204.9 (102.4%)** | 146.1 | 173.1 | 177.6 |
+
+(Peak = trigger + the 4.50 MB `remap` transient; percentages are of the
+200 MB/1M hard cap. Phase B = Phase A − 27.26 for the open-addressed
+`frn_index` of Step 12.)
+
+**What changes.**
+
+1. **Steady state holds everywhere measured.** Phase A steady is 164–173
+   B/entry across the real range — 82–87% of the cap — and the measured
+   1.09M RSS of 163 MB (`docs/M0.md`) agrees. The head column's 2 B/entry
+   fit inside that; it was admitted on this table.
+2. **The compaction transient no longer clears the cap on name-heavy
+   volumes.** Phase A's peak is 96.5% of the cap at L = 30 and **102.4% at
+   L = 34.6**. The plan's "Phase A stays under the cap up to L ≈ 34" (§D)
+   was computed without the head column and at the edge; with it, the
+   crossing is at **L ≈ 32.6**. Tightening the trigger (20% stale / 20%
+   recs / 10% dead instead of 25/25/12.5) buys back only ~5 B/entry — 199.3
+   at L = 34.6, at the line — so the thresholds are not the lever.
+3. **Step 12 is the lever, and is no longer optional by the plan's own
+   criterion.** The open-addressed `frn_index` (−27.26 B/entry) puts Phase B's
+   peak at 166–178 B/entry (83–89%) across the whole measured range, with
+   the 4 B/entry chunk slack still on top. The plan staged it last and
+   marked it optional because "the cap closes without it" at L = 23; at the
+   measured L it is what closes the cap during compaction on a
+   user-file-heavy volume. **Recommendation: schedule Step 12 in M1, before
+   the first reference-volume MFT measurement of L would be needed to
+   decide it** — it is the same ~120 lines either way, and the remaining
+   headroom (Phase B leaves 22–34 B/entry at peak) is what any later
+   per-entry spend has to come out of.
+4. **Every "the budget has room" argument in §A–D is to be read at L = 30–35,
+   not 23.** In particular the +8 B/entry second BSI slice the fuzzy tier
+   once contemplated (§Open questions) would push Phase A's steady state to
+   181 at L = 34.6 and its peak to 213 — it is only affordable after Step 12.
+   (Issue #7 was resolved without it.)
+
+`yspot-indexd` now logs this breakdown, in B/entry with L, after every
+enumeration, so the reference-machine runs (`docs/M0.md`, Machine B) record
+L alongside the total.
 
 ## Open questions
 

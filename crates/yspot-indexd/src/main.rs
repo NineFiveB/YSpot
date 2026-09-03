@@ -62,6 +62,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let (n, ram) = (idx_api::entry_count(&idx), idx_api::ram_bytes(&idx));
             // M0 exit-criteria numbers (§10): duration, entries, resident bytes.
             log::info!("walk complete: {n} entries in {ms} ms, ram_bytes={ram}");
+            log_ram_breakdown(&idx);
 
             let state = Arc::new(ServiceState::new(idx, root, Mode::Walk));
             // Dev mode has no USN tailing; the index is as live as it gets.
@@ -91,6 +92,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let (n, ram) = (idx_api::entry_count(&idx), idx_api::ram_bytes(&idx));
             // M0 exit-criteria numbers (§10): duration, entries, resident bytes.
             log::info!("MFT enumeration complete: {n} entries in {ms} ms, ram_bytes={ram}");
+            log_ram_breakdown(&idx);
 
             let state = Arc::new(ServiceState::new(idx, root, Mode::Mft));
             state.set_vol_state(VS_TAILING);
@@ -99,6 +101,37 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             pipe::serve(state)
         }
     }
+}
+
+/// One line of per-structure memory attribution after enumeration, in
+/// B/entry, with the mean name length every arena-sized row scales through
+/// (issue #10: the §3.4 accounting is a function of that length, and the
+/// reference-machine runs need the real figure next to the total).
+fn log_ram_breakdown(idx: &idx_api::VolumeIndex) {
+    let n = idx_api::entry_count(idx).max(1) as f64;
+    let b = idx_api::ram_breakdown(idx);
+    let per = |v: u64| v as f64 / n;
+    log::info!(
+        "ram_bytes by structure (B/entry): entries={:.2} name_arena={:.2} folded_arena={:.2} \
+         frn_map={:.2} rank_key={:.2} arena_recs={:.2} owner={:.2} initials={:.2} head={:.2} \
+         charclass_bsi={:.2} presence={:.2} free_slots={:.2} depth_repair={:.2} total={:.2}; \
+         mean name length {:.1} B",
+        per(b.entries),
+        per(b.name_arena),
+        per(b.folded_arena),
+        per(b.frn_map),
+        per(b.rank_key),
+        per(b.arena_recs),
+        per(b.owner),
+        per(b.initials),
+        per(b.head),
+        per(b.charclass_bsi),
+        per(b.presence),
+        per(b.free_slots),
+        per(b.depth_repair_state),
+        per(b.total()),
+        idx_api::name_arena_len(idx) as f64 / n,
+    );
 }
 
 /// How often the housekeeping thread looks for deferred writer-side work.

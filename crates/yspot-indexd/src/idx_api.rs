@@ -30,6 +30,16 @@ pub fn ram_bytes(idx: &VolumeIndex) -> u64 {
     idx.ram_bytes()
 }
 
+/// Per-structure attribution of [`ram_bytes`] (§4.3 `ram_bytes.filename`),
+/// plus the live+stale name payload the per-entry figures scale through.
+pub fn ram_breakdown(idx: &VolumeIndex) -> yspot_index::index::RamBreakdown {
+    idx.ram_breakdown()
+}
+
+pub fn name_arena_len(idx: &VolumeIndex) -> usize {
+    idx.name_arena_len()
+}
+
 pub fn name_of(idx: &VolumeIndex, frn: u64) -> Option<String> {
     idx.name_of(frn).map(|s| s.to_string())
 }
