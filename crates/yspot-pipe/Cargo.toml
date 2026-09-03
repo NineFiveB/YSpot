@@ -1,0 +1,24 @@
+[package]
+name = "yspot-pipe"
+description = "YSpot named-pipe transport: overlapped I/O primitive, §4.1 server creation and client open/verification, shared by yspot-indexd and every client (SPEC.md §4.1)."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+log.workspace = true
+yspot-proto = { path = "../yspot-proto" }
+
+[dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+]

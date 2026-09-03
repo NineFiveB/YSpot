@@ -1,50 +1,38 @@
 //! Named-pipe client to `yspot-indexd` (SPEC.md §4.1, relay per §4.6).
 //!
-//! ONE background thread owns the handle outright: connect → Hello/HelloAck →
-//! a pump loop that alternates draining queued commands (writes) with
-//! `PeekNamedPipe`-guarded reads, with a 1 s → 10 s capped reconnect backoff.
-//! Commands from Tauri's thread pool only ever ENQUEUE.
+//! Two threads, no polling (issue #9):
+//! - `yspot-pipe` owns the connection: connect (§4.1 open + server
+//!   verification, in `yspot-pipe`) → Hello/HelloAck → a read loop that sits
+//!   in an overlapped `ReadFile` until a frame arrives, and a 1 s → 10 s
+//!   capped reconnect backoff when the pipe goes away.
+//! - `yspot-pipe-w` drains the command queue into the current connection's
+//!   write half. Commands from Tauri's thread pool — and the window-hide
+//!   path on the event-loop thread — only ever ENQUEUE, so no UI or command
+//!   thread can block on pipe I/O, however wedged the service is.
 //!
-//! Why single-threaded ownership is load-bearing, not style: the pipe is
-//! opened synchronously, and Windows serializes synchronous I/O per FILE
-//! OBJECT — which `try_clone` duplicates a handle to rather than escaping. The
-//! previous shape (dedicated read thread blocked in `ReadFile`, writes from
-//! command threads) deadlocked on the FIRST `SearchQuery`: the write waited
-//! behind the outstanding read, the read waited for a reply the service could
-//! not send because the request never left this process. The exact
-//! client-side twin of the service bug fixed in dd228ee — issue #9's full
-//! remedy (`FILE_FLAG_OVERLAPPED`) lands with the M1 service wrapper; until
-//! then the peek-before-read poll below costs at most [`POLL_IDLE_CAP`] of
-//! added arrival latency against the §2.5 20 ms budget.
+//! Both halves share one overlapped handle, which is what makes the shape
+//! safe: a pending read on one thread never blocks a write on the other.
+//! (The synchronous-pipe version of exactly this shape deadlocked on the
+//! shell's first `SearchQuery` — 0965adb — and was bridged by a
+//! `PeekNamedPipe` poll that cost up to 2 ms of arrival latency per frame.
+//! Frames now complete the read the moment they land.)
 //!
-//! TODO(M1, §4.1 client hardening): verify the server before first write —
-//! `GetNamedPipeServerProcessId` + pipe owner SID == S-1-5-18 via
-//! `GetSecurityInfo`.
+//! Connection epochs keep commands from crossing connections: every queued
+//! command carries the epoch it was enqueued under, and the writer drops
+//! anything from an earlier one. A command enqueued for a connection that
+//! then dies is therefore dropped rather than replayed to the next service
+//! instance, whose generation watermark starts over.
 
-use std::fs::File;
-use std::io;
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-};
-use windows_sys::Win32::System::Pipes::{PeekNamedPipe, WaitNamedPipeW};
+use yspot_pipe::client::{self, ServerOwner};
+use yspot_pipe::{Pipe, PipeReader, PipeWriter};
 use yspot_proto::{Filters, Message, ResultItem, MAX_FRAME_S2C, PIPE_NAME, PROTO_VERSION};
-
-/// Pump-loop sleep while traffic is flowing.
-const POLL_ACTIVE: Duration = Duration::from_millis(1);
-/// Pump-loop sleep cap when idle. Bounds the worst-case delay between a frame
-/// arriving at the pipe and this client reading it — i.e. the measurement and
-/// UX cost of polling instead of overlapped I/O. Kept at 2 ms so it stays
-/// noise against the §2.5 budget; the CPU cost of ≤500 wakeups/s is nil.
-const POLL_IDLE_CAP: Duration = Duration::from_millis(2);
 
 const MAX_RESULTS: u32 = 50;
 const BACKOFF_START: Duration = Duration::from_secs(1);
@@ -102,11 +90,28 @@ struct ConnState {
 
 // ---------------------------------------------------------------------------
 
+/// A queued frame, stamped with the connection it was meant for.
+struct Cmd {
+    epoch: u64,
+    msg: Message,
+}
+
+/// The write half of the live connection, installed by the connection thread
+/// after the handshake and cleared when the connection dies.
+struct ConnWriter {
+    epoch: u64,
+    writer: PipeWriter,
+}
+
 pub struct PipeClient {
-    /// Command queue into the pump thread — the only path to the pipe.
-    cmd_tx: Sender<Message>,
-    /// The pump thread takes this once at spawn.
-    cmd_rx: Mutex<Option<Receiver<Message>>>,
+    /// Command queue into the writer thread — the only path to the pipe.
+    cmd_tx: Sender<Cmd>,
+    /// The writer thread takes this once at spawn.
+    cmd_rx: Mutex<Option<Receiver<Cmd>>>,
+    /// Current connection's write half (`None` while disconnected).
+    writer: Mutex<Option<ConnWriter>>,
+    /// Bumps on every successful handshake; stamps queued commands.
+    epoch: AtomicU64,
     req_id: AtomicU64,
     current_gen: AtomicU64,
     connected: AtomicBool,
@@ -118,6 +123,8 @@ impl PipeClient {
         PipeClient {
             cmd_tx,
             cmd_rx: Mutex::new(Some(cmd_rx)),
+            writer: Mutex::new(None),
+            epoch: AtomicU64::new(0),
             req_id: AtomicU64::new(1),
             current_gen: AtomicU64::new(0),
             connected: AtomicBool::new(false),
@@ -132,16 +139,19 @@ impl PipeClient {
         self.req_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Enqueue for the pump thread. The connected check keeps the old error
+    /// Enqueue for the writer thread. The connected check keeps the old error
     /// semantics for callers; a message racing a disconnect merely sits in the
-    /// queue, and the pump drains stale commands before each new handshake.
+    /// queue under a dead epoch and is dropped by the writer.
     fn send(&self, msg: Message) -> Result<(), String> {
         if !self.is_connected() {
             return Err("index service not connected".to_string());
         }
         self.cmd_tx
-            .send(msg)
-            .map_err(|_| "index service pump thread gone".to_string())
+            .send(Cmd {
+                epoch: self.epoch.load(Ordering::SeqCst),
+                msg,
+            })
+            .map_err(|_| "index service writer thread gone".to_string())
     }
 
     /// §4.6 `search`: filename query, empty scopes, default filters, 50 rows.
@@ -167,10 +177,34 @@ impl PipeClient {
     pub fn request_status(&self) -> Result<(), String> {
         self.send(Message::IndexStatusReq { id: self.next_id() })
     }
+
+    fn lock_writer(&self) -> std::sync::MutexGuard<'_, Option<ConnWriter>> {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tear down the write half of a dead connection: abort any write in
+    /// flight (the writer thread then fails out and releases the slot), take
+    /// the slot, drop the half.
+    fn drop_writer(&self, pipe: &Pipe) {
+        self.connected.store(false, Ordering::SeqCst);
+        pipe.cancel_all();
+        *self.lock_writer() = None;
+    }
 }
 
-/// Spawn the connect/read background thread.
+/// Spawn the connection thread and the writer thread.
 pub fn spawn(app: AppHandle, client: Arc<PipeClient>) {
+    let cmd_rx = client
+        .cmd_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("pipe client spawned twice");
+    let writer_client = client.clone();
+    std::thread::Builder::new()
+        .name("yspot-pipe-w".into())
+        .spawn(move || write_loop(writer_client, cmd_rx))
+        .expect("failed to spawn pipe writer thread");
     std::thread::Builder::new()
         .name("yspot-pipe".into())
         .spawn(move || run_loop(app, client))
@@ -178,28 +212,20 @@ pub fn spawn(app: AppHandle, client: Arc<PipeClient>) {
 }
 
 fn run_loop(app: AppHandle, client: Arc<PipeClient>) {
-    // The pump owns the command receiver for the life of the process.
-    let cmd_rx = client
-        .cmd_rx
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .expect("pipe pump spawned twice");
     let mut backoff = BACKOFF_START;
     loop {
         match connect_and_handshake() {
-            Ok(file) => {
+            Ok((mut reader, writer)) => {
                 backoff = BACKOFF_START;
-                // Commands queued while disconnected are stale by definition
-                // (their generations were superseded, their callers told the
-                // service was down); a new conversation starts empty.
-                while cmd_rx.try_recv().is_ok() {}
+                let pipe = reader.pipe().clone();
+                let epoch = client.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                *client.lock_writer() = Some(ConnWriter { epoch, writer });
                 client.connected.store(true, Ordering::SeqCst);
                 emit_conn_state(&app, true);
 
-                pump_loop(&app, &client, &cmd_rx, file);
+                read_loop(&app, &client, &mut reader);
 
-                client.connected.store(false, Ordering::SeqCst);
+                client.drop_writer(&pipe);
                 emit_conn_state(&app, false);
             }
             Err(e) => {
@@ -211,26 +237,44 @@ fn run_loop(app: AppHandle, client: Arc<PipeClient>) {
     }
 }
 
-/// Bytes currently readable on the pipe without blocking, or an error when the
-/// pipe has died (broken/closed — the reconnect signal).
-fn readable_bytes(file: &File) -> io::Result<u32> {
-    let mut avail: u32 = 0;
-    // SAFETY: valid pipe handle for the duration of the call; only
-    // TotalBytesAvail is requested, all buffer pointers are documented-null.
-    let ok = unsafe {
-        PeekNamedPipe(
-            file.as_raw_handle(),
-            std::ptr::null_mut(),
-            0,
-            std::ptr::null_mut(),
-            &mut avail,
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
+/// Sit in the overlapped read until a frame arrives or the pipe dies.
+fn read_loop(app: &AppHandle, client: &PipeClient, reader: &mut PipeReader) {
+    loop {
+        match yspot_proto::read_msg(reader, MAX_FRAME_S2C) {
+            Ok(Some(msg)) => handle_msg(app, client, msg),
+            Ok(None) => {
+                log::info!("indexd pipe closed by service");
+                return;
+            }
+            Err(e) => {
+                // Includes the writer thread aborting this read after a write
+                // failure, so both halves agree the connection is over.
+                log::warn!("indexd pipe read ended: {e}");
+                return;
+            }
+        }
     }
-    Ok(avail)
+}
+
+/// Drain commands into the live connection for the life of the process.
+fn write_loop(client: Arc<PipeClient>, cmd_rx: Receiver<Cmd>) {
+    for cmd in cmd_rx {
+        let mut slot = client.lock_writer();
+        let Some(conn) = slot.as_mut() else {
+            continue; // disconnected: stale by definition
+        };
+        if conn.epoch != cmd.epoch {
+            continue; // queued for a connection that is gone
+        }
+        if let Err(e) = yspot_proto::write_msg(&mut conn.writer, &cmd.msg) {
+            log::warn!("indexd pipe write error: {e}");
+            // Wake the connection thread out of its read so it reconnects; it
+            // will clear this slot again, harmlessly.
+            client.connected.store(false, Ordering::SeqCst);
+            conn.writer.pipe().cancel_all();
+            *slot = None;
+        }
+    }
 }
 
 pub(crate) fn emit_conn_state(app: &AppHandle, connected: bool) {
@@ -239,62 +283,35 @@ pub(crate) fn emit_conn_state(app: &AppHandle, connected: bool) {
     }
 }
 
-/// Open the pipe per §4.1: explicit `CLIENT_PIPE_ACCESS` (never GENERIC_WRITE),
-/// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`; on `ERROR_PIPE_BUSY`
-/// wait 100 ms via `WaitNamedPipeW` and retry up to 5 times.
-fn connect_pipe() -> io::Result<File> {
-    let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut attempts = 0u32;
-    loop {
-        // SAFETY: `name` is a valid NUL-terminated UTF-16 string; all other
-        // arguments are plain values / null pointers permitted by the API.
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                yspot_proto::CLIENT_PIPE_ACCESS,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            // SAFETY: `handle` is a freshly opened, owned handle; ownership
-            // transfers to `File` exactly once.
-            return Ok(unsafe { File::from_raw_handle(handle as RawHandle) });
-        }
-        // SAFETY: trivially safe thread-local read.
-        let err = unsafe { GetLastError() };
-        if err == ERROR_PIPE_BUSY && attempts < 5 {
-            attempts += 1;
-            // SAFETY: same valid pipe name; 100 ms timeout per §4.1.
-            let _ = unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
-            continue;
-        }
-        return Err(io::Error::from_raw_os_error(err as i32));
-    }
-}
-
-fn connect_and_handshake() -> Result<File, String> {
-    let mut file = connect_pipe().map_err(|e| format!("connect: {e}"))?;
+/// §4.1 open + server verification (in `yspot-pipe`), then Hello/HelloAck —
+/// the first write on the pipe happens after the server has been verified.
+fn connect_and_handshake() -> Result<(PipeReader, PipeWriter), String> {
+    let conn = client::connect(PIPE_NAME).map_err(|e| format!("connect: {e}"))?;
+    let server = conn.server;
+    let (mut reader, mut writer) = conn.split().map_err(|e| format!("split: {e}"))?;
     let hello = Message::Hello {
         proto_min: PROTO_VERSION,
         proto_max: PROTO_VERSION,
         client: "yspot-shell".to_string(),
         pid: std::process::id(),
     };
-    yspot_proto::write_msg(&mut file, &hello).map_err(|e| format!("hello: {e}"))?;
-    match yspot_proto::read_msg(&mut file, MAX_FRAME_S2C) {
+    yspot_proto::write_msg(&mut writer, &hello).map_err(|e| format!("hello: {e}"))?;
+    match yspot_proto::read_msg(&mut reader, MAX_FRAME_S2C) {
         Ok(Some(Message::HelloAck {
             proto,
             service_version,
             index_epoch,
         })) => {
+            let owner = match server.owner {
+                ServerOwner::System => "SYSTEM".to_string(),
+                dev => format!("{dev:?} — DEV MODE, not the installed service"),
+            };
             log::info!(
-                "connected to yspot-indexd: proto {proto}, service {service_version}, epoch {index_epoch}"
+                "connected to yspot-indexd: proto {proto}, service {service_version}, epoch \
+                 {index_epoch}, server pid {}, pipe owner {owner}",
+                server.pid
             );
-            Ok(file)
+            Ok((reader, writer))
         }
         Ok(Some(Message::Error { code, message, .. })) => {
             Err(format!("handshake refused: code {code}: {message}"))
@@ -302,64 +319,6 @@ fn connect_and_handshake() -> Result<File, String> {
         Ok(Some(other)) => Err(format!("unexpected handshake reply: {other:?}")),
         Ok(None) => Err("pipe closed during handshake".to_string()),
         Err(e) => Err(format!("handshake read: {e}")),
-    }
-}
-
-/// The single owner of the pipe handle: drain queued commands (writes), then
-/// read whatever frames have arrived, then sleep briefly. Writes can never
-/// wait behind a blocked read because nothing here blocks — reads happen only
-/// after `PeekNamedPipe` says bytes are available. A partially-arrived frame
-/// makes `read_msg` block for the remainder, which is bounded by the service
-/// finishing a `write_msg` it has already started.
-fn pump_loop(app: &AppHandle, client: &PipeClient, cmd_rx: &Receiver<Message>, mut file: File) {
-    let mut idle = POLL_ACTIVE;
-    loop {
-        let mut active = false;
-
-        loop {
-            match cmd_rx.try_recv() {
-                Ok(msg) => {
-                    if let Err(e) = yspot_proto::write_msg(&mut file, &msg) {
-                        log::warn!("indexd pipe write error: {e}");
-                        return;
-                    }
-                    active = true;
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return,
-            }
-        }
-
-        loop {
-            match readable_bytes(&file) {
-                Ok(0) => break,
-                Ok(_) => match yspot_proto::read_msg(&mut file, MAX_FRAME_S2C) {
-                    Ok(Some(msg)) => {
-                        handle_msg(app, client, msg);
-                        active = true;
-                    }
-                    Ok(None) => {
-                        log::info!("indexd pipe closed by service");
-                        return;
-                    }
-                    Err(e) => {
-                        log::warn!("indexd pipe read error: {e}");
-                        return;
-                    }
-                },
-                Err(e) => {
-                    log::info!("indexd pipe gone: {e}");
-                    return;
-                }
-            }
-        }
-
-        if active {
-            idle = POLL_ACTIVE;
-        } else {
-            std::thread::sleep(idle);
-            idle = (idle * 2).min(POLL_IDLE_CAP);
-        }
     }
 }
 
@@ -463,5 +422,16 @@ mod tests {
         assert_eq!(v["gen"], 7);
         assert!(v["isFinal"].as_bool().unwrap());
         assert!(v.get("is_final").is_none());
+    }
+
+    #[test]
+    fn commands_are_refused_while_disconnected() {
+        let c = PipeClient::new();
+        assert!(c.search(1, "x".into()).is_err());
+        assert!(c.cancel_current().is_err());
+        assert!(c.request_status().is_err());
+        // The generation is still recorded, so stale-frame dropping works
+        // from the first reply after a reconnect.
+        assert_eq!(c.current_gen.load(Ordering::SeqCst), 1);
     }
 }

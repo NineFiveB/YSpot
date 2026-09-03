@@ -90,7 +90,10 @@ jobs:
       # search deadlocked (the synchronous-pipe bug found the day a real
       # client first connected). `probe` speaks the §4 protocol exactly as the
       # shell does: handshake, IndexStatus, SearchQuery → final SearchResults,
-      # so a service that cannot answer a search fails CI here.
+      # so a service that cannot answer a search fails CI here. `--burst 50`
+      # is the §4.4 supersession check (issue #9): 50 generations written
+      # before any is read must come back in order, ending with the last one —
+      # which requires the service to keep reading while it searches.
       - name: Walk-mode index + probe answers over the pipe
         shell: pwsh
         timeout-minutes: 10
@@ -117,7 +120,7 @@ jobs:
           # otherwise stall to the step timeout and skip every diagnostic
           # below. 124, in the timeout(1) tradition.
           $probe = Start-Process -FilePath "target/release/probe.exe" `
-            -ArgumentList "--iterations", "20" -PassThru -NoNewWindow
+            -ArgumentList "--iterations", "20", "--burst", "50" -PassThru -NoNewWindow
           if ($probe.WaitForExit(120000)) {
             $probeExit = $probe.ExitCode
           } else {

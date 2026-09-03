@@ -1,63 +1,25 @@
 //! Minimal blocking pipe client for the freshness and startup subcommands —
-//! the same §4.1 open sequence the shell and `probe` use, kept synchronous:
-//! one request, read until the reply, no background thread.
-
-use std::fs::File;
-use std::io;
-use std::os::windows::io::{FromRawHandle, RawHandle};
+//! the same §4.1 open sequence and server verification the shell and `probe`
+//! use (`yspot-pipe`), kept synchronous: one request, read until the reply,
+//! no background thread.
 
 use anyhow::{bail, Context, Result};
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-};
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+use yspot_pipe::Duplex;
 use yspot_proto::{
     Filters, Message, ResultItem, VolumeStatus, MAX_FRAME_S2C, PIPE_NAME, PROTO_VERSION,
 };
 
 pub struct Pipe {
-    file: File,
+    file: Duplex,
     next_id: u64,
     next_gen: u64,
 }
 
-fn open_pipe() -> io::Result<File> {
-    let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut attempts = 0u32;
-    loop {
-        // SAFETY: NUL-terminated pipe name; the remaining arguments are plain
-        // values or documented-null pointers.
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                yspot_proto::CLIENT_PIPE_ACCESS,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            // SAFETY: fresh owned handle, transferred exactly once.
-            return Ok(unsafe { File::from_raw_handle(handle as RawHandle) });
-        }
-        // SAFETY: trivially safe thread-local read.
-        let err = unsafe { GetLastError() };
-        if err == ERROR_PIPE_BUSY && attempts < 5 {
-            attempts += 1;
-            // SAFETY: same valid pipe name; 100 ms per §4.1.
-            let _ = unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
-            continue;
-        }
-        return Err(io::Error::from_raw_os_error(err as i32));
-    }
-}
-
 impl Pipe {
     pub fn connect() -> Result<Pipe> {
-        let mut file = open_pipe().context("open pipe (is yspot-indexd running?)")?;
+        let conn = yspot_pipe::client::connect(PIPE_NAME)
+            .context("open pipe (is yspot-indexd running?)")?;
+        let mut file = conn.duplex().context("split pipe")?;
         let hello = Message::Hello {
             proto_min: PROTO_VERSION,
             proto_max: PROTO_VERSION,

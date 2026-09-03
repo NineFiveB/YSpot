@@ -7,22 +7,14 @@ publish.workspace = true
 
 [dependencies]
 yspot-proto = { path = "../yspot-proto" }
+yspot-pipe = { path = "../yspot-pipe" }
 yspot-index = { path = "../yspot-index" }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
+# The pipe itself lives in yspot-pipe; the service only needs the error
+# constants it matches on at startup.
 [dependencies.windows-sys]
 workspace = true
-features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Pipes",
-    "Win32_Security",
-    "Win32_Security_Authorization",
-    "Win32_System_IO",
-    # LocalFree lives in Win32::Foundation in windows-sys 0.59; the Memory
-    # feature is a no-cost hedge in case the import needs to move.
-    "Win32_System_Memory",
-    "Win32_System_Threading",
-]
+features = ["Win32_Foundation"]

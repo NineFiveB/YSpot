@@ -4728,6 +4728,7 @@ dependencies = [
  "log",
  "windows-sys 0.59.0",
  "yspot-index",
+ "yspot-pipe",
  "yspot-proto",
 ]
 
@@ -4737,6 +4738,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "log",
+ "windows-sys 0.59.0",
+ "yspot-pipe",
+ "yspot-proto",
+]
+
+[[package]]
+name = "yspot-pipe"
+version = "0.1.0"
+dependencies = [
  "log",
  "windows-sys 0.59.0",
  "yspot-proto",
@@ -4764,6 +4775,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-global-shortcut",
  "windows-sys 0.59.0",
+ "yspot-pipe",
  "yspot-proto",
 ]
 

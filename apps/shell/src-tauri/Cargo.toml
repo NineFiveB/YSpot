@@ -33,6 +33,7 @@ serde_json = "1"
 log = { workspace = true }
 env_logger = { workspace = true }
 yspot-proto = { path = "../../../crates/yspot-proto" }
+yspot-pipe = { path = "../../../crates/yspot-pipe" }
 
 [dependencies.windows-sys]
 workspace = true

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/yspot-proto",
+    "crates/yspot-pipe",
     "crates/yspot-index",
     "crates/yspot-indexd",
     "apps/shell/src-tauri",

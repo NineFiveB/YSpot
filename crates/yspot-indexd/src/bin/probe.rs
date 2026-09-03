@@ -1,4 +1,4 @@
-//! Pipe-level latency probe — SPEC §10 M0 exit criteria.
+//! Pipe-level latency probe — SPEC §10 M0 exit criteria, and the CI client.
 //!
 //! The matcher benchmark (`yspot-index --bin bench`) measures the index in
 //! isolation: no pipe, no serialization, no service. §2.5's budget is stated
@@ -11,19 +11,21 @@
 //! does NOT cover: the frontend's rAF application, which only the shell's own
 //! HUD can report.
 //!
-//!   probe [--queries a,b,c] [--iterations N] [--max-results N]
+//! `--burst N` is the §4.4 supersession check (issue #9): N queries are
+//! written back-to-back before anything is read, the way a fast typist's
+//! keystrokes arrive, and the reply stream must end with the LAST generation's
+//! final batch, in generation order, with nothing from outside the burst. A
+//! service that could not read while searching answered every one of these
+//! in sequence; one that reads concurrently supersedes most of them before
+//! they start. Exit 3 when the check fails.
+//!
+//!   probe [--queries a,b,c] [--iterations N] [--max-results N] [--burst N]
 
-use std::fs::File;
-use std::io;
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::io::Write;
 use std::time::Instant;
 
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_PIPE_BUSY, INVALID_HANDLE_VALUE};
-use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, OPEN_EXISTING, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
-};
-use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
-
+use yspot_pipe::client::ServerOwner;
+use yspot_pipe::Duplex;
 use yspot_proto::{Filters, Message, MAX_FRAME_S2C, PIPE_NAME, PROTO_VERSION};
 
 const DEFAULT_QUERIES: &[&str] = &["re", "rep", "report", "cargo", "index", "zzqxjv"];
@@ -40,6 +42,9 @@ fn main() {
     let max_results: u32 = arg(&args, "--max-results")
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
+    let burst: u64 = arg(&args, "--burst")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let mut pipe = match connect_and_handshake() {
         Ok(p) => p,
@@ -64,6 +69,14 @@ fn main() {
         }
     }
 
+    let mut gen = 0u64;
+    if burst > 0 {
+        if let Err(e) = burst_check(&mut pipe, &mut gen, burst, max_results) {
+            eprintln!("probe: burst check FAILED: {e}");
+            std::process::exit(3);
+        }
+    }
+
     println!("YSpot pipe latency probe — SPEC §2.5 / §10 M0");
     println!("{}", "=".repeat(78));
     println!(
@@ -77,7 +90,6 @@ fn main() {
     );
     println!("{}", "-".repeat(78));
 
-    let mut gen = 0u64;
     let mut worst_p95 = 0f64;
     for q in &queries {
         // One warm-up so the first row is not paying for a cold connection.
@@ -135,23 +147,27 @@ fn arg(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
-/// One `SearchQuery` and the wait for its final batch, in microseconds.
-fn round_trip(
-    pipe: &mut File,
-    gen: u64,
-    text: &str,
-    max_results: u32,
-) -> Result<(f64, usize), String> {
-    let q = Message::SearchQuery {
+fn search_query(gen: u64, text: &str, max_results: u32) -> Message {
+    Message::SearchQuery {
         id: gen,
         gen,
         text: text.to_string(),
         scopes: Vec::new(),
         filters: Filters::default(),
         max_results,
-    };
+    }
+}
+
+/// One `SearchQuery` and the wait for its final batch, in microseconds.
+fn round_trip(
+    pipe: &mut Duplex,
+    gen: u64,
+    text: &str,
+    max_results: u32,
+) -> Result<(f64, usize), String> {
     let t0 = Instant::now();
-    yspot_proto::write_msg(pipe, &q).map_err(|e| e.to_string())?;
+    yspot_proto::write_msg(pipe, &search_query(gen, text, max_results))
+        .map_err(|e| e.to_string())?;
     let mut hits = 0usize;
     loop {
         match yspot_proto::read_msg(pipe, MAX_FRAME_S2C) {
@@ -173,8 +189,64 @@ fn round_trip(
     }
 }
 
-fn connect_and_handshake() -> Result<File, String> {
-    let mut pipe = connect_pipe().map_err(|e| format!("connect: {e}"))?;
+/// §4.4 supersession check: `n` generations written before any is read.
+fn burst_check(pipe: &mut Duplex, gen: &mut u64, n: u64, max_results: u32) -> Result<(), String> {
+    let first = *gen + 1;
+    let last = *gen + n;
+    *gen = last;
+    // Successive prefixes of one word, the way keystrokes arrive.
+    const WORD: &str = "repository";
+    let t0 = Instant::now();
+    for g in first..=last {
+        let text = &WORD[..1 + ((g - first) as usize % WORD.len())];
+        yspot_proto::write_msg(pipe, &search_query(g, text, max_results))
+            .map_err(|e| format!("write gen {g}: {e}"))?;
+    }
+    pipe.flush().map_err(|e| e.to_string())?;
+
+    let mut answered: Vec<u64> = Vec::new();
+    loop {
+        match yspot_proto::read_msg(pipe, MAX_FRAME_S2C) {
+            Ok(Some(Message::SearchResults { gen, is_final, .. })) => {
+                if gen < first || gen > last {
+                    return Err(format!("gen {gen} is outside the burst {first}..={last}"));
+                }
+                if answered.last().is_some_and(|&prev| gen <= prev) {
+                    return Err(format!(
+                        "batches out of generation order: {answered:?} then {gen}"
+                    ));
+                }
+                answered.push(gen);
+                if gen == last {
+                    if !is_final {
+                        return Err("last generation's batch was not final".into());
+                    }
+                    break;
+                }
+            }
+            Ok(Some(Message::Error { code, message, .. })) => {
+                return Err(format!("service error {code}: {message}"))
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => return Err("service closed the pipe mid-burst".into()),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    println!(
+        "burst ok: {n} queries written back-to-back; {} generation(s) answered, {} superseded; \
+         final gen {last} answered {:.1} ms after the first write",
+        answered.len(),
+        n - answered.len() as u64,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+    Ok(())
+}
+
+/// §4.1 open + server verification, then Hello/HelloAck.
+fn connect_and_handshake() -> Result<Duplex, String> {
+    let conn = yspot_pipe::client::connect(PIPE_NAME).map_err(|e| format!("connect: {e}"))?;
+    let server = conn.server;
+    let mut pipe = conn.duplex().map_err(|e| format!("split: {e}"))?;
     let hello = Message::Hello {
         proto_min: PROTO_VERSION,
         proto_max: PROTO_VERSION,
@@ -188,49 +260,19 @@ fn connect_and_handshake() -> Result<File, String> {
             service_version,
             index_epoch,
         })) => {
+            let owner = match server.owner {
+                ServerOwner::System => "SYSTEM".to_string(),
+                dev => format!("{dev:?} (dev mode)"),
+            };
             println!(
-                "connected: proto {proto}, service {service_version}, index epoch {index_epoch}"
+                "connected: proto {proto}, service {service_version}, index epoch {index_epoch}, \
+                 server pid {}, pipe owner {owner}",
+                server.pid
             );
             Ok(pipe)
         }
         Ok(Some(other)) => Err(format!("unexpected handshake reply: {other:?}")),
         Ok(None) => Err("service closed the pipe during handshake".into()),
         Err(e) => Err(format!("handshake: {e}")),
-    }
-}
-
-/// §4.1 client rules: explicit access rights (never `GENERIC_WRITE`, which
-/// carries `FILE_APPEND_DATA` and is refused by the pipe's DACL), identification
-/// SQOS, and a bounded `ERROR_PIPE_BUSY` retry.
-fn connect_pipe() -> io::Result<File> {
-    let name: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut attempts = 0u32;
-    loop {
-        // SAFETY: `name` is a valid NUL-terminated UTF-16 string; the remaining
-        // arguments are plain values and permitted null pointers.
-        let handle = unsafe {
-            CreateFileW(
-                name.as_ptr(),
-                yspot_proto::CLIENT_PIPE_ACCESS,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION,
-                std::ptr::null_mut(),
-            )
-        };
-        if handle != INVALID_HANDLE_VALUE {
-            // SAFETY: freshly opened owned handle; ownership moves once.
-            return Ok(unsafe { File::from_raw_handle(handle as RawHandle) });
-        }
-        // SAFETY: trivially safe thread-local read.
-        let err = unsafe { GetLastError() };
-        if err == ERROR_PIPE_BUSY && attempts < 5 {
-            attempts += 1;
-            // SAFETY: same valid pipe name; 100 ms per §4.1.
-            let _ = unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
-            continue;
-        }
-        return Err(io::Error::from_raw_os_error(err as i32));
     }
 }
