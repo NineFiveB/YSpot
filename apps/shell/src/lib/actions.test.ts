@@ -28,6 +28,27 @@ const fileRow = (): Row => ({
   path: "C:\\notes.txt",
 });
 
+const settingRow = (): Row => ({
+  kind: "setting",
+  key: "setting:ms-settings:display",
+  id: "ms-settings:display",
+  name: "Display",
+  subtitle: "Settings",
+  score: 1,
+  matchRanges: [],
+});
+
+const calcRow = (): Row => ({
+  kind: "calc",
+  key: "calc:result",
+  id: "calc",
+  name: "42",
+  subtitle: "Calculator — Enter copies",
+  score: 2,
+  matchRanges: [],
+  value: "42",
+});
+
 const chord = (key: string, mods: Partial<{ ctrlKey: boolean; shiftKey: boolean; altKey: boolean }> = {}) => ({
   key,
   ctrlKey: false,
@@ -48,6 +69,15 @@ describe("actionsFor", () => {
     const packaged = actionsFor(appRow("packaged")).map((a) => a.id);
     expect(win32).toContain("runas");
     expect(packaged).not.toContain("runas");
+  });
+
+  it("gives the calculator a copy action and settings an open action", () => {
+    // §7.7: Enter copies the answer — there is nothing to open.
+    expect(actionsFor(calcRow()).map((a) => a.id)).toEqual(["copy"]);
+    expect(actionsFor(settingRow()).map((a) => a.id)).toEqual(["open"]);
+    // Neither offers a destructive verb.
+    expect(actionsFor(calcRow()).some((a) => a.destructive)).toBe(false);
+    expect(actionsFor(settingRow()).some((a) => a.destructive)).toBe(false);
   });
 
   it("covers every §7.3 file verb", () => {
@@ -93,8 +123,17 @@ describe("shortcutAction", () => {
     expect(shortcutAction(fileRow(), chord("Enter", { ctrlKey: true }))).toBeNull();
   });
 
+  it("gives calculator and settings rows no chords at all", () => {
+    for (const row of [calcRow(), settingRow()]) {
+      for (const key of ["c", "e", "Enter"]) {
+        expect(shortcutAction(row, chord(key, { ctrlKey: true }))).toBeNull();
+        expect(shortcutAction(row, chord(key, { ctrlKey: true, shiftKey: true }))).toBeNull();
+      }
+    }
+  });
+
   it("only names actions the row actually offers", () => {
-    for (const row of [appRow("win32"), appRow("packaged"), fileRow()]) {
+    for (const row of [appRow("win32"), appRow("packaged"), fileRow(), settingRow(), calcRow()]) {
       const offered = new Set(actionsFor(row).map((a) => a.id));
       for (const key of ["c", "C", "e", "E", "Enter", "q"]) {
         for (const mods of [{ ctrlKey: true }, { ctrlKey: true, shiftKey: true }]) {

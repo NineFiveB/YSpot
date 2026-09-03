@@ -9,14 +9,17 @@
 
 mod apps;
 mod autostart;
+mod calc;
 mod com;
 mod etw_mark;
 mod file_actions;
 mod focus;
 mod frecency;
 mod icons;
+mod matcher;
 mod pipe_client;
 mod placement;
+mod settings_catalog;
 mod tray;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +30,7 @@ use frecency::Frecency;
 use icons::IconCache;
 use pipe_client::PipeClient;
 use serde::Serialize;
+use settings_catalog::SettingsCatalog;
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -148,48 +152,83 @@ fn dismiss(app: &AppHandle) {
 // ---------------------------------------------------------------------------
 // Commands (§4.6 subset).
 
-/// One generation's app results (§5.11: a shell-side catalog source, on
-/// screen in the same frame as the keystroke).
+/// One generation's shell-side answers (§5.11: catalog sources land in ~1 ms,
+/// ahead of the service's first batch, in the same frame as the keystroke).
+///
+/// One event rather than three: everything here is computed synchronously in
+/// the same command, so splitting it would only cost extra round trips and
+/// give the frontend more arrival orders to reason about.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct AppResults {
+struct ShellResults {
     gen: u64,
-    items: Vec<apps::AppMatch>,
+    apps: Vec<apps::AppMatch>,
+    settings: Vec<settings_catalog::SettingMatch>,
+    calc: Option<CalcRow>,
+}
+
+/// The calculator's answer row (§7.7): shown first, Enter copies it.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CalcRow {
+    display: String,
+    value: String,
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn search(
     app: AppHandle,
     pipe: tauri::State<'_, Arc<PipeClient>>,
     catalog: tauri::State<'_, Arc<AppCatalog>>,
+    settings: tauri::State<'_, Arc<SettingsCatalog>>,
     frec: tauri::State<'_, Arc<Frecency>>,
     gen: u64,
     text: String,
 ) -> Result<Accepted, String> {
     log::debug!("search cmd: gen={gen} text={text:?}");
-    // Apps first, and synchronously: matching a few hundred names is
-    // microseconds, and §5.11 expects catalog sources to land in ~1 ms —
-    // before the service's first batch, in the same animation frame as the
-    // keystroke that asked for them.
-    let mut items = apps::match_query(&catalog.snapshot(), &text, apps::MAX_APP_RESULTS);
-    for it in &mut items {
+    // The shell's own answers first, and synchronously: matching a few
+    // hundred names is microseconds and the calculator is a parse of one
+    // line, so all of it fits the §2.5 shell-routing share and lands in the
+    // same animation frame as the keystroke that asked for it.
+    let mut apps = apps::match_query(&catalog.snapshot(), &text, apps::MAX_APP_RESULTS);
+    for it in &mut apps {
         // §7.1: frecency reorders within a tier and can never lift a lower
         // tier above a higher one — the bonus is bounded under the tier gap.
         it.score += frec.bonus(&it.id);
     }
-    items.sort_by(|a, b| b.score.total_cmp(&a.score));
-    log::debug!(
-        "apps gen={gen}: {} match(es){}",
-        items.len(),
-        items
-            .first()
-            .map(|m| format!(", best {:?} {:.3}", m.name, m.score))
-            .unwrap_or_default()
-    );
-    if let Err(e) = app.emit("search:apps", AppResults { gen, items }) {
-        log::warn!("emit search:apps failed: {e}");
+    apps.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    let mut settings = settings.match_query(&text, settings_catalog::MAX_RESULTS);
+    for it in &mut settings {
+        it.score += frec.bonus(&it.id);
     }
-    // The service half is enqueued after, so a slow pipe cannot delay apps.
+    settings.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    let calc = calc::evaluate(&text).map(|r| CalcRow {
+        display: r.display,
+        value: r.copy,
+    });
+
+    log::debug!(
+        "shell gen={gen}: {} app(s), {} setting(s), calc={}",
+        apps.len(),
+        settings.len(),
+        calc.is_some()
+    );
+    if let Err(e) = app.emit(
+        "search:shell",
+        ShellResults {
+            gen,
+            apps,
+            settings,
+            calc,
+        },
+    ) {
+        log::warn!("emit search:shell failed: {e}");
+    }
+    // The service half is enqueued after, so a slow pipe cannot delay the
+    // rows the shell already has.
     pipe.search(gen, text).map_err(|e| {
         log::warn!("search cmd failed: {e}");
         e
@@ -331,10 +370,12 @@ fn m0_report(json: String) -> Result<(), String> {
 /// Every file action runs here, in the unelevated shell, never in the
 /// elevated service (§7.3).
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn execute_action(
     app: AppHandle,
     frec: tauri::State<'_, Arc<Frecency>>,
     catalog: tauri::State<'_, Arc<AppCatalog>>,
+    settings: tauri::State<'_, Arc<SettingsCatalog>>,
     kind: String,
     id: String,
     path: Option<String>,
@@ -345,7 +386,7 @@ fn execute_action(
     // step, not the end of the errand. Everything that hands the user to
     // another window dismisses first, so the launcher is not left floating
     // over what it just opened.
-    let stays_open = matches!(action.as_str(), "copy_path" | "copy_file");
+    let stays_open = matches!(action.as_str(), "copy_path" | "copy_file" | "copy");
     if !stays_open {
         // Dismissed BEFORE the action so focus lands on whatever the action
         // raises (§5.2 hands focus back to the previous foreground window,
@@ -362,6 +403,19 @@ fn execute_action(
             entry.and_then(|entry| {
                 apps::launch(&entry.aumid, entry.kind, action == "runas").map(|()| true)
             })
+        }
+        "setting" => {
+            let entry = settings
+                .find(&id)
+                .ok_or_else(|| format!("unknown settings entry {id}"))?;
+            settings_catalog::launch(entry).map(|()| true)
+        }
+        // §7.7: Enter copies the calculator's answer. The value travels in
+        // `path` because that is the field already carrying a row's payload;
+        // there is nothing on disk to open.
+        "calc" => {
+            let value = path.ok_or_else(|| "calc action needs a value".to_string())?;
+            file_actions::copy_text(&value).map(|()| false)
         }
         "file" => match path {
             None => Err("file action needs a path".to_string()),
@@ -415,7 +469,17 @@ fn get_status(pipe: tauri::State<'_, Arc<PipeClient>>) -> Result<(), String> {
 }
 
 /// `ShellExecuteW` with a null verb (default "open") and SW_SHOWNORMAL.
-fn shell_open(path: &str) -> Result<(), String> {
+pub(crate) fn shell_open(path: &str) -> Result<(), String> {
+    shell_execute_inner(path, None)
+}
+
+/// The same, with parameters — how §7.2 opens a Control Panel item
+/// (`control.exe /name Microsoft.<CanonicalName>`).
+pub(crate) fn shell_execute(file: &str, params: &str) -> Result<(), String> {
+    shell_execute_inner(file, Some(params))
+}
+
+fn shell_execute_inner(path: &str, params: Option<&str>) -> Result<(), String> {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
@@ -423,14 +487,17 @@ fn shell_open(path: &str) -> Result<(), String> {
         return Err("empty path".to_string());
     }
     let path_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: `path_w` is a valid NUL-terminated UTF-16 string; null hwnd,
-    // verb, parameters, and directory are all documented as permitted.
+    let params_w: Option<Vec<u16>> =
+        params.map(|p| p.encode_utf16().chain(std::iter::once(0)).collect());
+    // SAFETY: `path_w` and `params_w` are valid NUL-terminated UTF-16 strings
+    // that outlive the call; null hwnd, verb and directory are documented as
+    // permitted, as is a null parameter string.
     let inst = unsafe {
         ShellExecuteW(
             std::ptr::null_mut(),
             std::ptr::null(),
             path_w.as_ptr(),
-            std::ptr::null(),
+            params_w.as_ref().map_or(std::ptr::null(), |p| p.as_ptr()),
             std::ptr::null(),
             SW_SHOWNORMAL,
         )
@@ -499,6 +566,16 @@ pub fn run() {
         ])
         .setup(move |app| {
             pipe_client::spawn(app.handle().clone(), pipe.clone());
+
+            // §7.2: the catalog file ships beside the executable so it can be
+            // updated without a code release; the compiled-in copy is the
+            // floor when it is missing (a dev build, a test, a broken
+            // install). Gates are evaluated once, here.
+            let resource_dir = app.path().resource_dir().ok();
+            app.manage(SettingsCatalog::load(
+                resource_dir.as_deref(),
+                settings_catalog::probe_capabilities(),
+            ));
             // §7.1: first enumeration now, then every 30 minutes; a show
             // with a stale catalog triggers one too. All off-thread.
             catalog.refresh_async();

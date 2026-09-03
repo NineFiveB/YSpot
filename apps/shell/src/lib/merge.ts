@@ -23,10 +23,15 @@
 
 import type { Row } from "./ipc";
 
-/** Global-score order; apps win exact ties so a catalog hit leads. */
+/**
+ * Global-score order. On an exact tie a shell-side row (calculator, app,
+ * settings page) leads a file: the shell knows what those rows ARE, while a
+ * file that merely scores the same is a weaker claim on the top slot.
+ */
 export function byScore(a: Row, b: Row): number {
   if (b.score !== a.score) return b.score - a.score;
-  if (a.kind !== b.kind) return a.kind === "app" ? -1 : 1;
+  const shellSide = (r: Row): number => (r.kind === "file" ? 1 : 0);
+  if (shellSide(a) !== shellSide(b)) return shellSide(a) - shellSide(b);
   return a.name.localeCompare(b.name);
 }
 

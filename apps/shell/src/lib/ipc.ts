@@ -40,9 +40,34 @@ export interface AppItem {
   matchRanges: [number, number][];
 }
 
-export interface SearchAppsPayload {
+/** One Settings page or Control Panel item (§7.2). */
+export interface SettingItem {
+  id: string;
+  name: string;
+  /** "Settings" or "Control Panel" — the row's subtitle. */
+  group: string;
+  score: number;
+  matchRanges: [number, number][];
+}
+
+/** The calculator's answer (§7.7), when the query is an expression. */
+export interface CalcItem {
+  /** What the row shows, which may carry a unit or a base echo. */
+  display: string;
+  /** What Enter copies. */
+  value: string;
+}
+
+/**
+ * Everything the shell itself answers for one generation, in one event: all
+ * of it is computed synchronously in the `search` command, so splitting it
+ * would only add round trips and arrival orders to reason about.
+ */
+export interface SearchShellPayload {
   gen: number;
-  items: AppItem[];
+  apps: AppItem[];
+  settings: SettingItem[];
+  calc: CalcItem | null;
 }
 
 export interface IndexStatePayload {
@@ -56,6 +81,25 @@ export interface IndexStatePayload {
  * to across merges (§5.11).
  */
 export type Row =
+  | {
+      kind: "calc";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
+      value: string;
+    }
+  | {
+      kind: "setting";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
+    }
   | {
       kind: "app";
       key: string;
@@ -95,6 +139,35 @@ export function appRow(item: AppItem): Row {
   };
 }
 
+export function settingRow(item: SettingItem): Row {
+  return {
+    kind: "setting",
+    key: `setting:${item.id}`,
+    id: item.id,
+    name: item.name,
+    subtitle: item.group,
+    score: item.score,
+    matchRanges: item.matchRanges,
+  };
+}
+
+/**
+ * §7.7 puts the calculator's answer first, so it carries a score above every
+ * match tier rather than being special-cased in the merge.
+ */
+export function calcRow(item: CalcItem): Row {
+  return {
+    kind: "calc",
+    key: "calc:result",
+    id: "calc",
+    name: item.display,
+    subtitle: "Calculator — Enter copies",
+    score: 2,
+    matchRanges: [],
+    value: item.value,
+  };
+}
+
 export function fileRow(item: ResultItem): Row {
   const id = rowKey(item.id);
   return {
@@ -126,7 +199,9 @@ export function executeAction(row: Row, action = "open"): Promise<unknown> {
   return invoke("execute_action", {
     kind: row.kind,
     id: row.id,
-    path: row.kind === "file" ? row.path : null,
+    // `path` carries the row's payload: a file's path, or the calculator's
+    // value, which is what Enter copies (§7.7).
+    path: row.kind === "file" ? row.path : row.kind === "calc" ? row.value : null,
     action,
   });
 }
@@ -146,10 +221,10 @@ export function onSearchResults(
   return listen<SearchResultsPayload>("search:results", (e) => cb(e.payload));
 }
 
-export function onSearchApps(
-  cb: (payload: SearchAppsPayload) => void,
+export function onSearchShell(
+  cb: (payload: SearchShellPayload) => void,
 ): Promise<UnlistenFn> {
-  return listen<SearchAppsPayload>("search:apps", (e) => cb(e.payload));
+  return listen<SearchShellPayload>("search:shell", (e) => cb(e.payload));
 }
 
 export function onIndexState(

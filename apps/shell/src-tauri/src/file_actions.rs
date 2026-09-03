@@ -83,7 +83,13 @@ pub fn delete_to_recycle_bin(path: &str) -> Result<(), String> {
 
 /// Put the path on the clipboard as text (§7.3 "Copy Path").
 pub fn copy_path(path: &str) -> Result<(), String> {
-    let text = wide(path);
+    copy_text(path)
+}
+
+/// Put arbitrary text on the clipboard — what Enter does to a calculator
+/// answer (§7.7).
+pub fn copy_text(value: &str) -> Result<(), String> {
+    let text = wide(value);
     let bytes = std::mem::size_of_val(&text[..]);
     let mem = GlobalBlock::new(bytes)?;
     // SAFETY: the block is at least `bytes` long and locked for this write.

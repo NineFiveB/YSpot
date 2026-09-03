@@ -31,8 +31,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
-    "icon": ["icons/icon.ico"],
+    "targets": [
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
     "windows": {
       "signCommand": {
         "cmd": "powershell",
@@ -47,6 +52,9 @@
           "%1"
         ]
       }
-    }
+    },
+    "resources": [
+      "resources/settings-catalog.json"
+    ]
   }
 }

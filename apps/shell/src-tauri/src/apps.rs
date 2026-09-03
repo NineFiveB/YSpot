@@ -7,10 +7,9 @@
 //! AUMIDs only, no COM objects retained — rebuilt on a worker thread and
 //! swapped in atomically, so a keystroke never waits on enumeration.
 //!
-//! Matching is a small tiered scorer on the same scale as the file index
-//! (§3.4: exact 1.0, prefix 0.9, word start 0.8, initials 0.7, substring
-//! 0.55, subsequence 0.3–0.5), so the frontend can interleave apps and files
-//! by one global score (§5.11, §7.3).
+//! Matching goes through the shared [`crate::matcher`], which scores on the
+//! file index's own tier scale (§3.4), so the frontend can interleave apps,
+//! settings pages and files under one global score (§5.11, §7.3).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -30,6 +29,7 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::com::{take_cotaskmem_string, wide, Apartment};
+use crate::matcher::{self, Ranges, Target};
 
 /// `System.AppUserModel.ID` — the property key family `{9F4C2855-…}`.
 const PKEY_APPUSERMODEL_ID: PROPERTYKEY = PROPERTYKEY {
@@ -61,74 +61,20 @@ pub enum AppKind {
 pub struct AppEntry {
     pub aumid: String,
     pub name: String,
-    /// Case-folded name, one folded char per original char (see [`fold`]),
-    /// so a match position maps straight back to the display name.
-    folded: Vec<char>,
-    /// UTF-16 offset of each original char, plus the total, for §5.13 ranges.
-    utf16_offsets: Vec<u32>,
-    /// Char indexes where a segment starts (after a separator or at a camel
-    /// transition), for the word-start and initials tiers.
-    segment_starts: Vec<u32>,
+    target: Target,
     pub kind: AppKind,
 }
 
 impl AppEntry {
     pub fn new(aumid: String, name: String, kind: AppKind) -> AppEntry {
-        let folded: Vec<char> = name.chars().map(fold_char).collect();
-        let mut utf16_offsets = Vec::with_capacity(folded.len() + 1);
-        let mut off = 0u32;
-        for c in name.chars() {
-            utf16_offsets.push(off);
-            off += c.len_utf16() as u32;
-        }
-        utf16_offsets.push(off);
-        let segment_starts = segment_starts(&name);
         AppEntry {
+            target: Target::new(&name),
             aumid,
             name,
-            folded,
-            utf16_offsets,
-            segment_starts,
             kind,
         }
     }
 }
-
-/// One folded char per input char: lowercase, keeping only the first char of
-/// a multi-char expansion (`İ` → `i`), so positions stay aligned with the
-/// display name. The file index folds with full NFC + lowercase; app names
-/// are short and the difference is invisible for matching purposes.
-fn fold_char(c: char) -> char {
-    c.to_lowercase().next().unwrap_or(c)
-}
-
-fn is_sep(c: char) -> bool {
-    matches!(
-        c,
-        ' ' | '-' | '_' | '.' | '/' | '\\' | '(' | ')' | '&' | '+'
-    )
-}
-
-/// Segment starts by the same rule the index uses for initials: after a
-/// separator, and at a lower→upper camel transition.
-fn segment_starts(name: &str) -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut prev: Option<char> = None;
-    for (i, c) in name.chars().enumerate() {
-        let start = match prev {
-            None => !is_sep(c),
-            Some(p) => (is_sep(p) && !is_sep(c)) || (p.is_lowercase() && c.is_uppercase()),
-        };
-        if start {
-            out.push(i as u32);
-        }
-        prev = Some(c);
-    }
-    out
-}
-
-/// UTF-16 code-unit ranges into a display name (§5.13).
-type Ranges = Vec<(u32, u32)>;
 
 /// A scored app hit, in the shape the frontend row needs.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -142,94 +88,17 @@ pub struct AppMatch {
     pub match_ranges: Ranges,
 }
 
-/// Tier bases, identical to the index's (§3.4).
-const EXACT: f32 = 1.0;
-const PREFIX: f32 = 0.9;
-const WORD_START: f32 = 0.8;
-const INITIALS: f32 = 0.7;
-const SUBSTRING: f32 = 0.55;
-
-/// Score one entry against a folded query; `None` when it does not match.
-fn score_entry(e: &AppEntry, q: &[char]) -> Option<(f32, Ranges)> {
-    if q.is_empty() || e.folded.is_empty() {
-        return None;
-    }
-    let range = |start: usize, len: usize| -> (u32, u32) {
-        (e.utf16_offsets[start], e.utf16_offsets[start + len])
-    };
-    let n = e.folded.len();
-    // Contiguous occurrences, first one per tier is enough.
-    let mut first_sub: Option<usize> = None;
-    let mut first_word: Option<usize> = None;
-    if q.len() <= n {
-        for start in 0..=n - q.len() {
-            if e.folded[start..start + q.len()] == *q {
-                if first_sub.is_none() {
-                    first_sub = Some(start);
-                }
-                if e.segment_starts.contains(&(start as u32)) {
-                    first_word = Some(start);
-                    break;
-                }
-            }
-        }
-    }
-    if first_sub == Some(0) {
-        let base = if q.len() == n { EXACT } else { PREFIX };
-        return Some((base, vec![range(0, q.len())]));
-    }
-    if let Some(s) = first_word {
-        return Some((WORD_START, vec![range(s, q.len())]));
-    }
-    // Initials: the query is a prefix of the segment-initial sequence.
-    if q.len() >= 2 && q.len() <= e.segment_starts.len() {
-        let ok = e
-            .segment_starts
-            .iter()
-            .zip(q)
-            .all(|(&s, &qc)| e.folded[s as usize] == qc);
-        if ok {
-            let ranges = e.segment_starts[..q.len()]
-                .iter()
-                .map(|&s| range(s as usize, 1))
-                .collect();
-            return Some((INITIALS, ranges));
-        }
-    }
-    if let Some(s) = first_sub {
-        return Some((SUBSTRING, vec![range(s, q.len())]));
-    }
-    // Subsequence (fuzzy), 3+ chars like the index: density = qlen / span.
-    if q.len() >= 3 {
-        let mut positions = Vec::with_capacity(q.len());
-        let mut qi = 0;
-        for (i, &c) in e.folded.iter().enumerate() {
-            if qi < q.len() && c == q[qi] {
-                positions.push(i);
-                qi += 1;
-            }
-        }
-        if qi == q.len() {
-            let span = positions[q.len() - 1] - positions[0] + 1;
-            let density = q.len() as f32 / span as f32;
-            let ranges = positions.iter().map(|&p| range(p, 1)).collect();
-            return Some((0.3 + 0.2 * density, ranges));
-        }
-    }
-    None
-}
-
 /// Match `query` against the catalog: best `max` entries by score, ties by
 /// name. Pure and allocation-light — it runs inside the `search` command on
 /// every keystroke (§5.11: catalog sources answer in ~1 ms).
 pub fn match_query(entries: &[AppEntry], query: &str, max: usize) -> Vec<AppMatch> {
-    let q: Vec<char> = query.trim().chars().map(fold_char).collect();
+    let q = matcher::fold_query(query);
     if q.is_empty() || max == 0 {
         return Vec::new();
     }
     let mut hits: Vec<(f32, &AppEntry, Ranges)> = entries
         .iter()
-        .filter_map(|e| score_entry(e, &q).map(|(s, r)| (s, e, r)))
+        .filter_map(|e| matcher::score(&e.target, &q).map(|(s, r)| (s, e, r)))
         .collect();
     hits.sort_by(|a, b| {
         b.0.total_cmp(&a.0)
@@ -495,41 +364,6 @@ mod tests {
 
     fn entry(name: &str) -> AppEntry {
         AppEntry::new(format!("aumid:{name}"), name.to_string(), AppKind::Win32)
-    }
-
-    fn best(name: &str, q: &str) -> Option<(f32, Ranges)> {
-        let e = entry(name);
-        let qc: Vec<char> = q.chars().map(fold_char).collect();
-        score_entry(&e, &qc)
-    }
-
-    #[test]
-    fn tiers_in_order() {
-        assert_eq!(best("Notepad", "notepad").unwrap().0, EXACT);
-        assert_eq!(best("Notepad", "note").unwrap().0, PREFIX);
-        assert_eq!(best("Visual Studio Code", "code").unwrap().0, WORD_START);
-        assert_eq!(best("Visual Studio Code", "vsc").unwrap().0, INITIALS);
-        assert_eq!(best("Notepad", "tep").unwrap().0, SUBSTRING);
-        let (s, r) = best("Visual Studio Code", "vslc").unwrap();
-        assert!(s > 0.3 && s < 0.5, "fuzzy {s}");
-        assert_eq!(r.len(), 4);
-        assert!(best("Notepad", "xyz").is_none());
-        assert!(best("Notepad", "").is_none());
-    }
-
-    #[test]
-    fn ranges_are_utf16_and_track_the_display_name() {
-        let (_, r) = best("Visual Studio Code", "code").unwrap();
-        assert_eq!(r, vec![(14, 18)]);
-        let (_, r) = best("Visual Studio Code", "vsc").unwrap();
-        assert_eq!(r, vec![(0, 1), (7, 8), (14, 15)]);
-        // A supplementary-plane char is two UTF-16 units.
-        let (s, r) = best("𝄞 Music", "music").unwrap();
-        assert_eq!(s, WORD_START);
-        assert_eq!(r, vec![(3, 8)]);
-        // Camel transitions start segments; case folds.
-        assert_eq!(best("PowerToys", "toys").unwrap().0, WORD_START);
-        assert_eq!(best("PowerToys", "PT").unwrap().0, INITIALS);
     }
 
     #[test]

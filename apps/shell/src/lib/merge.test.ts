@@ -96,6 +96,46 @@ describe("selectionIndex", () => {
   });
 });
 
+describe("byScore with shell-side rows", () => {
+  const calc = (): Row => ({
+    kind: "calc",
+    key: "calc:result",
+    id: "calc",
+    name: "42",
+    subtitle: "Calculator",
+    score: 2,
+    matchRanges: [],
+    value: "42",
+  });
+  const setting = (name: string, score: number): Row => ({
+    kind: "setting",
+    key: `setting:${name}`,
+    id: name,
+    name,
+    subtitle: "Settings",
+    score,
+    matchRanges: [],
+  });
+
+  it("puts the calculator answer first (§7.7)", () => {
+    const rows = mergeRows({
+      apps: [calc(), app("Display Driver", 1.0)],
+      files: [file("display.txt", 1.0)],
+      frozen: null,
+    });
+    expect(rows[0].kind).toBe("calc");
+  });
+
+  it("breaks an exact tie for the shell side over a file", () => {
+    const rows = mergeRows({
+      apps: [setting("Display", 0.9)],
+      files: [file("Display", 0.9)],
+      frozen: null,
+    });
+    expect(rows[0].kind).toBe("setting");
+  });
+});
+
 describe("byScore", () => {
   it("is a total order: score, then app-before-file, then name", () => {
     expect(byScore(app("A", 1), file("b", 0.5))).toBeLessThan(0);

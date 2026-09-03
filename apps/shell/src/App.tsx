@@ -33,6 +33,7 @@ const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 /** Everything one generation has produced so far. */
 interface GenState {
   gen: number;
+  /** Everything the shell answered: calculator, apps, settings pages. */
   apps: ipc.Row[];
   files: ipc.Row[];
   /** Display order frozen at the moment the user moved the selection (§5.11). */
@@ -66,7 +67,7 @@ export default function App(): ReactElement {
   // the rAF below, so a burst of arrivals costs one render.
   const stateRef = useRef<GenState>(emptyGen(0));
   const filesBufferRef = useRef<ipc.SearchResultsPayload[]>([]);
-  const appsBufferRef = useRef<ipc.SearchAppsPayload[]>([]);
+  const shellBufferRef = useRef<ipc.SearchShellPayload[]>([]);
   const rafRef = useRef<number | null>(null);
   const keydownTsRef = useRef<number | null>(null);
   // §10 M0 non-injecting self-measurement: gen → resolver, fulfilled when that
@@ -88,12 +89,18 @@ export default function App(): ReactElement {
     rafRef.current = null;
     const cur = genRef.current;
     const st = stateRef.current;
-    const apps = appsBufferRef.current.filter((p) => p.gen === cur);
+    const shell = shellBufferRef.current.filter((p) => p.gen === cur);
     const files = filesBufferRef.current.filter((p) => p.gen === cur);
-    appsBufferRef.current = [];
+    shellBufferRef.current = [];
     filesBufferRef.current = [];
-    if (apps.length === 0 && files.length === 0) return;
-    for (const p of apps) st.apps = p.items.map(ipc.appRow);
+    if (shell.length === 0 && files.length === 0) return;
+    for (const p of shell) {
+      st.apps = [
+        ...(p.calc ? [ipc.calcRow(p.calc)] : []),
+        ...p.apps.map(ipc.appRow),
+        ...p.settings.map(ipc.settingRow),
+      ];
+    }
     // Service batches are strictly rank-descending — append-only (§5.11 r1).
     files.sort((a, b) => a.seq - b.seq);
     for (const p of files) st.files.push(...p.items.map(ipc.fileRow));
@@ -152,9 +159,9 @@ export default function App(): ReactElement {
       }),
     );
     track(
-      ipc.onSearchApps((payload) => {
+      ipc.onSearchShell((payload) => {
         if (payload.gen !== genRef.current) return;
-        appsBufferRef.current.push(payload);
+        shellBufferRef.current.push(payload);
         scheduleApply();
       }),
     );
@@ -202,7 +209,7 @@ export default function App(): ReactElement {
     (text: string): number => {
       const gen = ++genRef.current;
       stateRef.current = emptyGen(gen);
-      appsBufferRef.current = [];
+      shellBufferRef.current = [];
       filesBufferRef.current = [];
       // Selection resets to row 0 only here — on a generation change (§5.11).
       setRows([]);
@@ -419,12 +426,12 @@ export default function App(): ReactElement {
 
   const selClamped = clampSel(selected);
   const selectedItem = rows[selClamped];
-  const appCount = rows.filter((r) => r.kind === "app").length;
+  const shellCount = rows.filter((r) => r.kind !== "file").length;
   const hud = [
     lat.last !== null ? `${lat.last.toFixed(1)} ms` : "– ms",
     `p50 ${lat.p50 !== null ? lat.p50.toFixed(1) : "–"}`,
     `p95 ${lat.p95 !== null ? lat.p95.toFixed(1) : "–"}`,
-    `${rows.length} results (${appCount} apps)`,
+    `${rows.length} results (${shellCount} from the shell)`,
     connected ? "indexd: connected" : "indexd: offline",
   ].join(" · ");
 
