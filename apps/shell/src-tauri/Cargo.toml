@@ -34,6 +34,9 @@ log = { workspace = true }
 env_logger = { workspace = true }
 yspot-proto = { path = "../../../crates/yspot-proto" }
 yspot-pipe = { path = "../../../crates/yspot-pipe" }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Graphics_Gdi", "Win32_System_Threading", "Win32_System_Registry", "Win32_UI_WindowsAndMessaging"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+png = "0.18.1"
 
 [dependencies.windows-sys]
 workspace = true

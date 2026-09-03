@@ -38,6 +38,13 @@ jobs:
           npm ci
           npm run build
 
+      # The §5.11 merge/selection contract is normative and its failure mode
+      # is silent (rows reordering under the user's cursor, selection quietly
+      # pointing at a different item), so it has unit tests of its own.
+      - name: Frontend tests
+        working-directory: apps/shell
+        run: npm test
+
       - name: Formatting
         run: cargo fmt --all --check
 

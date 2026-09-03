@@ -97,11 +97,45 @@ body {
   height: 48px;
   padding: 6px 16px;
   display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  contain: strict;
+  border-left: 2px solid transparent;
+}
+
+/* Fixed box whether or not the icon has arrived, so a late icon never
+   reflows the row (§5.10: a missing icon renders a placeholder). */
+.row-icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.row-icon img {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+}
+
+.row-icon-app:empty::before,
+.row-icon-app > :not(img)::before {
+  content: "";
+}
+
+.row-icon-file {
+  display: none;
+}
+
+.row-text {
+  min-width: 0;
+  display: flex;
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  contain: strict;
-  border-left: 2px solid transparent;
 }
 
 .row:hover {

@@ -1,8 +1,10 @@
-// YSpot launcher frontend — M0 (SPEC.md §5.6, §5.7, §5.10 subset).
+// YSpot launcher frontend (SPEC.md §5.6, §5.7, §5.10, §5.11, §7.1).
 //
 // One query input that always holds focus; per-keystroke generation counter;
 // stale-generation results dropped; batches applied at most once per
-// animation frame; latency HUD as the M0 measurement instrument.
+// animation frame; apps (shell catalog, ~1 ms) and files (service, ~10 ms)
+// merged by global score under the §5.11 selection contract; latency HUD as
+// the M0 measurement instrument.
 
 import {
   useCallback,
@@ -15,6 +17,7 @@ import {
 } from "react";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
 import * as ipc from "./lib/ipc";
+import { mergeRows, selectionIndex } from "./lib/merge";
 import {
   markApplied,
   markKeydown,
@@ -25,9 +28,28 @@ import { noteHidden, noteShown, startThrottleProbe } from "./lib/throttle";
 
 const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 
+/** Everything one generation has produced so far. */
+interface GenState {
+  gen: number;
+  apps: ipc.Row[];
+  files: ipc.Row[];
+  /** Display order frozen at the moment the user moved the selection (§5.11). */
+  frozen: ipc.Row[] | null;
+  /** Stable key the selection is stuck to, or null while it sits on row 0. */
+  selectedKey: string | null;
+}
+
+const emptyGen = (gen: number): GenState => ({
+  gen,
+  apps: [],
+  files: [],
+  frozen: null,
+  selectedKey: null,
+});
+
 export default function App(): ReactElement {
   const [query, setQuery] = useState("");
-  const [items, setItems] = useState<ipc.ResultItem[]>([]);
+  const [rows, setRows] = useState<ipc.Row[]>([]);
   const [selected, setSelected] = useState(0);
   const [generation, setGeneration] = useState(0);
   const [connected, setConnected] = useState(false);
@@ -36,7 +58,11 @@ export default function App(): ReactElement {
   const inputRef = useRef<HTMLInputElement>(null);
   const genRef = useRef(0);
   const appliedGenRef = useRef(0);
-  const bufferRef = useRef<ipc.SearchResultsPayload[]>([]);
+  // Per-generation accumulation; mutated off the render path and committed in
+  // the rAF below, so a burst of arrivals costs one render.
+  const stateRef = useRef<GenState>(emptyGen(0));
+  const filesBufferRef = useRef<ipc.SearchResultsPayload[]>([]);
+  const appsBufferRef = useRef<ipc.SearchAppsPayload[]>([]);
   const rafRef = useRef<number | null>(null);
   const keydownTsRef = useRef<number | null>(null);
   // §10 M0 non-injecting self-measurement: gen → resolver, fulfilled when that
@@ -46,44 +72,56 @@ export default function App(): ReactElement {
     new Map(),
   );
 
-  // Apply buffered result batches at most once per animation frame (§5.10).
+  /** Recompute the display list and selection from the generation state. */
+  const commit = useCallback((st: GenState) => {
+    const merged = mergeRows(st);
+    setRows(merged);
+    setSelected(selectionIndex(merged, st.selectedKey));
+  }, []);
+
+  // Apply buffered arrivals at most once per animation frame (§5.10).
   const applyBuffered = useCallback(() => {
     rafRef.current = null;
     const cur = genRef.current;
-    const fresh = bufferRef.current.filter((p) => p.gen === cur);
-    bufferRef.current = [];
-    if (fresh.length === 0) return;
-    fresh.sort((a, b) => a.seq - b.seq);
+    const st = stateRef.current;
+    const apps = appsBufferRef.current.filter((p) => p.gen === cur);
+    const files = filesBufferRef.current.filter((p) => p.gen === cur);
+    appsBufferRef.current = [];
+    filesBufferRef.current = [];
+    if (apps.length === 0 && files.length === 0) return;
+    for (const p of apps) st.apps = p.items.map(ipc.appRow);
+    // Service batches are strictly rank-descending — append-only (§5.11 r1).
+    files.sort((a, b) => a.seq - b.seq);
+    for (const p of files) st.files.push(...p.items.map(ipc.fileRow));
+    commit(st);
     const isNewGen = appliedGenRef.current !== cur;
-    setItems((prev) => {
-      // Service batches are strictly rank-descending — append-only (§5.11).
-      const base = isNewGen ? [] : prev.slice();
-      for (const p of fresh) base.push(...p.items);
-      return base;
-    });
     if (isNewGen) {
       appliedGenRef.current = cur;
-      // Selection resets only on generation change, never on append (§5.7).
-      setSelected(0);
       setGeneration(cur);
     }
-    const applied = markApplied(cur);
-    if (applied !== null) setLat(statsSnapshot());
-    // §10 M0 harness endpoint: this rAF committed `cur`'s results. The final
-    // flag says whether the committed set includes the generation's final
-    // batch — the harness pairs `applied gen=N final=1` with the results
-    // marker of the same generation, so a partial-batch commit can never be
-    // mistaken for the completed one if batching ever appears (M0 sends
-    // exactly one final batch, so today this is always 1).
-    const sawFinal = fresh.some((p) => p.isFinal);
-    ipc.m0Mark(`applied gen=${cur} final=${sawFinal ? 1 : 0}`);
-    // Fulfil a self-measurement waiter for this generation.
-    const resolve = measureResolversRef.current.get(cur);
-    if (resolve) {
-      measureResolversRef.current.delete(cur);
-      resolve(applied);
+    // §2.5's endpoint is the SERVICE's results reaching the frontend, so the
+    // measurement fires on the frame that commits them. Apps land a frame or
+    // two earlier (shell catalog, ~1 ms) and deliberately do not consume the
+    // pending keydown mark: `markApplied` is one-shot per generation, so an
+    // apps-only frame taking it would leave the frame that actually applied
+    // the service results with nothing to report.
+    if (files.length > 0) {
+      const applied = markApplied(cur);
+      if (applied !== null) setLat(statsSnapshot());
+      // §10 M0 harness endpoint. The final flag says whether the committed
+      // set includes the generation's final batch — the harness pairs
+      // `applied gen=N final=1` with the results marker of the same
+      // generation, so a partial-batch commit can never be mistaken for the
+      // completed one.
+      const sawFinal = files.some((p) => p.isFinal);
+      ipc.m0Mark(`applied gen=${cur} final=${sawFinal ? 1 : 0}`);
+      const resolve = measureResolversRef.current.get(cur);
+      if (resolve) {
+        measureResolversRef.current.delete(cur);
+        resolve(applied);
+      }
     }
-  }, []);
+  }, [commit]);
 
   const scheduleApply = useCallback(() => {
     if (rafRef.current === null) {
@@ -105,7 +143,14 @@ export default function App(): ReactElement {
       ipc.onSearchResults((payload) => {
         // Drop stale generations before buffering (§4.4, §5.10).
         if (payload.gen !== genRef.current) return;
-        bufferRef.current.push(payload);
+        filesBufferRef.current.push(payload);
+        scheduleApply();
+      }),
+    );
+    track(
+      ipc.onSearchApps((payload) => {
+        if (payload.gen !== genRef.current) return;
+        appsBufferRef.current.push(payload);
         scheduleApply();
       }),
     );
@@ -146,6 +191,25 @@ export default function App(): ReactElement {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
+  const startGeneration = useCallback(
+    (text: string): number => {
+      const gen = ++genRef.current;
+      stateRef.current = emptyGen(gen);
+      appsBufferRef.current = [];
+      filesBufferRef.current = [];
+      // Selection resets to row 0 only here — on a generation change (§5.11).
+      setRows([]);
+      setSelected(0);
+      appliedGenRef.current = gen;
+      setGeneration(gen);
+      void ipc.search(gen, text).catch((err) => {
+        console.warn("search invoke failed", err);
+      });
+      return gen;
+    },
+    [],
+  );
+
   // §10 M0 non-injecting self-measurement. Drives one real search generation
   // and resolves with keydown→results-applied ms (or null on timeout/no
   // results). Same path a keystroke takes — markKeydown, the pipe round trip,
@@ -154,7 +218,7 @@ export default function App(): ReactElement {
   const measureOne = useCallback(
     (text: string) =>
       new Promise<number | null>((resolve) => {
-        const gen = ++genRef.current;
+        const gen = genRef.current + 1;
         markKeydown(gen, performance.now());
         const timer = window.setTimeout(() => {
           if (measureResolversRef.current.delete(gen)) resolve(null);
@@ -163,14 +227,9 @@ export default function App(): ReactElement {
           window.clearTimeout(timer);
           resolve(ms);
         });
-        void ipc.search(gen, text).catch(() => {
-          if (measureResolversRef.current.delete(gen)) {
-            window.clearTimeout(timer);
-            resolve(null);
-          }
-        });
+        startGeneration(text);
       }),
-    [],
+    [startGeneration],
   );
 
   // First frame rendered → tell the shell the renderer is warm (§5.4).
@@ -184,9 +243,7 @@ export default function App(): ReactElement {
 
   // §10 M0 non-injecting self-measurement, driven entirely in-page: if the
   // shell was started with a spec (`queries;iterations`), warm up, then time
-  // each query prefix's keydown→results-applied and report. Each prefix is one
-  // sample, bucketed by length — the shape `yspot-m0 type` produces, but with
-  // no OS input injection, no ETW session, and no window focus needed.
+  // each query prefix's keydown→results-applied and report.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
@@ -219,47 +276,50 @@ export default function App(): ReactElement {
     };
   }, [measureOne]);
 
-  const resetResults = useCallback((gen: number) => {
-    appliedGenRef.current = gen;
-    bufferRef.current = [];
-    setItems([]);
-    setSelected(0);
-    setGeneration(gen);
-  }, []);
-
   function handleChange(e: ChangeEvent<HTMLInputElement>): void {
     const text = e.target.value;
     setQuery(text);
-    const gen = ++genRef.current;
-    if (text === "") {
-      // Empty query: clear locally, but still dispatch — the higher gen
-      // cancels the previous query's in-flight work service-side (§4.4),
-      // and an empty text yields an empty final batch.
-      resetResults(gen);
-      void ipc.search(gen, "").catch(() => {});
-      return;
+    if (text !== "") {
+      markKeydown(genRef.current + 1, keydownTsRef.current ?? performance.now());
     }
-    markKeydown(gen, keydownTsRef.current ?? performance.now());
     keydownTsRef.current = null;
-    void ipc.search(gen, text).catch((err) => {
-      console.warn("search invoke failed", err);
-    });
+    // An empty query still dispatches: the higher generation cancels the
+    // previous query's in-flight work service-side (§4.4), and an empty text
+    // yields an empty final batch and no app matches.
+    startGeneration(text);
   }
 
-  const maxIndex = Math.max(0, items.length - 1);
+  const maxIndex = Math.max(0, rows.length - 1);
   const clampSel = (i: number): number => Math.max(0, Math.min(i, maxIndex));
-  const selClamped = clampSel(selected);
+
+  /** Arrow/page keys: move the selection and stick it to that row (§5.11). */
+  const moveSelection = useCallback(
+    (delta: number) => {
+      setSelected((prev) => {
+        const next = Math.max(0, Math.min(prev + delta, Math.max(0, rows.length - 1)));
+        const st = stateRef.current;
+        const row = rows[next];
+        if (row) {
+          st.selectedKey = row.key;
+          // Freeze what is on screen: from here, late arrivals append below
+          // rather than reorder around the user's cursor (§5.11 rule 3).
+          st.frozen = rows;
+        }
+        return next;
+      });
+    },
+    [rows],
+  );
 
   const activateIndex = useCallback(
-    (index: number) => {
-      const item = items[index];
-      if (item) {
-        void ipc.executeAction(item.path).catch((err) => {
-          console.warn("executeAction failed", err);
-        });
-      }
+    (index: number, action: "open" | "runas" = "open") => {
+      const row = rows[index];
+      if (!row) return;
+      void ipc.executeAction(row, action).catch((err) => {
+        console.warn("executeAction failed", err);
+      });
     },
-    [items],
+    [rows],
   );
   // Stable identity for memoized rows: rows must not re-render just because
   // the items array (and thus this closure) was replaced (§5.6).
@@ -275,30 +335,35 @@ export default function App(): ReactElement {
     switch (e.key) {
       case "ArrowDown":
         e.preventDefault();
-        setSelected((s) => clampSel(s + 1));
+        moveSelection(1);
         break;
       case "ArrowUp":
         e.preventDefault();
-        setSelected((s) => clampSel(s - 1));
+        moveSelection(-1);
         break;
       case "PageDown":
         e.preventDefault();
-        setSelected((s) => clampSel(s + PAGE_ROWS));
+        moveSelection(PAGE_ROWS);
         break;
       case "PageUp":
         e.preventDefault();
-        setSelected((s) => clampSel(s - PAGE_ROWS));
+        moveSelection(-PAGE_ROWS);
         break;
-      case "Enter":
+      case "Enter": {
         e.preventDefault();
-        activateIndex(selClamped);
+        // Ctrl+Enter is the secondary action: run as administrator, which
+        // §7.1 offers for Win32 apps only.
+        const row = rows[clampSel(selected)];
+        const admin = e.ctrlKey && row?.kind === "app" && row.appKind === "win32";
+        activateIndex(clampSel(selected), admin ? "runas" : "open");
         break;
+      }
       case "Escape":
         e.preventDefault();
         if (query !== "") {
           // Esc clears a non-empty query; only an empty query dismisses (§5.7).
           setQuery("");
-          resetResults(++genRef.current);
+          startGeneration("");
         } else {
           void ipc.hideWindow().catch(() => undefined);
         }
@@ -308,12 +373,14 @@ export default function App(): ReactElement {
     }
   }
 
-  const selectedItem = items[selClamped];
+  const selClamped = clampSel(selected);
+  const selectedItem = rows[selClamped];
+  const appCount = rows.filter((r) => r.kind === "app").length;
   const hud = [
     lat.last !== null ? `${lat.last.toFixed(1)} ms` : "– ms",
     `p50 ${lat.p50 !== null ? lat.p50.toFixed(1) : "–"}`,
     `p95 ${lat.p95 !== null ? lat.p95.toFixed(1) : "–"}`,
-    `${items.length} results`,
+    `${rows.length} results (${appCount} apps)`,
     connected ? "indexd: connected" : "indexd: offline",
   ].join(" · ");
 
@@ -325,24 +392,22 @@ export default function App(): ReactElement {
           className="query-input"
           type="text"
           value={query}
-          placeholder="Search files…"
+          placeholder="Search apps and files…"
           spellCheck={false}
           autoComplete="off"
           autoCorrect="off"
           autoCapitalize="off"
           autoFocus
           role="combobox"
-          aria-expanded={items.length > 0}
+          aria-expanded={rows.length > 0}
           aria-controls="results-listbox"
-          aria-activedescendant={
-            selectedItem ? `row-${ipc.rowKey(selectedItem.id)}` : undefined
-          }
+          aria-activedescendant={selectedItem ? `row-${selectedItem.key}` : undefined}
           onChange={handleChange}
           onKeyDown={handleKeyDown}
         />
       </div>
       <ResultsList
-        items={items}
+        items={rows}
         selected={selClamped}
         generation={generation}
         onActivate={onActivate}

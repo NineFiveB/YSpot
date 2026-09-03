@@ -1,8 +1,9 @@
-// Typed wrappers over the Tauri IPC bridge — SPEC.md §4.6, M0 subset.
+// Typed wrappers over the Tauri IPC bridge — SPEC.md §4.6.
 //
 // The shell relays indexd `SearchResults` pipe frames as `search:results`
-// events; FRNs travel as decimal strings because a u64 exceeds the JS
-// safe-integer range (2^53).
+// events and answers the same generation's app matches as `search:apps`;
+// FRNs travel as decimal strings because a u64 exceeds the JS safe-integer
+// range (2^53).
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -29,14 +30,83 @@ export interface SearchResultsPayload {
   items: ResultItem[];
 }
 
+/** One app match from the shell's §7.1 `AppsFolder` catalog. */
+export interface AppItem {
+  /** AppUserModelID — the stable row id for apps (§5.6). */
+  id: string;
+  name: string;
+  kind: "packaged" | "win32";
+  score: number;
+  matchRanges: [number, number][];
+}
+
+export interface SearchAppsPayload {
+  gen: number;
+  items: AppItem[];
+}
+
 export interface IndexStatePayload {
   connected?: boolean;
   [key: string]: unknown;
 }
 
-/** Stable row key (§5.6): `volumeIdx:frn`. */
+/**
+ * One row of the merged result list. `kind` selects the provider; `key` is
+ * the stable, provider-scoped row id of §5.6, and is what selection sticks
+ * to across merges (§5.11).
+ */
+export type Row =
+  | {
+      kind: "app";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
+      appKind: "packaged" | "win32";
+    }
+  | {
+      kind: "file";
+      key: string;
+      id: string;
+      name: string;
+      subtitle: string;
+      score: number;
+      matchRanges: [number, number][];
+      path: string;
+    };
+
+/** Stable row key for a file (§5.6): `volumeIdx:frn`. */
 export function rowKey(id: ResultId): string {
   return `${id.volumeIdx}:${id.frn}`;
+}
+
+export function appRow(item: AppItem): Row {
+  return {
+    kind: "app",
+    key: `app:${item.id}`,
+    id: item.id,
+    name: item.name,
+    subtitle: item.kind === "packaged" ? "App" : "Application",
+    score: item.score,
+    matchRanges: item.matchRanges,
+    appKind: item.kind,
+  };
+}
+
+export function fileRow(item: ResultItem): Row {
+  const id = rowKey(item.id);
+  return {
+    kind: "file",
+    key: `file:${id}`,
+    id,
+    name: item.name,
+    subtitle: item.path,
+    score: item.score,
+    matchRanges: item.matchRanges,
+    path: item.path,
+  };
 }
 
 export function search(gen: number, text: string): Promise<unknown> {
@@ -51,8 +121,22 @@ export function frontendReady(): Promise<unknown> {
   return invoke("frontend_ready");
 }
 
-export function executeAction(path: string): Promise<unknown> {
-  return invoke("execute_action", { path });
+/** §4.6 `executeAction` on the selected row. */
+export function executeAction(
+  row: Row,
+  action: "open" | "runas" = "open",
+): Promise<unknown> {
+  return invoke("execute_action", {
+    kind: row.kind,
+    id: row.id,
+    path: row.kind === "file" ? row.path : null,
+    action,
+  });
+}
+
+/** §7.1 icon for an app row, as a PNG data URI. Off the query path (§5.10). */
+export function appIcon(id: string, px: number): Promise<string> {
+  return invoke<string>("app_icon", { id, px });
 }
 
 export function getStatus(): Promise<unknown> {
@@ -63,6 +147,12 @@ export function onSearchResults(
   cb: (payload: SearchResultsPayload) => void,
 ): Promise<UnlistenFn> {
   return listen<SearchResultsPayload>("search:results", (e) => cb(e.payload));
+}
+
+export function onSearchApps(
+  cb: (payload: SearchAppsPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<SearchAppsPayload>("search:apps", (e) => cb(e.payload));
 }
 
 export function onIndexState(

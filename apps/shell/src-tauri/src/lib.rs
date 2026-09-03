@@ -1,19 +1,27 @@
-//! YSpot shell — Tauri v2 host (SPEC.md §5), M0 subset:
+//! YSpot shell — Tauri v2 host (SPEC.md §5):
 //! Alt+Space toggle via the global-shortcut plugin (RegisterHotKey on
 //! Windows, §5.1), §5.3 placement, §5.2 focus model, indexd pipe client,
-//! and the §4.6 command surface.
+//! the §7.1 app catalog, the §7.1 per-user frecency store, and the §4.6
+//! command surface.
 //!
-//! Deferred to M1: single-instance mutex + show forwarding (§5.5), tray
+//! Still deferred: single-instance mutex + show forwarding (§5.5), tray
 //! icon, hotkey conflict dialog and rebinding UI (§5.1), autostart (§5.4).
 
+mod apps;
+mod com;
 mod etw_mark;
 mod focus;
+mod frecency;
+mod icons;
 mod pipe_client;
 mod placement;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use apps::AppCatalog;
+use frecency::Frecency;
+use icons::IconCache;
 use pipe_client::PipeClient;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
@@ -58,6 +66,14 @@ fn show(app: &AppHandle) {
     let Some(window) = app.get_webview_window("launcher") else {
         return;
     };
+    // §7.1: a catalog older than five minutes is refreshed when the popup
+    // shows. Asynchronous by contract — enumeration must never block the
+    // results pipeline — so this show uses the current snapshot.
+    if let Some(catalog) = app.try_state::<Arc<AppCatalog>>() {
+        if catalog.is_stale() {
+            catalog.refresh_async();
+        }
+    }
     // §5.2 step 1: record the foreground window before we take focus.
     focus::remember_foreground();
     // §5.3: recompute placement on every show.
@@ -129,18 +145,68 @@ fn dismiss(app: &AppHandle) {
 // ---------------------------------------------------------------------------
 // Commands (§4.6 subset).
 
+/// One generation's app results (§5.11: a shell-side catalog source, on
+/// screen in the same frame as the keystroke).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct AppResults {
+    gen: u64,
+    items: Vec<apps::AppMatch>,
+}
+
 #[tauri::command]
 fn search(
+    app: AppHandle,
     pipe: tauri::State<'_, Arc<PipeClient>>,
+    catalog: tauri::State<'_, Arc<AppCatalog>>,
+    frec: tauri::State<'_, Arc<Frecency>>,
     gen: u64,
     text: String,
 ) -> Result<Accepted, String> {
     log::debug!("search cmd: gen={gen} text={text:?}");
+    // Apps first, and synchronously: matching a few hundred names is
+    // microseconds, and §5.11 expects catalog sources to land in ~1 ms —
+    // before the service's first batch, in the same animation frame as the
+    // keystroke that asked for them.
+    let mut items = apps::match_query(&catalog.snapshot(), &text, apps::MAX_APP_RESULTS);
+    for it in &mut items {
+        // §7.1: frecency reorders within a tier and can never lift a lower
+        // tier above a higher one — the bonus is bounded under the tier gap.
+        it.score += frec.bonus(&it.id);
+    }
+    items.sort_by(|a, b| b.score.total_cmp(&a.score));
+    log::debug!(
+        "apps gen={gen}: {} match(es){}",
+        items.len(),
+        items
+            .first()
+            .map(|m| format!(", best {:?} {:.3}", m.name, m.score))
+            .unwrap_or_default()
+    );
+    if let Err(e) = app.emit("search:apps", AppResults { gen, items }) {
+        log::warn!("emit search:apps failed: {e}");
+    }
+    // The service half is enqueued after, so a slow pipe cannot delay apps.
     pipe.search(gen, text).map_err(|e| {
         log::warn!("search cmd failed: {e}");
         e
     })?;
     Ok(Accepted { accepted: true })
+}
+
+/// §7.1 icon extraction, off the query path: the frontend asks per visible
+/// row and renders a placeholder until this resolves (§5.10).
+#[tauri::command]
+async fn app_icon(
+    cache: tauri::State<'_, Arc<IconCache>>,
+    id: String,
+    px: i32,
+) -> Result<String, String> {
+    let cache = cache.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cache.app_icon(&id, px))
+        .await
+        .map_err(|e| format!("icon task: {e}"))?
+        .map(|uri| uri.to_string())
 }
 
 #[tauri::command]
@@ -251,9 +317,40 @@ fn m0_report(json: String) -> Result<(), String> {
     Ok(())
 }
 
+/// §4.6 `executeAction`: run an action on a result.
+///
+/// `kind` selects the provider (`"app"` or `"file"`), `id` is that
+/// provider's stable id (§5.6: AUMID for apps, `volumeIdx:frn` for files),
+/// and `action` is `"open"` or `"runas"`. Files carry their path because the
+/// shell holds no file catalog of its own — the service's row is the record.
 #[tauri::command]
-fn execute_action(app: AppHandle, path: String) -> Result<(), String> {
-    shell_open(&path)?;
+fn execute_action(
+    app: AppHandle,
+    frec: tauri::State<'_, Arc<Frecency>>,
+    catalog: tauri::State<'_, Arc<AppCatalog>>,
+    kind: String,
+    id: String,
+    path: Option<String>,
+    action: Option<String>,
+) -> Result<(), String> {
+    let action = action.unwrap_or_else(|| "open".to_string());
+    match kind.as_str() {
+        "app" => {
+            let entries = catalog.snapshot();
+            let entry = entries
+                .iter()
+                .find(|e| e.aumid == id)
+                .ok_or_else(|| format!("unknown app {id}"))?;
+            apps::launch(&entry.aumid, entry.kind, action == "runas")?;
+            frec.record(&id, "app");
+        }
+        "file" => {
+            let path = path.ok_or_else(|| "file action needs a path".to_string())?;
+            shell_open(&path)?;
+            frec.record(&id, "file");
+        }
+        other => return Err(format!("unknown result kind {other}")),
+    }
     dismiss(&app);
     Ok(())
 }
@@ -301,6 +398,9 @@ pub fn run() {
     etw_mark::init();
 
     let pipe = Arc::new(PipeClient::new());
+    let catalog = AppCatalog::new();
+    let frec = Frecency::open();
+    let icon_cache = IconCache::new();
 
     tauri::Builder::default()
         .plugin(
@@ -314,12 +414,16 @@ pub fn run() {
                 .build(),
         )
         .manage(pipe.clone())
+        .manage(catalog.clone())
+        .manage(frec)
+        .manage(icon_cache)
         .manage(WarmState::default())
         .invoke_handler(tauri::generate_handler![
             search,
             hide_window,
             frontend_ready,
             execute_action,
+            app_icon,
             get_status,
             m0_mark,
             m0_report,
@@ -327,6 +431,10 @@ pub fn run() {
         ])
         .setup(move |app| {
             pipe_client::spawn(app.handle().clone(), pipe.clone());
+            // §7.1: first enumeration now, then every 30 minutes; a show
+            // with a stale catalog triggers one too. All off-thread.
+            catalog.refresh_async();
+            catalog.spawn_periodic();
 
             match app.global_shortcut().register(alt_space()) {
                 Ok(()) => log::info!("registered Alt+Space (RegisterHotKey via plugin, §5.1)"),

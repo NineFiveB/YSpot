@@ -1,7 +1,7 @@
 // Virtualized results list (SPEC.md §5.6, §5.10): fixed 48 px rows, windowed
 // rendering from index math only (no DOM measurement), memoized rows keyed by
-// the stable `volumeIdx:frn` id, <mark> highlights from UTF-16 code-unit
-// ranges sliced directly off `name` (§5.13).
+// the stable provider-scoped id (§5.6), <mark> highlights from UTF-16
+// code-unit ranges sliced directly off `name` (§5.13).
 
 import {
   memo,
@@ -11,12 +11,63 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
-import { rowKey, type ResultItem } from "../lib/ipc";
+import { appIcon, type Row } from "../lib/ipc";
 
 export const ROW_HEIGHT = 48;
 /** 480 logical-px window minus the 64 px query bar — a constant, never a DOM read (§5.10). */
 export const LIST_HEIGHT = 416;
 const OVERSCAN = 5;
+/** Logical icon size of §7.1; the shell scales it by the monitor's DPI. */
+const ICON_LOGICAL_PX = 32;
+
+/**
+ * Process-wide icon cache: app id → data URI, or null once extraction has
+ * failed (so a broken icon is asked for once, not once per mount). Icons are
+ * immutable for the life of the process, which is what makes a plain Map the
+ * right cache here (§5.10: off the critical path, placeholder until loaded).
+ */
+const iconCache = new Map<string, string | null>();
+const iconWaiters = new Map<string, Set<(uri: string | null) => void>>();
+
+function requestIcon(id: string, px: number, cb: (uri: string | null) => void): () => void {
+  const cached = iconCache.get(id);
+  if (cached !== undefined) {
+    cb(cached);
+    return () => undefined;
+  }
+  let waiters = iconWaiters.get(id);
+  if (!waiters) {
+    waiters = new Set();
+    iconWaiters.set(id, waiters);
+    void appIcon(id, px)
+      .then((uri) => finishIcon(id, uri))
+      .catch(() => finishIcon(id, null));
+  }
+  waiters.add(cb);
+  return () => {
+    waiters?.delete(cb);
+  };
+}
+
+function finishIcon(id: string, uri: string | null): void {
+  iconCache.set(id, uri);
+  const waiters = iconWaiters.get(id);
+  iconWaiters.delete(id);
+  if (waiters) for (const w of waiters) w(uri);
+}
+
+function useIcon(row: Row): string | null {
+  const id = row.kind === "app" ? row.id : null;
+  const [uri, setUri] = useState<string | null>(() =>
+    id ? (iconCache.get(id) ?? null) : null,
+  );
+  useEffect(() => {
+    if (!id) return;
+    const px = Math.round(ICON_LOGICAL_PX * (window.devicePixelRatio || 1));
+    return requestIcon(id, px, setUri);
+  }, [id]);
+  return uri;
+}
 
 function renderHighlighted(
   name: string,
@@ -39,37 +90,43 @@ function renderHighlighted(
 }
 
 interface RowProps {
-  item: ResultItem;
+  item: Row;
   index: number;
   top: number;
   isSelected: boolean;
   onActivate: (index: number) => void;
 }
 
-const Row = memo(function Row({
+const ResultRow = memo(function ResultRow({
   item,
   index,
   top,
   isSelected,
   onActivate,
 }: RowProps): ReactElement {
+  const icon = useIcon(item);
   return (
     <div
-      id={`row-${rowKey(item.id)}`}
+      id={`row-${item.key}`}
       role="option"
       aria-selected={isSelected}
       className={isSelected ? "row row-selected" : "row"}
       style={{ transform: `translateY(${top}px)` }}
       onClick={() => onActivate(index)}
     >
-      <div className="row-name">{renderHighlighted(item.name, item.matchRanges)}</div>
-      <div className="row-path">{item.path}</div>
+      <div className={`row-icon row-icon-${item.kind}`} aria-hidden="true">
+        {icon ? <img src={icon} alt="" width={ICON_LOGICAL_PX} height={ICON_LOGICAL_PX} /> : null}
+      </div>
+      <div className="row-text">
+        <div className="row-name">{renderHighlighted(item.name, item.matchRanges)}</div>
+        <div className="row-path">{item.subtitle}</div>
+      </div>
     </div>
   );
 });
 
 interface ResultsListProps {
-  items: ResultItem[];
+  items: Row[];
   selected: number;
   /** Bumps when a new generation's results are first applied — resets scroll. */
   generation: number;
@@ -119,8 +176,8 @@ export function ResultsList({
   for (let i = first; i < last; i++) {
     const item = items[i];
     rows.push(
-      <Row
-        key={rowKey(item.id)}
+      <ResultRow
+        key={item.key}
         item={item}
         index={i}
         top={i * ROW_HEIGHT}
