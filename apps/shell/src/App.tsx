@@ -21,6 +21,7 @@ import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
 import { actionsFor, shortcutAction } from "./lib/actions";
 import * as ipc from "./lib/ipc";
+import { announceText } from "./lib/announce";
 import { mergeRows, selectionIndex } from "./lib/merge";
 import {
   markApplied,
@@ -65,6 +66,8 @@ export default function App(): ReactElement {
   const [connected, setConnected] = useState(false);
   /** §9.5's unobtrusive hint, or §3.1's "not searchable" notice. */
   const [fallbackNote, setFallbackNote] = useState<string | null>(null);
+  /** §5.12's polite live region, set only when a generation settles. */
+  const [announcement, setAnnouncement] = useState("");
   const [panelOpen, setPanelOpen] = useState(false);
   // §5.7's navigation stack, one level deep for now: the results list, or a
   // view opened in place. Esc pops back.
@@ -85,6 +88,8 @@ export default function App(): ReactElement {
   const shellBufferRef = useRef<ipc.SearchShellPayload[]>([]);
   const rafRef = useRef<number | null>(null);
   const keydownTsRef = useRef<number | null>(null);
+  /** The live query, for the announcement built inside the rAF callback. */
+  const queryRef = useRef("");
   // §10 M0 non-injecting self-measurement: gen → resolver, fulfilled when that
   // generation's results are applied in a rAF. Lets a driver time the real
   // keydown→results-applied path without any OS input injection.
@@ -99,6 +104,7 @@ export default function App(): ReactElement {
     const merged = mergeRows(st);
     setRows(merged);
     setSelected(selectionIndex(merged, st.selectedKey));
+    return merged;
   }, []);
 
   // Apply buffered arrivals at most once per animation frame (§5.10).
@@ -126,7 +132,7 @@ export default function App(): ReactElement {
     files.sort((a, b) => a.seq - b.seq);
     for (const p of files) st.files.push(...p.items.map(ipc.fileRow));
     for (const p of fallback) st.files.push(...p.items.map(ipc.fallbackFileRow));
-    commit(st);
+    const merged = commit(st);
     const isNewGen = appliedGenRef.current !== cur;
     if (isNewGen) {
       appliedGenRef.current = cur;
@@ -148,6 +154,12 @@ export default function App(): ReactElement {
       // completed one.
       const sawFinal = files.some((p) => p.isFinal);
       ipc.m0Mark(`applied gen=${cur} final=${sawFinal ? 1 : 0}`);
+      // §5.12: announce the SETTLED set, not every batch. A reader saying
+      // "1 result… 8 results… 23 results" for one keystroke is worse than
+      // one that says nothing.
+      if (sawFinal) {
+        setAnnouncement(announceText(queryRef.current, merged));
+      }
       const resolve = measureResolversRef.current.get(cur);
       if (resolve) {
         measureResolversRef.current.delete(cur);
@@ -361,6 +373,7 @@ export default function App(): ReactElement {
   function handleChange(e: ChangeEvent<HTMLInputElement>): void {
     const text = e.target.value;
     setQuery(text);
+    queryRef.current = text;
     if (text !== "") {
       markKeydown(genRef.current + 1, keydownTsRef.current ?? performance.now());
     }
@@ -482,6 +495,7 @@ export default function App(): ReactElement {
         if (query !== "") {
           // Esc clears a non-empty query; only an empty query dismisses (§5.7).
           setQuery("");
+          queryRef.current = "";
           startGeneration("");
         } else {
           void ipc.hideWindow().catch(() => undefined);
@@ -525,6 +539,7 @@ export default function App(): ReactElement {
           className="query-input"
           type="text"
           value={query}
+          aria-label="Search apps, files, settings and windows"
           placeholder="Search apps and files…"
           spellCheck={false}
           autoComplete="off"
@@ -545,6 +560,10 @@ export default function App(): ReactElement {
         generation={generation}
         onActivate={onActivate}
       />
+      {/* §5.12: result-count changes announced politely, off-screen. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {announcement}
+      </div>
       {fallbackNote ? <div className="fallback-note">{fallbackNote}</div> : null}
       <div className="hud" aria-hidden="true">
         {hud}
