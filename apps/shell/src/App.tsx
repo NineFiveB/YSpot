@@ -16,6 +16,7 @@ import {
   type ReactElement,
 } from "react";
 import Clipboard from "./Clipboard";
+import Onboarding from "./Onboarding";
 import Settings from "./Settings";
 import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
@@ -37,6 +38,7 @@ const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 const SEARCH_HEIGHT = 480;
 const SETTINGS_HEIGHT = 620;
 const CLIPBOARD_HEIGHT = 600;
+const ONBOARDING_HEIGHT = 520;
 
 /** Everything one generation has produced so far. */
 interface GenState {
@@ -71,7 +73,9 @@ export default function App(): ReactElement {
   const [panelOpen, setPanelOpen] = useState(false);
   // §5.7's navigation stack, one level deep for now: the results list, or a
   // view opened in place. Esc pops back.
-  const [view, setView] = useState<"search" | "settings" | "clipboard">("search");
+  const [view, setView] = useState<"search" | "settings" | "clipboard" | "onboarding">(
+    "search",
+  );
   const inSettings = view !== "search";
   const [lat, setLat] = useState<LatencySnapshot>(statsSnapshot());
 
@@ -222,6 +226,7 @@ export default function App(): ReactElement {
     );
     track(ipc.onOpenSettingsView(() => setView("settings")));
     track(ipc.onOpenClipboardView(() => setView("clipboard")));
+    track(ipc.onOpenOnboardingView(() => setView("onboarding")));
     track(ipc.onViewReset(() => setView("search")));
     track(
       ipc.onWindowShown(() => {
@@ -255,7 +260,9 @@ export default function App(): ReactElement {
         ? SETTINGS_HEIGHT
         : view === "clipboard"
           ? CLIPBOARD_HEIGHT
-          : SEARCH_HEIGHT;
+          : view === "onboarding"
+            ? ONBOARDING_HEIGHT
+            : SEARCH_HEIGHT;
     void ipc.setLauncherHeight(height).catch(() => undefined);
     void ipc.setInView(view !== "search").catch(() => undefined);
   }, [view]);
@@ -524,6 +531,8 @@ export default function App(): ReactElement {
       <div className="app">
         {view === "settings" ? (
           <Settings onClose={closeView} />
+        ) : view === "onboarding" ? (
+          <Onboarding onClose={closeView} />
         ) : (
           <Clipboard onClose={closeView} />
         )}

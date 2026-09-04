@@ -432,6 +432,29 @@ export function setAutostart(enabled: boolean): Promise<unknown> {
   return invoke("set_autostart", { enabled });
 }
 
+/** What §5.9's first-run wizard needs to report truthfully. */
+export interface OnboardingState {
+  hotkey: Hotkey;
+  hotkeyError: string | null;
+  service_connected: boolean;
+  autostart: boolean;
+  crash_reports: boolean;
+}
+
+export function onboardingState(): Promise<OnboardingState> {
+  return invoke<OnboardingState>("onboarding_state");
+}
+
+/** Records that onboarding happened, so it is shown once (§5.9). */
+export function finishOnboarding(): Promise<unknown> {
+  return invoke("finish_onboarding");
+}
+
+/** The shell asking the launcher to show first-run onboarding (§5.9). */
+export function onOpenOnboardingView(cb: () => void): Promise<UnlistenFn> {
+  return listen("view:onboarding", () => cb());
+}
+
 /** §5.9's log export: open the folder the logs and dumps live in. */
 export function openDiagnosticsFolder(): Promise<unknown> {
   return invoke("open_diagnostics_folder");

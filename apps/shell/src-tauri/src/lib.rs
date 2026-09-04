@@ -711,6 +711,52 @@ fn clipboard_set_enabled(clip: tauri::State<'_, Arc<ClipboardStore>>, enabled: b
     clip.set_enabled(enabled);
 }
 
+/// What first-run onboarding needs to tell the truth about this machine
+/// (§5.9): whether the hotkey took, whether the service is there, and what
+/// the current consents are.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnboardingState {
+    hotkey: settings::Hotkey,
+    /// Set when the chord could not be registered — §5.1's conflict flow.
+    hotkey_error: Option<String>,
+    /// Whether the index service is answering. §5.9's step 2 is consent to
+    /// install it; until the service MSI exists there is nothing to launch,
+    /// so the wizard reports the state and offers the skip path.
+    service_connected: bool,
+    autostart: bool,
+    crash_reports: bool,
+}
+
+#[tauri::command]
+fn onboarding_state(
+    store: tauri::State<'_, Arc<SettingsStore>>,
+    pipe: tauri::State<'_, Arc<PipeClient>>,
+) -> OnboardingState {
+    let settings = store.get();
+    OnboardingState {
+        hotkey_error: settings.hotkey.rejection().map(str::to_string),
+        hotkey: settings.hotkey,
+        service_connected: pipe.is_connected(),
+        autostart: autostart::is_enabled(),
+        crash_reports: settings.diagnostics.crash_reports,
+    }
+}
+
+/// §5.9: finishing the wizard records that it happened, so it is shown once.
+#[tauri::command]
+fn finish_onboarding(
+    app: AppHandle,
+    store: tauri::State<'_, Arc<SettingsStore>>,
+) -> Result<(), String> {
+    let mut next = store.get();
+    next.onboarded = true;
+    store.save(next)?;
+    log::info!("onboarding complete (§5.9)");
+    let _ = app.emit("view:reset", ());
+    Ok(())
+}
+
 /// §5.9 Settings: the current settings plus what the UI needs to render
 /// them honestly (whether autostart is really on, what the hotkey warns
 /// about).
@@ -977,6 +1023,8 @@ pub fn run() {
             get_settings,
             save_settings,
             open_settings,
+            onboarding_state,
+            finish_onboarding,
             clipboard_list,
             clipboard_paste,
             clipboard_delete,
@@ -1030,11 +1078,20 @@ pub fn run() {
             }
             diagnostics::rotate_dumps();
 
-            // `yspot.exe --settings` opens the Settings window directly, for
-            // a shortcut or a script; the launcher itself stays hidden.
+            // `yspot.exe --settings` opens Settings directly, for a shortcut
+            // or a script; the launcher itself stays hidden.
             if std::env::args().any(|a| a == "--settings") {
                 if let Err(e) = show_settings(app.handle()) {
                     log::error!("could not open Settings: {e}");
+                }
+            }
+
+            // §5.9 first run. Not when started hidden by autostart: a window
+            // appearing unbidden at logon is exactly what --hidden promises
+            // it will not do, so the wizard waits for the first summon.
+            if !app.state::<Arc<SettingsStore>>().get().onboarded && !autostart::started_hidden() {
+                if let Err(e) = show_view(app.handle(), "view:onboarding") {
+                    log::error!("could not open onboarding: {e}");
                 }
             }
 

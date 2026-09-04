@@ -152,6 +152,12 @@ pub struct Settings {
     pub theme: Theme,
     #[serde(default)]
     pub diagnostics: Diagnostics,
+    /// Whether first-run onboarding has been completed (§5.9). Absent in a
+    /// file written before onboarding existed, which reads as `false` — so
+    /// an existing install sees the wizard once, which is the right answer:
+    /// it is where consent for autostart and diagnostics is actually given.
+    #[serde(default)]
+    pub onboarded: bool,
     /// Everything this build does not know about, kept so a newer build's
     /// settings survive a round trip through an older one.
     #[serde(flatten)]
@@ -295,6 +301,15 @@ mod tests {
         let win = with(|h| h.win = true);
         assert!(win.rejection().is_none());
         assert!(win.warning().is_some());
+    }
+
+    #[test]
+    fn onboarding_has_not_happened_until_it_says_so() {
+        assert!(!Settings::default().onboarded);
+        // A file from before the flag existed also reads as "not yet".
+        let older: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(!older.onboarded);
+        assert_eq!(older.theme, Theme::Dark);
     }
 
     #[test]
