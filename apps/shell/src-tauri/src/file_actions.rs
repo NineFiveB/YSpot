@@ -179,13 +179,40 @@ impl Drop for GlobalBlock {
     }
 }
 
+/// Holds the clipboard open for as long as it lives.
+///
+/// The clipboard is a machine-wide singleton with no owner but the thread that
+/// opened it, so a path that opens and does not close wedges it for every other
+/// program on the desktop until this process exits. A guard rather than a
+/// matched pair of calls, because the ways to skip the second call — an early
+/// `?`, an `unwrap`, an assertion, a panic unwinding from anywhere in between —
+/// are all invisible at the call site and none of them is a compile error.
+struct ClipboardOpen;
+
+impl ClipboardOpen {
+    fn acquire() -> Result<Self, String> {
+        // SAFETY: no owner window; the Drop below is what balances this.
+        unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard: {e}"))?;
+        Ok(ClipboardOpen)
+    }
+}
+
+impl Drop for ClipboardOpen {
+    fn drop(&mut self) {
+        // SAFETY: balances the OpenClipboard in `acquire`, on every path out
+        // including an unwind.
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
 /// Replace the clipboard contents with one format. On success the clipboard
 /// owns the memory; on failure this frees it.
 fn set_clipboard(format: u32, mem: GlobalBlock) -> Result<(), String> {
-    // SAFETY: no owner window; paired with CloseClipboard on every path.
-    unsafe { OpenClipboard(None) }.map_err(|e| format!("OpenClipboard: {e}"))?;
+    let _open = ClipboardOpen::acquire()?;
     // SAFETY: the clipboard is open and owned by this thread.
-    let result = unsafe {
+    unsafe {
         EmptyClipboard()
             .map_err(|e| format!("EmptyClipboard: {e}"))
             .and_then(|()| {
@@ -198,12 +225,7 @@ fn set_clipboard(format: u32, mem: GlobalBlock) -> Result<(), String> {
                         format!("SetClipboardData: {e}")
                     })
             })
-    };
-    // SAFETY: balances OpenClipboard on both the success and failure paths.
-    unsafe {
-        let _ = CloseClipboard();
-    };
-    result
+    }
 }
 
 /// These exercise the real clipboard and the real Recycle Bin, so they are
@@ -244,19 +266,22 @@ mod tests {
         let p = temp_file("copy-path.txt");
         let path = p.to_string_lossy().to_string();
         copy_path(&path).expect("copy path");
-        // SAFETY: open, read the format we just set, close.
-        let read = unsafe {
-            OpenClipboard(None).unwrap();
-            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).unwrap();
-            let ptr = GlobalLock(HGLOBAL(h.0)) as *const u16;
-            let mut n = 0usize;
-            while *ptr.add(n) != 0 {
-                n += 1;
+        let read = {
+            // The `unwrap` below is exactly why this is a guard: a clipboard
+            // left open by a failing test wedges every later one.
+            let _open = ClipboardOpen::acquire().expect("open clipboard");
+            // SAFETY: the clipboard is open; we read the format just set.
+            unsafe {
+                let h = GetClipboardData(CF_UNICODETEXT.0 as u32).unwrap();
+                let ptr = GlobalLock(HGLOBAL(h.0)) as *const u16;
+                let mut n = 0usize;
+                while *ptr.add(n) != 0 {
+                    n += 1;
+                }
+                let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
+                let _ = GlobalUnlock(HGLOBAL(h.0));
+                s
             }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
-            let _ = GlobalUnlock(HGLOBAL(h.0));
-            let _ = CloseClipboard();
-            s
         };
         assert_eq!(read, path);
         let _ = std::fs::remove_file(&p);
@@ -272,24 +297,27 @@ mod tests {
         let p = temp_file("copy-file.txt");
         let path = p.to_string_lossy().to_string();
         copy_file(&path).expect("copy file");
-        // SAFETY: as above; the layout is the one `copy_file` wrote.
-        let (offset, wide_flag, names) = unsafe {
-            OpenClipboard(None).unwrap();
-            let h = GetClipboardData(CF_HDROP.0 as u32).unwrap();
-            let base = GlobalLock(HGLOBAL(h.0)) as *const u8;
-            let df = std::ptr::read_unaligned(base as *const DROPFILES);
-            let ptr = base.add(df.pFiles as usize) as *const u16;
-            let mut n = 0usize;
-            while *ptr.add(n) != 0 {
-                n += 1;
+        let (offset, wide_flag, names, terminator) = {
+            let _open = ClipboardOpen::acquire().expect("open clipboard");
+            // SAFETY: as above; the layout is the one `copy_file` wrote.
+            unsafe {
+                let h = GetClipboardData(CF_HDROP.0 as u32).unwrap();
+                let base = GlobalLock(HGLOBAL(h.0)) as *const u8;
+                let df = std::ptr::read_unaligned(base as *const DROPFILES);
+                let ptr = base.add(df.pFiles as usize) as *const u16;
+                let mut n = 0usize;
+                while *ptr.add(n) != 0 {
+                    n += 1;
+                }
+                let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
+                let terminator = *ptr.add(n + 1);
+                let _ = GlobalUnlock(HGLOBAL(h.0));
+                (df.pFiles as usize, df.fWide.as_bool(), s, terminator)
             }
-            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, n));
-            let terminator = *ptr.add(n + 1);
-            let _ = GlobalUnlock(HGLOBAL(h.0));
-            let _ = CloseClipboard();
-            assert_eq!(terminator, 0, "path list is not double-NUL terminated");
-            (df.pFiles as usize, df.fWide.as_bool(), s)
         };
+        // Asserted after the guard has closed it, so a failure reports itself
+        // instead of taking the clipboard down with it.
+        assert_eq!(terminator, 0, "path list is not double-NUL terminated");
         assert_eq!(offset, std::mem::size_of::<DROPFILES>());
         assert!(wide_flag);
         assert_eq!(names, path);

@@ -47,7 +47,34 @@ pub struct ServiceState {
     /// so, which is why this is a count rather than a flag: one active session
     /// must be able to hold heavy maintenance off for all of them.
     pub active_sessions: AtomicUsize,
+    /// How many heavy rebuild-class operations are in flight (§4.3
+    /// `Rebuilding`).
+    ///
+    /// A count, and reported as an overlay, because two of them genuinely
+    /// overlap: compaction runs on the housekeeping thread while a full
+    /// re-enumeration runs on the USN tail thread, and re-enumeration does its
+    /// long work with the index lock free precisely so searches keep being
+    /// answered. The obvious alternative — each one saving `vol_state` and
+    /// restoring it when done — is what this replaces: a compaction that read
+    /// `Rebuilding` on the way in would write it back after the re-enumeration
+    /// had already published `Tailing`, and the volume then reported
+    /// "Rebuilding" for the rest of the service's life with nothing left to
+    /// clear it.
+    rebuilding: AtomicUsize,
     pub mode: Mode,
+}
+
+/// Holds the volume in [`VolumeState::Rebuilding`] for as long as it lives.
+///
+/// A guard rather than a pair of calls so that an early return, a `?`, or a
+/// panic unwinding through the operation cannot leave the volume permanently
+/// claiming to be busy.
+pub struct RebuildGuard<'a>(&'a AtomicUsize);
+
+impl Drop for RebuildGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl ServiceState {
@@ -58,6 +85,7 @@ impl ServiceState {
             paused: AtomicBool::new(false),
             index_epoch: AtomicU64::new(1),
             active_sessions: AtomicUsize::new(0),
+            rebuilding: AtomicUsize::new(0),
             root_path,
             mode,
         }
@@ -102,9 +130,21 @@ impl ServiceState {
         self.paused.load(Ordering::SeqCst)
     }
 
+    /// Report the volume busy until the returned guard is dropped.
+    pub fn rebuilding(&self) -> RebuildGuard<'_> {
+        self.rebuilding.fetch_add(1, Ordering::SeqCst);
+        RebuildGuard(&self.rebuilding)
+    }
+
     pub fn volume_state(&self) -> VolumeState {
         if self.is_paused() {
             return VolumeState::Paused; // paused overlays whatever else is going on (§4.3)
+        }
+        // Rebuilding is an overlay on the lifecycle for the same reason Paused
+        // is: it is a thing happening *to* the volume, not a place it has
+        // reached, and more than one of them can be happening at once.
+        if self.rebuilding.load(Ordering::SeqCst) > 0 {
+            return VolumeState::Rebuilding;
         }
         vol_state_from_u8(self.vol_state.load(Ordering::SeqCst))
     }
@@ -148,5 +188,57 @@ mod tests {
         assert_eq!(vol_state_from_u8(VS_REBUILDING), VolumeState::Rebuilding);
         // Unknown values degrade to Tailing rather than panicking.
         assert_eq!(vol_state_from_u8(200), VolumeState::Tailing);
+    }
+
+    fn state() -> ServiceState {
+        ServiceState::new(
+            idx_api::new_index(0, "C:\\"),
+            "C:\\".to_string(),
+            Mode::Walk,
+        )
+    }
+
+    #[test]
+    fn overlapping_rebuilds_do_not_clear_each_other() {
+        // The bug this shape replaces: compaction reads `vol_state` on the way
+        // in, a re-enumeration finishes and publishes Tailing, and compaction
+        // then writes back the Rebuilding it happened to read — with nothing
+        // left to correct it.
+        let s = state();
+        s.set_vol_state(VS_TAILING);
+        assert_eq!(s.volume_state(), VolumeState::Tailing);
+
+        let outer = s.rebuilding();
+        assert_eq!(s.volume_state(), VolumeState::Rebuilding);
+        {
+            let _inner = s.rebuilding();
+            assert_eq!(s.volume_state(), VolumeState::Rebuilding);
+        }
+        // The inner one finishing must not declare the volume done.
+        assert_eq!(s.volume_state(), VolumeState::Rebuilding);
+        drop(outer);
+        assert_eq!(s.volume_state(), VolumeState::Tailing);
+    }
+
+    #[test]
+    fn a_rebuild_that_unwinds_does_not_wedge_the_volume() {
+        let s = state();
+        s.set_vol_state(VS_TAILING);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _busy = s.rebuilding();
+            panic!("enumeration blew up");
+        }));
+        assert!(caught.is_err());
+        assert_eq!(s.volume_state(), VolumeState::Tailing);
+    }
+
+    #[test]
+    fn pause_still_wins_over_a_rebuild_in_flight() {
+        // §4.3: Paused overlays whatever else is going on, including this.
+        let s = state();
+        s.set_vol_state(VS_TAILING);
+        let _busy = s.rebuilding();
+        s.paused.store(true, Ordering::SeqCst);
+        assert_eq!(s.volume_state(), VolumeState::Paused);
     }
 }

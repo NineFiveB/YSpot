@@ -29,7 +29,7 @@ mod settings_catalog;
 mod tray;
 mod winman;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use apps::AppCatalog;
@@ -718,14 +718,92 @@ struct FallbackItem {
     score: f32,
 }
 
-/// Run the shell-side file search for one generation and emit its results.
+struct FallbackRequest {
+    gen: u64,
+    text: String,
+    reason: String,
+}
+
+/// One shell-side file search at a time, and only the newest one.
+///
+/// The provider is a blocking OLE DB round trip into Windows Search that
+/// cannot be cancelled once it has started. Spawning one per keystroke meant
+/// "readme.md" put nine of them on the blocking pool at once, every result but
+/// the last thrown away — while the query the user is actually waiting on
+/// queued behind eight dead ones.
+///
+/// So: a single worker with a single-slot mailbox, which is the shape §4.4
+/// already defines for the service path. A request arriving while another is
+/// still waiting replaces it, and a result whose generation has been
+/// superseded is dropped rather than emitted.
+#[derive(Default)]
+struct FallbackQueue {
+    /// The newest request that has not started yet. One slot, deliberately.
+    slot: Mutex<Option<FallbackRequest>>,
+    ready: std::sync::Condvar,
+    /// The newest generation anyone has asked for.
+    latest: AtomicU64,
+}
+
+impl FallbackQueue {
+    fn submit(&self, req: FallbackRequest) {
+        self.latest.fetch_max(req.gen, Ordering::SeqCst);
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(req);
+        self.ready.notify_one();
+    }
+
+    /// Block until there is something to do.
+    fn take(&self) -> FallbackRequest {
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(req) = slot.take() {
+                return req;
+            }
+            slot = self.ready.wait(slot).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Whether a result for `gen` is still worth emitting.
+    fn is_current(&self, gen: u64) -> bool {
+        self.latest.load(Ordering::SeqCst) <= gen
+    }
+}
+
+/// Ask for a shell-side file search. Returns immediately.
 ///
 /// The single entry point §9.5 asks for: portable mode and §3.1's `107`
 /// routing are the same code path, not two implementations.
 pub(crate) fn run_fallback_search(app: &AppHandle, gen: u64, text: String, reason: &str) {
-    let app = app.clone();
-    let reason = reason.to_string();
-    tauri::async_runtime::spawn_blocking(move || {
+    let Some(queue) = app.try_state::<Arc<FallbackQueue>>() else {
+        log::warn!("fallback search asked for before the worker existed; dropped");
+        return;
+    };
+    queue.submit(FallbackRequest {
+        gen,
+        text,
+        reason: reason.to_string(),
+    });
+}
+
+/// The worker: one blocking query at a time, newest first.
+fn fallback_worker(app: AppHandle, queue: Arc<FallbackQueue>) {
+    loop {
+        let req = queue.take();
+        // Checked before the query as well as after: a request can be
+        // superseded while it sits in the slot, and the cheapest OLE DB round
+        // trip is the one never made.
+        if !queue.is_current(req.gen) {
+            log::debug!("fallback gen={}: superseded before it ran", req.gen);
+            continue;
+        }
+        run_fallback_query(&app, req, &queue);
+    }
+}
+
+fn run_fallback_query(app: &AppHandle, req: FallbackRequest, queue: &FallbackQueue) {
+    let FallbackRequest { gen, text, reason } = req;
+    {
         let Some(provider) = app.try_state::<Arc<dyn FileSearch>>() else {
             return;
         };
@@ -779,10 +857,20 @@ pub(crate) fn run_fallback_search(app: &AppHandle, gen: u64, text: String, reaso
                 .map(|m| format!(" (unavailable: {m})"))
                 .unwrap_or_default()
         );
+        // A newer keystroke landed while this was in the provider. The rows
+        // are for a query the user has already moved past, so they are
+        // dropped rather than raced against the result that is coming.
+        if !queue.is_current(gen) {
+            log::debug!(
+                "fallback gen={gen}: superseded while running; {} hit(s) dropped",
+                payload.items.len()
+            );
+            return;
+        }
         if let Err(e) = app.emit("search:fallback", payload) {
             log::warn!("emit search:fallback failed: {e}");
         }
-    });
+    }
 }
 
 /// §7.4 clipboard history, for the view that shows it. An empty query lists
@@ -1152,6 +1240,7 @@ pub fn run() {
 
     let store = Arc::new(SettingsStore::open());
     let clip = ClipboardStore::open(store.get().clipboard.capture);
+    let fallback_queue = Arc::new(FallbackQueue::default());
     // Behind the §11 Risk 6 trait, so the day Windows Search is not the
     // answer any more, only this line changes.
     let fallback: Arc<dyn FileSearch> = Arc::new(WindowsSearch);
@@ -1203,6 +1292,7 @@ pub fn run() {
         .manage(WarmState::default())
         .manage(HotkeyState::default())
         .manage(PendingView::default())
+        .manage(fallback_queue.clone())
         .invoke_handler(tauri::generate_handler![
             search,
             hide_window,
@@ -1282,6 +1372,20 @@ pub fn run() {
             // the chord is owned, so binding a second verb through YKeys does
             // not require flipping a setting first (see `hotkey_signal`).
             hotkey_signal::spawn(app.handle().clone());
+
+            // §9.5's file search, on one thread of its own: the provider blocks
+            // and cannot be cancelled, so serialising is what keeps a burst of
+            // keystrokes from queueing behind each other's dead queries.
+            {
+                let handle = app.handle().clone();
+                let queue = fallback_queue.clone();
+                if let Err(e) = std::thread::Builder::new()
+                    .name("file-fallback".into())
+                    .spawn(move || fallback_worker(handle, queue))
+                {
+                    log::error!("fallback search worker failed to spawn: {e}");
+                }
+            }
 
             let current = app.state::<Arc<SettingsStore>>().get();
             let hotkey_failed = if current.hotkey_source.registers_in_shell() {
@@ -1385,6 +1489,46 @@ mod tests {
         // have, and clicking one has to actually try again.
         assert!(should_rebind(&chord, &chord, true));
         assert!(should_rebind(&chord, &other, true));
+    }
+
+    fn request(gen: u64, text: &str) -> FallbackRequest {
+        FallbackRequest {
+            gen,
+            text: text.to_string(),
+            reason: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_burst_of_keystrokes_leaves_only_the_newest_query_to_run() {
+        // "readme.md" used to put nine uncancellable OLE DB round trips on the
+        // blocking pool at once, with the one the user was waiting on queued
+        // behind eight already-dead ones.
+        let q = FallbackQueue::default();
+        for (i, text) in ["r", "re", "rea", "read"].iter().enumerate() {
+            q.submit(request(i as u64 + 1, text));
+        }
+        let got = q.take();
+        assert_eq!(got.gen, 4);
+        assert_eq!(got.text, "read");
+        // And nothing is left behind for a second worker pass.
+        assert!(q.slot.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_superseded_result_is_not_worth_emitting() {
+        let q = FallbackQueue::default();
+        q.submit(request(1, "r"));
+        assert!(q.is_current(1));
+        // A keystroke lands while gen 1 is inside the provider.
+        q.submit(request(2, "re"));
+        assert!(!q.is_current(1));
+        assert!(q.is_current(2));
+        // An out-of-order arrival must not un-supersede anything: `latest` only
+        // ever moves forward.
+        q.submit(request(1, "r"));
+        assert!(!q.is_current(1));
+        assert!(q.is_current(2));
     }
 
     #[test]

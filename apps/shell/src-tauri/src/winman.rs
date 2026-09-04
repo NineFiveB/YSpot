@@ -17,7 +17,8 @@ use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, MAX_PATH, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    EnumDisplayMonitors, GetMonitorInfoW, MonitorFromWindow, HDC, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW,
@@ -28,10 +29,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetAncestor, GetForegroundWindow, GetLastActivePopup, GetWindowLongPtrW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow, GA_ROOTOWNER, GWL_EXSTYLE,
-    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_MINIMIZE, SW_RESTORE,
-    WM_CLOSE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, IsZoomed, PostMessageW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    GA_ROOTOWNER, GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, WM_CLOSE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 use crate::matcher::{self, Ranges, Target};
@@ -351,6 +352,7 @@ pub fn act(id: &str, action: &str) -> Result<(), String> {
             }
             .map_err(|e| format!("topmost: {e}"))
         }
+        "next_monitor" => move_to_next_monitor(hwnd),
         other => match tile_for(other) {
             Some(tile) => place(hwnd, tile),
             None => Err(format!("unknown window action {other}")),
@@ -423,8 +425,143 @@ unsafe fn nudge_alt() {
 
 /// Move and size a window into a tile of its current monitor's work area.
 fn place(hwnd: HWND, tile: Tile) -> Result<(), String> {
+    let work = monitor_work_area(hwnd)?;
+    let (x, y, w, h) = tile_rect(work, tile);
+    // SAFETY: valid window handle; no Z-order change, no activation.
+    unsafe { SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE) }
+        .map_err(|e| format!("move/resize: {e}"))
+}
+
+/// Where a window lands when it moves to another display (§7.5).
+///
+/// Proportional, not absolute. Monitors differ in size and in DPI, so a window
+/// that kept its pixel rect would arrive clipped off the edge of a smaller
+/// screen or marooned in the corner of a larger one. Carrying its position and
+/// size across as fractions of the work area is what makes the move read as
+/// "the same window, other screen".
+pub fn remap_rect(
+    rect: (i32, i32, i32, i32),
+    from: (i32, i32, i32, i32),
+    to: (i32, i32, i32, i32),
+) -> (i32, i32, i32, i32) {
+    let (rl, rt, rr, rb) = rect;
+    let (fl, ft, fr, fb) = from;
+    let (tl, tt, tr, tb) = to;
+    // A zero-extent source would divide by zero; treat the window as filling
+    // it, which is the same answer `tile_rect` gives a degenerate work area.
+    let fw = (fr - fl).max(1) as f32;
+    let fh = (fb - ft).max(1) as f32;
+    let tw = (tr - tl) as f32;
+    let th = (tb - tt) as f32;
+
+    let fx = ((rl - fl) as f32 / fw).clamp(0.0, 1.0);
+    let fy = ((rt - ft) as f32 / fh).clamp(0.0, 1.0);
+    let fwidth = ((rr - rl) as f32 / fw).clamp(0.0, 1.0);
+    let fheight = ((rb - rt) as f32 / fh).clamp(0.0, 1.0);
+
+    let w = (tw * fwidth).round().max(1.0) as i32;
+    let h = (th * fheight).round().max(1.0) as i32;
+    // Nudged back inside if the rounding pushed it over the far edge, so a
+    // window flush against the right of one screen is flush against the right
+    // of the next rather than half off it.
+    let x = (tl + (tw * fx).round() as i32).min(tr - w);
+    let y = (tt + (th * fy).round() as i32).min(tb - h);
+    (x, y, w, h)
+}
+
+/// The display after `current` in [`work_areas`] order, wrapping.
+pub fn next_area(areas: &[(i32, i32, i32, i32)], current: (i32, i32, i32, i32)) -> Option<usize> {
+    if areas.len() < 2 {
+        return None;
+    }
+    // An unrecognised current monitor (hot-plugged between the enumeration and
+    // now) starts from the first, which is better than refusing to move.
+    let idx = areas.iter().position(|a| *a == current).unwrap_or(0);
+    Some((idx + 1) % areas.len())
+}
+
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _hdc: HDC,
+    _clip: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    // SAFETY: `lparam` is the Vec this enumeration was started with, alive for
+    // the whole call.
+    let out = unsafe { &mut *(lparam.0 as *mut Vec<(i32, i32, i32, i32)>) };
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `monitor` comes from the enumeration; MONITORINFO is POD with
+    // cbSize set.
+    if unsafe { GetMonitorInfoW(monitor, &mut mi) }.as_bool() {
+        let RECT {
+            left,
+            top,
+            right,
+            bottom,
+        } = mi.rcWork;
+        out.push((left, top, right, bottom));
+    }
+    BOOL(1)
+}
+
+/// Every display's work area, in a stable spatial order.
+///
+/// Sorted rather than left in enumeration order: the order the driver reports
+/// is not guaranteed and can change across a docking event, and "next monitor"
+/// has to mean the screen to the right — the same screen every time — or the
+/// binding is unusable.
+fn work_areas() -> Vec<(i32, i32, i32, i32)> {
+    let mut found: Vec<(i32, i32, i32, i32)> = Vec::new();
+    // SAFETY: the callback only writes to `found`, which outlives the call.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&mut found as *mut _ as isize),
+        );
+    }
+    found.sort_by_key(|&(left, top, _, _)| (left, top));
+    found
+}
+
+/// §7.5's move-to-next-display verb.
+fn move_to_next_monitor(hwnd: HWND) -> Result<(), String> {
+    let areas = work_areas();
+    let from = monitor_work_area(hwnd)?;
+    let Some(next) = next_area(&areas, from) else {
+        return Err("there is only one display".to_string());
+    };
+    let to = areas[next];
+
+    // SAFETY: valid window handle; RECT is POD, the show-commands are messages.
+    unsafe {
+        // A maximized window has to be restored before it can be moved, or
+        // SetWindowPos fights the maximized state and it snaps back. Maximized
+        // on the way in means maximized on the way out, on the new screen.
+        let zoomed = IsZoomed(hwnd).as_bool();
+        if zoomed {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).map_err(|e| format!("window rect: {e}"))?;
+        let (x, y, w, h) = remap_rect((r.left, r.top, r.right, r.bottom), from, to);
+        SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE)
+            .map_err(|e| format!("move to next display: {e}"))?;
+        if zoomed {
+            let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+        }
+    }
+    Ok(())
+}
+
+/// The work area of the display a window is on.
+fn monitor_work_area(hwnd: HWND) -> Result<(i32, i32, i32, i32), String> {
     // SAFETY: valid window handle; MONITORINFO is POD with cbSize set.
-    let work = unsafe {
+    unsafe {
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
@@ -439,12 +576,8 @@ fn place(hwnd: HWND, tile: Tile) -> Result<(), String> {
             right,
             bottom,
         } = mi.rcWork;
-        (left, top, right, bottom)
-    };
-    let (x, y, w, h) = tile_rect(work, tile);
-    // SAFETY: valid window handle; no Z-order change, no activation.
-    unsafe { SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE) }
-        .map_err(|e| format!("move/resize: {e}"))
+        Ok((left, top, right, bottom))
+    }
 }
 
 #[cfg(test)]
@@ -505,6 +638,51 @@ mod tests {
     fn a_degenerate_work_area_still_yields_a_visible_window() {
         let (_, _, w, h) = tile_rect((0, 0, 1, 1), tile_for("left_third").unwrap());
         assert!(w >= 1 && h >= 1);
+    }
+
+    /// Two 1920x1080 displays side by side, the right one shorter (a laptop
+    /// panel next to an external, which is the common case).
+    const LEFT: (i32, i32, i32, i32) = (0, 0, 1920, 1040);
+    const RIGHT: (i32, i32, i32, i32) = (1920, 0, 3200, 720);
+
+    #[test]
+    fn moving_a_window_keeps_where_it_sat_on_the_screen_it_left() {
+        // Left half of the left display -> left half of the right display.
+        let (x, y, w, h) = remap_rect((0, 0, 960, 1040), LEFT, RIGHT);
+        assert_eq!((x, y), (1920, 0));
+        assert_eq!((w, h), (640, 720));
+
+        // A window flush against the far edge stays flush, rather than
+        // rounding its way half off the screen.
+        let (x, _, w, _) = remap_rect((960, 0, 1920, 1040), LEFT, RIGHT);
+        assert_eq!(x + w, RIGHT.2);
+    }
+
+    #[test]
+    fn a_window_never_arrives_offscreen_or_degenerate() {
+        // Bigger than the display it is leaving, and hanging off both edges.
+        let (x, y, w, h) = remap_rect((-500, -500, 4000, 4000), LEFT, RIGHT);
+        assert!(w >= 1 && h >= 1, "degenerate {w}x{h}");
+        assert!(x >= RIGHT.0 && y >= RIGHT.1, "off the top-left at {x},{y}");
+        assert!(x + w <= RIGHT.2 && y + h <= RIGHT.3, "off the bottom-right");
+
+        // A zero-extent source must not divide by zero.
+        let (_, _, w, h) = remap_rect((0, 0, 100, 100), (0, 0, 0, 0), RIGHT);
+        assert!(w >= 1 && h >= 1);
+    }
+
+    #[test]
+    fn next_monitor_wraps_and_needs_somewhere_to_go() {
+        let areas = [LEFT, RIGHT];
+        assert_eq!(next_area(&areas, LEFT), Some(1));
+        // Wraps, so repeating the action walks every display and comes back.
+        assert_eq!(next_area(&areas, RIGHT), Some(0));
+        // One display: there is nowhere to move to, and saying so beats
+        // silently doing nothing.
+        assert_eq!(next_area(&[LEFT], LEFT), None);
+        // A display we do not recognise (hot-plugged since the enumeration)
+        // still moves rather than refusing.
+        assert_eq!(next_area(&areas, (99, 99, 100, 100)), Some(1));
     }
 
     #[test]

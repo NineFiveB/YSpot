@@ -19,6 +19,7 @@
 //! `FILE_FLAG_FIRST_PIPE_INSTANCE`, and `ERROR_ACCESS_DENIED` on that create
 //! logs a security event and refuses to start.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,49 @@ use yspot_pipe::server::{self, SecDesc};
 
 use crate::session;
 use crate::state::ServiceState;
+
+/// How many client connections are served at once.
+///
+/// §4.1's DACL grants interactive users open rights, so the number of
+/// connections is the number of processes on the machine that feel like
+/// opening one — and each costs two threads (the connection reader and its
+/// search worker) plus whatever its queued batch holds. Unbounded, a loop
+/// calling `CreateFile` in a script takes the service down for every real
+/// client; capped, the newest connection is refused and the ones already
+/// being served keep working.
+///
+/// Sized for the real population with room to spare: one shell per interactive
+/// session, plus the probe and harness during development.
+const MAX_CONNECTIONS: usize = 32;
+
+/// Occupies one connection slot until dropped.
+///
+/// A guard, so a session thread that panics or returns early gives its slot
+/// back — a leaked slot is permanent, and enough of them close the service to
+/// new clients with no way back short of a restart.
+struct ConnSlot(Arc<AtomicUsize>);
+
+impl ConnSlot {
+    /// `None` when the service is already at [`MAX_CONNECTIONS`].
+    fn try_acquire(live: &Arc<AtomicUsize>) -> Option<ConnSlot> {
+        let mut n = live.load(Ordering::SeqCst);
+        loop {
+            if n >= MAX_CONNECTIONS {
+                return None;
+            }
+            match live.compare_exchange_weak(n, n + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => return Some(ConnSlot(live.clone())),
+                Err(actual) => n = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Serve the pipe forever. Returns only on a fatal startup error; exits the
 /// process directly on squat detection (§4.1).
@@ -70,19 +114,39 @@ pub fn serve(state: Arc<ServiceState>) -> anyhow::Result<()> {
     };
     log::info!("pipe server listening on {name}");
 
+    let live = Arc::new(AtomicUsize::new(0));
+
     loop {
         match server::accept(&pipe) {
-            Ok(()) => {
-                let st = state.clone();
-                if let Err(e) = std::thread::Builder::new()
-                    .name("pipe-conn".into())
-                    .spawn(move || session::run(pipe, st))
-                {
-                    // The moved `pipe` is dropped with the failed closure; the
-                    // client sees a disconnect.
-                    log::error!("connection thread spawn failed: {e}");
+            Ok(()) => match ConnSlot::try_acquire(&live) {
+                Some(slot) => {
+                    let st = state.clone();
+                    if let Err(e) =
+                        std::thread::Builder::new()
+                            .name("pipe-conn".into())
+                            .spawn(move || {
+                                // Moved in so the slot is held for exactly the life
+                                // of the session, released even on an unwind.
+                                let _slot = slot;
+                                session::run(pipe, st)
+                            })
+                    {
+                        // The moved `pipe` is dropped with the failed closure;
+                        // the client sees a disconnect.
+                        log::error!("connection thread spawn failed: {e}");
+                    }
                 }
-            }
+                None => {
+                    // Dropping the instance disconnects this client, which is
+                    // the honest answer: it retries per §4.1 and gets in when
+                    // a slot frees. Worth an error — at the cap something is
+                    // either wrong or hostile.
+                    log::error!(
+                        "refusing connection: already serving {MAX_CONNECTIONS} clients,                          the §4.1 cap"
+                    );
+                    drop(pipe);
+                }
+            },
             Err(e) => {
                 log::debug!("ConnectNamedPipe failed ({e}); recycling instance");
                 drop(pipe);
@@ -140,6 +204,37 @@ fn squat_refusal() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connections_are_capped_and_slots_come_back() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let held: Vec<ConnSlot> = (0..MAX_CONNECTIONS)
+            .map(|_| ConnSlot::try_acquire(&live).expect("under the cap"))
+            .collect();
+        assert_eq!(live.load(Ordering::SeqCst), MAX_CONNECTIONS);
+        // The one that would have been the (cap + 1)th is refused, not queued.
+        assert!(ConnSlot::try_acquire(&live).is_none());
+
+        drop(held);
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+        assert!(ConnSlot::try_acquire(&live).is_some());
+    }
+
+    #[test]
+    fn a_session_that_panics_does_not_leak_its_slot() {
+        // A leaked slot is permanent: enough of them and the service refuses
+        // every client with nothing short of a restart to clear it.
+        let live = Arc::new(AtomicUsize::new(0));
+        let caught = std::panic::catch_unwind({
+            let live = live.clone();
+            move || {
+                let _slot = ConnSlot::try_acquire(&live).expect("acquired");
+                panic!("session blew up");
+            }
+        });
+        assert!(caught.is_err());
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn dev_descriptor_carries_the_current_user_and_converts() {

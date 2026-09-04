@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use idx_api::UsnCursor;
-use state::{Mode, ServiceState, VS_REBUILDING, VS_TAILING};
+use state::{Mode, ServiceState, VS_TAILING};
 
 const USAGE: &str = "usage: yspot-indexd --walk <path> | --mft <C:>";
 
@@ -160,14 +160,17 @@ fn maybe_compact(state: &ServiceState) {
         return; // a session is interactive; wait for a quiet window
     }
 
-    let previous = state.vol_state.load(Ordering::SeqCst);
-    state.set_vol_state(VS_REBUILDING);
+    // Not a save/restore of `vol_state`: a re-enumeration on the USN thread can
+    // start and finish inside this window, and writing back the value read on
+    // the way in would bury the `Tailing` it published — leaving the volume
+    // reporting "Rebuilding" with nothing left to clear it.
+    let busy = state.rebuilding();
     let t0 = Instant::now();
     let (reclaimed, entries) = {
         let mut idx = state.index_write();
         (idx.compact(), idx.len())
     };
-    state.set_vol_state(previous);
+    drop(busy);
     log::info!(
         "compacted: reclaimed {reclaimed} bytes over {entries} entries in {} ms{}",
         t0.elapsed().as_millis(),
@@ -311,8 +314,11 @@ fn repair_depths(state: &ServiceState) {
 /// §4.3 index_epoch). Retries forever — without a rebuilt index the volume
 /// would serve stale data.
 fn rebuild(state: &ServiceState, drive: &str) -> UsnCursor {
+    // Held across every retry: the volume is being rebuilt for as long as this
+    // loop runs, and a failed attempt that slept for five seconds is still not
+    // a volume anyone should be told is tailing.
+    let _busy = state.rebuilding();
     loop {
-        state.set_vol_state(VS_REBUILDING);
         let t0 = Instant::now();
         let mut fresh = idx_api::new_index(0, &state.root_path);
         match idx_api::mft_enumerate(drive, &mut fresh) {
@@ -320,6 +326,8 @@ fn rebuild(state: &ServiceState, drive: &str) -> UsnCursor {
                 let (n, ram) = (idx_api::entry_count(&fresh), idx_api::ram_bytes(&fresh));
                 *state.index_write() = fresh; // short write lock: swap only
                 let epoch = state.index_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+                // The lifecycle underneath the overlay: from here on the
+                // volume is tailing, which is what shows once `_busy` drops.
                 state.set_vol_state(VS_TAILING);
                 log::info!(
                     "re-enumeration complete: {n} entries in {} ms, ram_bytes={ram}, epoch={epoch}",

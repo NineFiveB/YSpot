@@ -27,7 +27,7 @@ const FILE_ACTIONS: Action[] = [
 /**
  * §7.5's window verbs. Switching is the primary one; the layout presets and
  * the toggles live in the action panel, where a list is the right shape for
- * fifteen of them.
+ * sixteen of them.
  */
 const WINDOW_ACTIONS: Action[] = [
   { id: "open", title: "Switch to Window", shortcut: "Enter" },
@@ -46,6 +46,9 @@ const WINDOW_ACTIONS: Action[] = [
   { id: "top_right", title: "Top Right Quarter" },
   { id: "bottom_left", title: "Bottom Left Quarter" },
   { id: "bottom_right", title: "Bottom Right Quarter" },
+  // §7.5's move verb, next to the layouts because that is what it is: the
+  // sixteenth way of putting the window somewhere.
+  { id: "next_monitor", title: "Move to Next Display" },
   { id: "topmost", title: "Always on Top" },
   { id: "untopmost", title: "Not Always on Top" },
   { id: "minimize", title: "Minimize" },
