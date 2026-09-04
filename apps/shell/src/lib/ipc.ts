@@ -54,9 +54,16 @@ export interface SettingItem {
  * File results from the shell's own Windows Search provider (§3.1, §9.5) —
  * portable mode, or a scope the service does not index.
  */
+/** One unranked Windows Search hit, scored by the shell (§5.11 rule 2). */
+export interface FallbackItem {
+  path: string;
+  name: string;
+  score: number;
+}
+
 export interface SearchFallbackPayload {
   gen: number;
-  items: { path: string; name: string }[];
+  items: FallbackItem[];
   /** Why the shell answered instead of the service. */
   reason: string;
   /** Set when Windows Search itself could not answer (§3.1: never silent). */
@@ -253,16 +260,17 @@ export function calcRow(item: CalcItem): Row {
  * A file the shell's own provider found. It has no volume/FRN identity — the
  * service is what mints those — so the path is the stable key.
  */
-export function fallbackFileRow(item: { path: string; name: string }): Row {
+export function fallbackFileRow(item: FallbackItem): Row {
   return {
     kind: "file",
     key: `file:path:${item.path}`,
     id: item.path,
     name: item.name,
     subtitle: item.path,
-    // Below every catalog tier: these are unranked, so they should not
-    // outrank a real match the shell scored.
-    score: 0.5,
+    // Scored by the shell: a flat base below every catalog tier, since these
+    // are unranked and should not outrank a match the shell scored, plus the
+    // §7.1 frecency bonus for a path you have opened from here before.
+    score: item.score,
     matchRanges: [],
     path: item.path,
   };
@@ -339,8 +347,16 @@ export interface ClipboardSettings {
   capture: boolean;
 }
 
+/**
+ * Who registers the global chord (§5.1 as amended). "shell" is YSpot's own
+ * `RegisterHotKey`; "ykeys" means the YKeys daemon owns the keyboard and
+ * summons the launcher by posting a window message instead.
+ */
+export type HotkeySource = "shell" | "ykeys";
+
 export interface Settings {
   hotkey: Hotkey;
+  hotkey_source: HotkeySource;
   theme: "system" | "light" | "dark";
   diagnostics: Diagnostics;
   clipboard: ClipboardSettings;
@@ -351,6 +367,11 @@ export interface SettingsView {
   settings: Settings;
   autostart: boolean;
   hotkeyWarning: string | null;
+  /**
+   * Set while the bound chord is not actually registered (§5.1). Distinct
+   * from `hotkeyWarning`, which is a caution about a chord that did bind.
+   */
+  hotkeyError: string | null;
 }
 
 export function getSettings(): Promise<SettingsView> {

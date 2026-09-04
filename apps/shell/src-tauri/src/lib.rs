@@ -18,6 +18,7 @@ mod etw_mark;
 mod file_actions;
 mod focus;
 mod frecency;
+mod hotkey_signal;
 mod icons;
 mod matcher;
 mod pipe_client;
@@ -29,7 +30,7 @@ mod tray;
 mod winman;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use apps::AppCatalog;
 use clipboard::ClipboardStore;
@@ -68,6 +69,25 @@ fn shortcut_of(hotkey: &settings::Hotkey) -> Option<Shortcut> {
     Some(Shortcut::new(Some(mods), code))
 }
 
+/// The last registration outcome for the bound chord: `Some(message)` while
+/// the hotkey is not actually held by us.
+///
+/// §5.1 forbids silent degradation, and a chord that failed to register is
+/// exactly that — the launcher is unreachable by the only means most people
+/// will try. The static [`settings::Hotkey::rejection`] check cannot see it:
+/// it validates the chord's shape, and a persisted chord has already passed
+/// that. Only the registrar knows, so the registrar records it here and
+/// every surface that reports on the hotkey reads it.
+#[derive(Default)]
+struct HotkeyState(Mutex<Option<String>>);
+
+impl HotkeyState {
+    fn get(app: &AppHandle) -> Option<String> {
+        app.try_state::<HotkeyState>()
+            .and_then(|s| s.0.lock().ok().and_then(|g| g.clone()))
+    }
+}
+
 /// Register `hotkey`, replacing whatever is bound now.
 ///
 /// §5.1's atomicity rule: unregister the old chord, register the new one,
@@ -87,7 +107,11 @@ fn rebind_hotkey(
     if let Some(p) = previous {
         let _ = manager.unregister(p);
     }
-    match manager.register(shortcut) {
+    // Whether the chord the settings still name is held after all this. Not
+    // the same question as whether this call succeeded, and it is the one the
+    // standing conflict has to answer.
+    let mut restored = false;
+    let outcome = match manager.register(shortcut) {
         Ok(()) => {
             log::info!("hotkey bound to {} (§5.1)", next.accelerator());
             Ok(())
@@ -96,7 +120,7 @@ fn rebind_hotkey(
             // Put the old chord back before reporting, so the launcher stays
             // reachable while the user picks another one.
             if let Some(p) = previous {
-                let _ = manager.register(p);
+                restored = manager.register(p).is_ok();
             }
             let owner = next
                 .likely_owner()
@@ -107,7 +131,38 @@ fn rebind_hotkey(
                 next.accelerator()
             ))
         }
+    };
+    // A rejected rebind that put the working chord back leaves the launcher
+    // perfectly reachable: `save_settings` returns before it persists anything,
+    // so the settings still name the old chord and the old chord is registered.
+    // Recording a conflict there would strand a banner and a tray tooltip on a
+    // machine where nothing is wrong. The startup call has no previous chord to
+    // restore, which is exactly when the conflict is real.
+    let standing = match &outcome {
+        Ok(()) => None,
+        Err(_) if restored => {
+            log::info!("hotkey: rebind refused; the previous chord is still bound (§5.1)");
+            None
+        }
+        // Nothing is bound: neither the chord asked for nor the one that was
+        // working. Name the chord the settings still hold, since that is the
+        // one the user has to fix and the one every other surface shows.
+        Err(message) => Some(match old {
+            Some(o) => format!(
+                "{} is no longer registered, and {} could not take its place.",
+                o.accelerator(),
+                next.accelerator()
+            ),
+            None => message.clone(),
+        }),
+    };
+    if let Some(state) = app.try_state::<HotkeyState>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = standing.clone();
+        }
     }
+    tray::set_hotkey_conflict(app, standing.as_deref());
+    outcome
 }
 
 #[derive(Default)]
@@ -610,11 +665,27 @@ struct FallbackResults {
     unavailable: Option<String>,
 }
 
+/// Where an unranked Windows Search hit sits against the §5.11 bands. Below
+/// the catalog's own matches (`matcher::SUBSTRING` and up), because the shell
+/// scored those and merely knows these exist.
+const FALLBACK_BASE_SCORE: f32 = 0.5;
+
+/// Windows Search hands us no score of its own, so the base has to sit below
+/// the catalog's own bands (§5.11) or portable mode would bury real matches
+/// under whatever the OS index happened to return. Checked at compile time
+/// because both sides are constants and neither should drift into the other.
+const _: () = assert!(FALLBACK_BASE_SCORE < matcher::SUBSTRING);
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct FallbackItem {
     path: String,
     name: String,
+    /// Windows Search does not rank in our terms, so these rows sit at one
+    /// flat score below the catalog bands — plus §7.1 frecency, which is the
+    /// only signal the shell has about them and the reason a file you open
+    /// daily comes back first (§5.11 rule 2).
+    score: f32,
 }
 
 /// Run the shell-side file search for one generation and emit its results.
@@ -628,19 +699,31 @@ pub(crate) fn run_fallback_search(app: &AppHandle, gen: u64, text: String, reaso
         let Some(provider) = app.try_state::<Arc<dyn FileSearch>>() else {
             return;
         };
+        // Absent only in tests that never register it; a missing store must
+        // cost the rows their bonus, not their existence.
+        let frec = app.try_state::<Arc<Frecency>>().map(|f| f.inner().clone());
         let payload = match provider.search(&text, 50) {
-            Ok(hits) => FallbackResults {
-                gen,
-                items: hits
+            Ok(hits) => {
+                let mut items: Vec<FallbackItem> = hits
                     .into_iter()
                     .map(|h| FallbackItem {
+                        // The path is this provider's stable id — it has no
+                        // volume/FRN identity — and so is what a launch from
+                        // one of these rows records against (§5.6).
+                        score: FALLBACK_BASE_SCORE
+                            + frec.as_ref().map_or(0.0, |f| f.bonus(&h.path)),
                         path: h.path,
                         name: h.name,
                     })
-                    .collect(),
-                reason,
-                unavailable: None,
-            },
+                    .collect();
+                items.sort_by(|a, b| b.score.total_cmp(&a.score));
+                FallbackResults {
+                    gen,
+                    items,
+                    reason,
+                    unavailable: None,
+                }
+            }
             Err(search_fallback::SearchError::Unavailable(m)) => FallbackResults {
                 gen,
                 items: Vec::new(),
@@ -730,6 +813,17 @@ fn clipboard_set_enabled(
     store.save(next)
 }
 
+/// What to say about a chord: what the registrar actually reported, and only
+/// failing that, what the static check says.
+///
+/// The order is the whole point. A chord that came out of settings has
+/// already passed [`settings::Hotkey::rejection`] — it was checked before it
+/// was written — so consulting only the static check reports every real
+/// conflict as "no problem", which is §5.1's silent degradation exactly.
+fn hotkey_error(live: Option<String>, hotkey: &settings::Hotkey) -> Option<String> {
+    live.or_else(|| hotkey.rejection().map(str::to_string))
+}
+
 /// What first-run onboarding needs to tell the truth about this machine
 /// (§5.9): whether the hotkey took, whether the service is there, and what
 /// the current consents are.
@@ -749,12 +843,13 @@ struct OnboardingState {
 
 #[tauri::command]
 fn onboarding_state(
+    app: AppHandle,
     store: tauri::State<'_, Arc<SettingsStore>>,
     pipe: tauri::State<'_, Arc<PipeClient>>,
 ) -> OnboardingState {
     let settings = store.get();
     OnboardingState {
-        hotkey_error: settings.hotkey.rejection().map(str::to_string),
+        hotkey_error: hotkey_error(HotkeyState::get(&app), &settings.hotkey),
         hotkey: settings.hotkey,
         service_connected: pipe.is_connected(),
         autostart: autostart::is_enabled(),
@@ -785,13 +880,18 @@ struct SettingsView {
     settings: Settings,
     autostart: bool,
     hotkey_warning: Option<String>,
+    /// §5.1's conflict, standing: set whenever the bound chord is not
+    /// actually registered, so opening Settings shows the alternatives
+    /// without the user having to fail a rebind first.
+    hotkey_error: Option<String>,
 }
 
 #[tauri::command]
-fn get_settings(store: tauri::State<'_, Arc<SettingsStore>>) -> SettingsView {
+fn get_settings(app: AppHandle, store: tauri::State<'_, Arc<SettingsStore>>) -> SettingsView {
     let settings = store.get();
     SettingsView {
         hotkey_warning: settings.hotkey.warning().map(str::to_string),
+        hotkey_error: HotkeyState::get(&app),
         autostart: autostart::is_enabled(),
         settings,
     }
@@ -828,6 +928,10 @@ fn save_settings(
         settings: next,
         autostart: autostart::is_enabled(),
         hotkey_warning: warning,
+        // A successful rebind cleared it; an unchanged chord that never
+        // registered keeps it, so the banner does not vanish because an
+        // unrelated setting was saved.
+        hotkey_error: HotkeyState::get(&app),
     })
 }
 
@@ -1033,6 +1137,7 @@ pub fn run() {
         .manage(frec)
         .manage(icon_cache)
         .manage(WarmState::default())
+        .manage(HotkeyState::default())
         .invoke_handler(tauri::generate_handler![
             search,
             hide_window,
@@ -1105,23 +1210,54 @@ pub fn run() {
                 }
             }
 
+            // §5.1: the binding persists in settings and re-registers on
+            // every start. Before onboarding, so the wizard's first read of
+            // `hotkey_error` already knows the answer.
+            // §5.1 as amended: the shell listens for an external summons however
+            // the chord is owned, so binding a second verb through YKeys does
+            // not require flipping a setting first (see `hotkey_signal`).
+            hotkey_signal::spawn(app.handle().clone());
+
+            let current = app.state::<Arc<SettingsStore>>().get();
+            let hotkey_failed = if current.hotkey_source.registers_in_shell() {
+                match rebind_hotkey(app.handle(), None, &current.hotkey) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        log::error!("hotkey registration failed: {e} Rebind it in Settings.");
+                        true
+                    }
+                }
+            } else {
+                // Not a degradation and not reported as one: the user asked for
+                // this. §5.1's duty is to be honest about a chord that should
+                // work and does not, and here no chord was ever ours to lose.
+                log::info!(
+                    "hotkey: YKeys owns the chord; summoned by message on class {} (§5.1)",
+                    hotkey_signal::WINDOW_CLASS
+                );
+                false
+            };
+            let onboarded = current.onboarded;
+
             // §5.9 first run. Not when started hidden by autostart: a window
             // appearing unbidden at logon is exactly what --hidden promises
             // it will not do, so the wizard waits for the first summon.
-            if !app.state::<Arc<SettingsStore>>().get().onboarded && !autostart::started_hidden() {
+            if !onboarded && !autostart::started_hidden() {
                 if let Err(e) = show_view(app.handle(), "view:onboarding") {
                     log::error!("could not open onboarding: {e}");
                 }
-            }
-
-            // §5.1: the binding persists in settings and re-registers on
-            // every start.
-            let hotkey = app.state::<Arc<SettingsStore>>().get().hotkey;
-            if let Err(e) = rebind_hotkey(app.handle(), None, &hotkey) {
-                log::error!(
-                    "hotkey registration failed: {e} Rebind it in Settings \
-                     (tray → Settings…, or the `settings` query)."
-                );
+            } else if hotkey_failed && !autostart::started_hidden() {
+                // §5.1 MUST NOT degrade silently, and a launcher with no
+                // working hotkey and no window is as silent as it gets. This
+                // is the one start where saying so costs nothing: the user
+                // launched YSpot by hand a moment ago and is watching. A
+                // hidden autostart gets the tray tooltip and the log instead
+                // — a window at logon is the thing --hidden promises not to
+                // do, and §5.1's remedy keeps until the first summon.
+                log::info!("hotkey unavailable at startup; opening Settings (§5.1)");
+                if let Err(e) = show_settings(app.handle()) {
+                    log::error!("could not open Settings for the hotkey conflict: {e}");
+                }
             }
 
             // Dismiss on focus loss (§5.2 step 3: blur is a dismissal path).
@@ -1143,4 +1279,45 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running yspot-shell");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alt_space() -> settings::Hotkey {
+        settings::Hotkey {
+            ctrl: false,
+            alt: true,
+            shift: false,
+            win: false,
+            code: "Space".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_conflict_is_reported_even_though_the_chord_itself_is_valid() {
+        let chord = alt_space();
+        // The premise of the bug: the static check passes, so it cannot be
+        // the only thing onboarding asks.
+        assert_eq!(chord.rejection(), None);
+        let live = Some("Alt + Space could not be registered.".to_string());
+        assert_eq!(hotkey_error(live.clone(), &chord), live);
+    }
+
+    #[test]
+    fn a_chord_that_registered_reports_nothing() {
+        assert_eq!(hotkey_error(None, &alt_space()), None);
+    }
+
+    #[test]
+    fn a_malformed_chord_still_falls_back_to_the_static_reason() {
+        // Never registered, so there is no live outcome to report — but the
+        // shape is wrong and onboarding must still say so.
+        let chord = settings::Hotkey {
+            code: "AltLeft".to_string(),
+            ..alt_space()
+        };
+        assert!(hotkey_error(None, &chord).is_some());
+    }
 }

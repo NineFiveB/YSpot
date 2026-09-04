@@ -358,6 +358,21 @@ mark {
   line-height: 1.5;
 }
 
+/* The ykeys.json line, meant to be read character by character and copied. */
+.settings-code {
+  display: block;
+  margin-top: 6px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  background: var(--row-hover);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--fg);
+  overflow-x: auto;
+  white-space: pre;
+  user-select: text;
+}
+
 .settings-warning {
   font-size: 12px;
   color: #b26a00;

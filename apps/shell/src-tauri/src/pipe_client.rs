@@ -29,10 +29,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use yspot_pipe::client::{self, ServerOwner};
 use yspot_pipe::{Pipe, PipeReader, PipeWriter};
 use yspot_proto::{Filters, Message, ResultItem, MAX_FRAME_S2C, PIPE_NAME, PROTO_VERSION};
+
+use crate::frecency::Frecency;
 
 const MAX_RESULTS: u32 = 50;
 const BACKOFF_START: Duration = Duration::from_secs(1);
@@ -57,6 +59,19 @@ pub struct JsResultItem {
     pub name: String,
     pub score: f32,
     pub match_ranges: Vec<(u32, u32)>,
+}
+
+impl JsResultId {
+    /// The key §7.1 frecency is stored under for a file.
+    ///
+    /// It has to be byte-identical to what `executeAction` records against,
+    /// which is the frontend's `rowKey` (§5.6: `volumeIdx:frn`). If these two
+    /// ever disagree the failure is silent — launches accumulate under one
+    /// key and the ranker reads another, so the file you open every day
+    /// never rises and nothing reports an error.
+    pub fn frecency_id(&self) -> String {
+        format!("{}:{}", self.volume_idx, self.frn)
+    }
 }
 
 impl From<ResultItem> for JsResultItem {
@@ -368,11 +383,28 @@ fn handle_msg(app: &AppHandle, client: &PipeClient, msg: Message) {
                 "results gen={gen} seq={seq} final={}",
                 u8::from(is_final)
             ));
+            let mut items: Vec<JsResultItem> = items.into_iter().map(JsResultItem::from).collect();
+            // §5.11 rule 2 wants frecency applied uniformly across sources,
+            // and the shell is the only place it can be: the store is
+            // per-user and lives on this side of the pipe (§7.1), while the
+            // service ranks for a machine. The id is the one `executeAction`
+            // records under (§5.6 `volumeIdx:frn`), so opening a file from
+            // here is what lifts it next time.
+            //
+            // Bounded by construction: the bonus cannot promote a file the
+            // service never sent, so a rarely-matched favourite still has to
+            // clear the service's own cut to be reordered here.
+            if let Some(frec) = app.try_state::<Arc<Frecency>>() {
+                for it in &mut items {
+                    it.score += frec.bonus(&it.id.frecency_id());
+                }
+                items.sort_by(|a, b| b.score.total_cmp(&a.score));
+            }
             let payload = JsSearchResults {
                 gen,
                 seq,
                 is_final,
-                items: items.into_iter().map(JsResultItem::from).collect(),
+                items,
             };
             if let Err(e) = app.emit("search:results", payload) {
                 log::warn!("emit search:results failed: {e}");
@@ -470,5 +502,18 @@ mod tests {
         // The generation is still recorded, so stale-frame dropping works
         // from the first reply after a reconnect.
         assert_eq!(c.current_gen.load(Ordering::SeqCst), 1);
+    }
+
+    /// The one that matters: this string is written by `executeAction` and
+    /// read by the ranker, and the two live in different languages.
+    #[test]
+    fn the_frecency_key_is_the_one_the_frontend_records_under() {
+        let id = JsResultId {
+            volume_idx: 2,
+            // Past 2^53, which is why `frn` crosses the wire as a string.
+            frn: "9007199254740993".to_string(),
+        };
+        // `rowKey` in apps/shell/src/lib/ipc.ts: `${id.volumeIdx}:${id.frn}`.
+        assert_eq!(id.frecency_id(), "2:9007199254740993");
     }
 }

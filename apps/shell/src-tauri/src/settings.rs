@@ -166,10 +166,36 @@ impl Default for Clipboard {
     }
 }
 
+/// Who holds the global chord (§5.1 as amended).
+///
+/// `Shell` is the original behaviour and the default: YSpot calls
+/// `RegisterHotKey` itself. `Ykeys` means an external daemon owns the keyboard
+/// and summons us by message instead — see [`crate::hotkey_signal`]. The
+/// distinction has to be a setting rather than a guess, because "no chord is
+/// registered" and "someone else registers it for us" look identical from
+/// inside this process, and one of them is a fault §5.1 requires us to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HotkeySource {
+    #[default]
+    Shell,
+    Ykeys,
+}
+
+impl HotkeySource {
+    /// Whether this shell should register the chord itself.
+    pub fn registers_in_shell(self) -> bool {
+        matches!(self, HotkeySource::Shell)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub hotkey: Hotkey,
+    /// §5.1 as amended: who registers [`Settings::hotkey`].
+    #[serde(default)]
+    pub hotkey_source: HotkeySource,
     #[serde(default)]
     pub theme: Theme,
     #[serde(default)]
@@ -362,7 +388,14 @@ mod tests {
     fn the_wire_keys_are_the_ones_the_frontend_uses() {
         let json = serde_json::to_value(Settings::default()).unwrap();
         let obj = json.as_object().expect("an object");
-        for key in ["hotkey", "theme", "diagnostics", "clipboard", "onboarded"] {
+        for key in [
+            "hotkey",
+            "hotkey_source",
+            "theme",
+            "diagnostics",
+            "clipboard",
+            "onboarded",
+        ] {
             assert!(obj.contains_key(key), "settings.json lost `{key}`");
         }
         assert!(
@@ -373,10 +406,34 @@ mod tests {
             json["clipboard"].get("capture").is_some(),
             "clipboard.capture renamed"
         );
+        // Settings.tsx writes these two spellings literally.
+        assert_eq!(json["hotkey_source"], serde_json::json!("shell"));
+        assert_eq!(
+            serde_json::to_value(HotkeySource::Ykeys).unwrap(),
+            serde_json::json!("ykeys")
+        );
         // And a round trip must not quietly relocate a known field into the
         // unknown-key bag, which is what a rename would look like.
         let back: Settings = serde_json::from_value(json).unwrap();
         assert!(back.extra.is_empty(), "a known field leaked into `extra`");
+    }
+
+    #[test]
+    fn the_shell_registers_the_chord_unless_the_file_hands_it_to_ykeys() {
+        // The default has to be §5.1's original behaviour: a file written
+        // before this setting existed, or by someone who never heard of YKeys,
+        // must still get a launcher that can be summoned.
+        assert!(Settings::default().hotkey_source.registers_in_shell());
+
+        let handed: Settings =
+            serde_json::from_str(r#"{"hotkey_source":"ykeys"}"#).expect("parses");
+        assert!(!handed.hotkey_source.registers_in_shell());
+
+        // An unreadable value must not silently mean "nobody registers it",
+        // which would leave the launcher unreachable with nothing to show for
+        // it — the whole failure §5.1 exists to forbid.
+        assert!(serde_json::from_str::<Settings>(r#"{"hotkey_source":"YKEYS"}"#).is_err());
+        assert!(serde_json::from_str::<Settings>(r#"{"hotkey_source":"nonsense"}"#).is_err());
     }
 
     #[test]

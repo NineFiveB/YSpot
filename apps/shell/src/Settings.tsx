@@ -43,6 +43,20 @@ function prettyCode(code: string): string {
   return code || "…";
 }
 
+/**
+ * The same chord in YKeys' spelling — lowercase, `+`-joined, no spaces — so the
+ * line in the hint can be copied into `ykeys.json` as it stands.
+ */
+export function describeChord(h: ipc.Hotkey): string {
+  const parts: string[] = [];
+  if (h.ctrl) parts.push("ctrl");
+  if (h.alt) parts.push("alt");
+  if (h.shift) parts.push("shift");
+  if (h.win) parts.push("win");
+  parts.push(prettyCode(h.code).toLowerCase());
+  return parts.join("+");
+}
+
 /** §5.1 offers these one click away when the chosen chord is taken. */
 const ALTERNATIVES: ipc.Hotkey[] = [
   { ctrl: true, alt: false, shift: false, win: false, code: "Space" },
@@ -64,6 +78,10 @@ export default function Settings({ onClose }: Props): ReactElement {
   useEffect(() => {
     void ipc.getSettings().then(setView).catch((e) => setError(String(e)));
   }, []);
+
+  // §5.1 as amended: with YKeys holding the chord, this view reports the
+  // binding rather than owning it.
+  const external = view?.settings.hotkey_source === "ykeys";
 
   const apply = useCallback(async (next: ipc.Settings, note: string) => {
     setError(null);
@@ -146,24 +164,61 @@ export default function Settings({ onClose }: Props): ReactElement {
             <div className="settings-label">
               <div>Hotkey</div>
               <div className="settings-hint">
-                The chord that summons the launcher. While capturing, Esc keeps the current
-                one.
+                {external
+                  ? "YKeys holds this chord. Change it in ykeys.json, not here."
+                  : "The chord that summons the launcher. While capturing, Esc keeps the current one."}
               </div>
             </div>
             <button
               className={capturing ? "chord chord-capturing" : "chord"}
+              // Disabled rather than hidden: the chord is still what summons
+              // the launcher, so it belongs on screen — it is just not ours to
+              // rebind, and a button that silently did nothing would be worse
+              // than one that plainly cannot be pressed.
+              disabled={external}
               onClick={() => setCapturing((c) => !c)}
             >
               {capturing ? "Press a chord…" : describeHotkey(view.settings.hotkey)}
             </button>
           </div>
 
+          <div className="settings-row">
+            <div className="settings-label">
+              <div>Let YKeys hold the hotkey</div>
+              <div className="settings-hint">
+                One daemon owns the keyboard instead of every app claiming a chord of
+                its own. YKeys registers it and summons YSpot by message, which costs
+                nothing extra — add this to <code>~/.config/ykeys/ykeys.json</code>:
+                <code className="settings-code">"{describeChord(view.settings.hotkey)}": "@signal:YSpot.Signal"</code>
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={external}
+              onChange={(e) =>
+                void apply(
+                  {
+                    ...view.settings,
+                    hotkey_source: e.target.checked ? "ykeys" : "shell",
+                  },
+                  e.target.checked ? "YKeys holds the hotkey" : "YSpot holds the hotkey",
+                )
+              }
+            />
+          </div>
+
           {view.hotkeyWarning ? (
             <p className="settings-warning">{view.hotkeyWarning}</p>
           ) : null}
-          {error ? (
+          {/*
+            A rebind we just refused, or — from the view — a chord that never
+            registered at startup. §5.1's conflict flow has to reach the
+            second case too: the chord is in settings and looks fine, and the
+            only symptom is that pressing it does nothing.
+          */}
+          {(error ?? view.hotkeyError) ? (
             <div className="settings-error">
-              <p>{error}</p>
+              <p>{error ?? view.hotkeyError}</p>
               <div className="settings-alternatives">
                 {ALTERNATIVES.map((h) => (
                   <button

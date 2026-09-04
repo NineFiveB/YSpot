@@ -97,6 +97,28 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Say on the tray icon that the hotkey is not held (§5.1: a conflict must
+/// not be silent).
+///
+/// The tray is the surface that survives the failure — if the chord did not
+/// register, the launcher cannot be summoned, so a message inside it is a
+/// message nobody sees. The tooltip is the one always-visible place left.
+pub fn set_hotkey_conflict(app: &AppHandle, error: Option<&str>) {
+    let Some(tray) = app.tray_by_id("yspot") else {
+        return;
+    };
+    let tip = match error {
+        // Deliberately says what to do, not just what broke: the tooltip is
+        // the whole message for a user who does not know the tray menu opens
+        // Settings.
+        Some(_) => "YSpot — the hotkey is unavailable. Click to open, or right-click for Settings.",
+        None => "YSpot",
+    };
+    if let Err(e) = tray.set_tooltip(Some(tip)) {
+        log::warn!("tray: set tooltip: {e}");
+    }
+}
+
 fn on_menu(
     app: &AppHandle,
     _handle: &AppHandle,
