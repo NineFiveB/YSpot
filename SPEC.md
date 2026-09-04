@@ -498,7 +498,8 @@ One keystroke — one generation (`gen`) — produces results from multiple sour
 - **Every action MUST be keyboard-reachable**: primary action, action panel (Ctrl+K), navigation stack, settings. §5.7's model already guarantees this structurally; it is restated here as a hard requirement so no future surface regresses it.
 - **Forced-colors / high contrast**: the design-token layer (§5.8) MUST resolve to system colors under `forced-colors: active`; no state may be conveyed by color alone.
 - Both themes MUST meet **WCAG 2.1 AA contrast**.
-- **M1 exit criterion**: the launcher is operable end-to-end (summon → type → navigate → execute → dismiss) with **Narrator** and with **NVDA** (§10).
+- **Screen-reader verification is deferred out of M1** (**Amended 2026-09-04**, superseding "M1 exit criterion: the launcher is operable end-to-end (summon → type → navigate → execute → dismiss) with **Narrator** and with **NVDA** (§10)"). Every requirement above stays normative and is implemented: the combobox/`aria-activedescendant` pattern, the debounced polite live region, keyboard reachability, forced-colors, and AA contrast — the last guarded by a test that reads the real token values. What is deferred is the manual end-to-end run with a screen reader, which nothing automated substitutes for and which needs a person listening.
+  The cost is stated rather than hidden: the markup is believed correct, not known to be. A reader that announces nothing as the selection moves, talks over typing, or goes silent after the action panel opens would look exactly like this. Revisit before any release that has to make a conformance claim (Section 508 / EN 301 549 procurement language is the usual trigger), and treat the runs as the first thing to do then.
 
 ### 5.13 Unicode, IME, and language
 
@@ -826,7 +827,7 @@ M0 was measured on Machine-A-class hardware with one recorded variance: 16 GB RA
 
 ### M1 — Core launcher, daily-drivable (4–6 weeks)
 **Goal:** replace PowerToys Run for the author full-time. **Scope:** Win32 + UWP app launching (Start Menu, `AppsFolder`), ms-settings catalog + Control Panel tasks, file search UI with actions (open, reveal, copy path, copy file), calculator, clipboard history and window management (native, §7.4/§7.5), tray icon, autostart, settings window, multi-monitor placement, onboarding, shell-side OleDB fallback for non-NTFS scopes (§3.1, error 107 routing), crash reporting (opt-in, §8.5).
-**Exit criteria:** author dogfoods exclusively for 2 weeks with no daily crash; all M0 budgets still green under CI benchmark; portable mode functional; launcher operable end-to-end with Narrator and NVDA (§5 accessibility NFR).
+**Exit criteria:** author dogfoods exclusively for 2 weeks with no daily crash; all M0 budgets still green under CI benchmark; portable mode functional. (The Narrator/NVDA end-to-end run was an exit criterion here until **2026-09-04**; §5.12 records the amendment and what it costs. §5.12's implementation requirements are unchanged and met.)
 
 ### M2 — Content search (3–4 weeks)
 **Goal:** ship the differentiator. **Scope:** Tantivy full-text index with opt-in scopes UI, incremental reindex from USN events, text/PDF/Office extractors running in the sandboxed `yspot-extract` worker (§2.2, §8.1), `content:` query prefix + ranking merge, preview pane with hit highlighting.
