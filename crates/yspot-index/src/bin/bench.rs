@@ -1369,12 +1369,12 @@ only by that one entry — the trigram postings that used to appear between them
         }
         println!("{}", "-".repeat(96));
         println!(
-            "OVERALL: {}  (advisory{})",
+            "OVERALL: {}  ({})",
             verdict(self.overall_pass),
             if self.strict {
-                "; --strict → non-zero exit on failure"
+                "gating: --strict makes a budget miss a non-zero exit"
             } else {
-                "; pass --strict to make this gating"
+                "advisory; pass --strict to make this gating"
             }
         );
         println!(

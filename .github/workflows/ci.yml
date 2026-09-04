@@ -59,15 +59,25 @@ jobs:
       - name: "Side-effecting shell tests (clipboard, Recycle Bin)"
         run: cargo test -p yspot-shell -- --ignored
 
-      # SPEC §10 M0 wants measured evidence for the §3.4 matching path before
-      # feature work proceeds. Advisory on purpose — no --strict yet: a shared,
-      # throttled runner is not reference Machine A/B, so this is a regression
-      # tripwire, not M0 sign-off. Flip to --strict once the numbers are stable.
-      - name: "Matching benchmark (advisory)"
+      # SPEC §10 M1 exits on "all M0 budgets still green under the CI
+      # benchmark", so this is now GATING (--strict): a p95 or memory budget
+      # miss fails the build.
+      #
+      # It was advisory while the numbers settled, on the reasoning that a
+      # shared throttled runner is not reference Machine A/B. Flipped on
+      # 2026-09-03 against measured margin: the worst class across four
+      # consecutive runs was 2.2–3.6 ms against the 10 ms per-class budget,
+      # and memory was 146.6 B/entry every single time. A transient runner
+      # stall would have to nearly triple the worst case to make this flake,
+      # and a real regression is exactly what it should catch.
+      #
+      # This gates the SHAPE of the numbers, not reference-hardware
+      # sign-off — that stays deferred with Machine B (§10 amendment).
+      - name: "Matching benchmark (gating)"
         shell: bash
         run: |
           cargo build -p yspot-index --bin bench --release
-          ./target/release/bench.exe --entries 300000 --iterations 100 --json-out bench.json
+          ./target/release/bench.exe --entries 300000 --iterations 100 --json-out bench.json --strict
 
       - name: Upload benchmark metrics
         uses: actions/upload-artifact@v4
