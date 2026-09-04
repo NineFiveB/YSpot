@@ -1120,13 +1120,22 @@ impl VolumeIndex {
         // record is live iff its slot survived AND the slot still points at it
         // — a rename leaves the superseded record behind, and that comparison
         // is the only thing telling the two apart.
-        let recs = std::mem::take(&mut self.arena_recs);
-        let mut fresh: Vec<ArenaRec> = Vec::with_capacity(new_len);
+        // Rewritten in place, like every other column above, rather than
+        // collected into a second vector. The survivors are a subsequence of
+        // `arena_recs` in ascending order, so the write cursor never passes
+        // the read cursor — the same argument that makes the arena copies
+        // leftward. A `Vec::with_capacity(new_len)` here is 8 B per live entry
+        // of transient, which measured as two thirds of compaction's entire
+        // peak and is exactly the "no second copy of `arena_recs`" the design
+        // doc claims for this pass (accel-redesign.md, Step 9).
+        let mut recs = std::mem::take(&mut self.arena_recs);
+        let mut rw = 0usize;
         let (mut fw, mut nw) = (1usize, 0usize); // folded starts past its fence
         {
             let folded = unsafe { self.folded_arena.as_mut_vec() };
             let names = unsafe { self.name_arena.as_mut_vec() };
-            for rec in &recs {
+            for r in 0..recs.len() {
+                let rec = recs[r];
                 let ns = remap[rec.slot as usize];
                 if ns == DEAD_SLOT {
                     continue;
@@ -1143,10 +1152,12 @@ impl VolumeIndex {
                 let entry = &mut self.entries[ns as usize];
                 entry.folded_off = fw as u32;
                 entry.name_off = nw as u32;
-                fresh.push(ArenaRec {
+                debug_assert!(rw <= r, "arena_recs write cursor passed its read cursor");
+                recs[rw] = ArenaRec {
                     off: fw as u32,
                     slot: ns,
-                });
+                };
+                rw += 1;
                 fw += fl;
                 folded[fw] = FOLDED_DELIM;
                 fw += 1;
@@ -1154,10 +1165,11 @@ impl VolumeIndex {
             }
             // An index with nothing live carries no opening fence either;
             // `intern` lays one down again on the next insert.
-            folded.truncate(if fresh.is_empty() { 0 } else { fw });
+            folded.truncate(if rw == 0 { 0 } else { fw });
             names.truncate(nw);
         }
-        self.arena_recs = fresh;
+        recs.truncate(rw);
+        self.arena_recs = recs;
 
         // `owner` maps arena blocks to records, so it follows the arenas.
         self.owner.clear();

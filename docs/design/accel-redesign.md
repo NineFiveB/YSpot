@@ -439,6 +439,54 @@ trigger the arenas carry 25% stale bytes, so the slope there is 2.578.
 200 MB/1M hard cap. Phase B = Phase A − 27.26 for the open-addressed
 `frn_index` of Step 12.)
 
+### §G. The same table, measured (2026-09-03)
+
+§F is arithmetic. `crates/yspot-index/tests/compaction_peak.rs` measures it
+with a counting global allocator — the gate Step 9 asked for and never got —
+building a corpus at a chosen mean folded-name length, churning until
+`should_compact()` fires, and recording the allocation high-water mark across
+`compact()` itself. At 1M entries, which is the size the per-1M budget is
+written for:
+
+| L | steady | at trigger | **peak** | transient |
+|---:|---:|---:|---:|---:|
+| 26.0 | 142.6 | 163.2 | **167.9 (84.0%)** | 4.77 |
+| 31.0 | 152.4 | 176.1 | **180.8 (90.4%)** | 4.77 |
+| 36.0 | 162.3 | 190.0 | **194.8 (97.4%)** | 4.77 |
+
+**Three corrections to §F.**
+
+1. **The transient was not 4.50 MB/1M; it was 12.4.** §F counts only the
+   `remap` array. Pass 3 also built `fresh: Vec<ArenaRec>` with
+   `Vec::with_capacity(new_len)` — 8 B per live entry, a second copy of
+   `arena_recs`, which is the very thing this step's own rule forbids and its
+   prose claims it does not do. `arena_recs` is now rewritten in place like
+   every other column, on the same write-cursor-never-passes-read-cursor
+   argument that already justifies the arena copies, and the measured
+   transient is **4.77 MB/1M** — the `remap` array and nothing else, as
+   written. The test is the standing tripwire.
+2. **§F over-states steady state by about 11 MB/1M**, and the peak with it. Its
+   173.4 at L = 34.6 measures 162.3 at L = 36 — a *higher* L. The two errors
+   ran in opposite directions and roughly cancelled, which is why §F's totals
+   looked plausible.
+3. **The cap is not breached anywhere in the measured range.** §F's headline
+   — "102.4% at L = 34.6", the whole argument for scheduling Step 12 — does
+   not reproduce: the measurement is **97.4% at L = 36**, past the worst real
+   corpus (34.6, the 554k walk).
+
+**What this does and does not settle.** The corpus is synthetic: generated
+names of a controlled mean length under one parent. It exercises the same
+per-entry structures a real volume does, and `ram_bytes()` agrees with the
+allocator to within 0.1%, but it is not a real name-length *distribution*.
+And the number measured is allocator bytes, while §10's gate is RSS: M0's
+1.09M run reported 163 MB RSS against a model of ~155, so roughly 5% slack
+sits on top of every figure above. Applying it, L = 36 lands at ~205 MB —
+marginally over — while L ≤ 31 stays clear.
+
+So the honest reading is that Phase A holds across the measured range with
+the margin thinning at the top of it, not that it fails at L = 34.6. Step 12
+buys 27 B/entry of headroom; it is no longer required to clear the cap.
+
 **What changes.**
 
 1. **Steady state holds everywhere measured.** Phase A steady is 164–173
