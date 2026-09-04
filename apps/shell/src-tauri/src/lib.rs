@@ -168,6 +168,17 @@ fn rebind_hotkey(
 #[derive(Default)]
 struct WarmState(AtomicBool);
 
+/// A view asked for before the page could listen.
+///
+/// `emit` reaches whatever is listening *now*. During `setup` the webview has
+/// not run its `listen()` calls yet, so a view opened from the command line
+/// (`--settings`), first-run onboarding, or §5.1's conflict remedy is emitted
+/// into nothing: the launcher appears showing an empty query instead of the
+/// thing that was asked for. [`frontend_ready`] replays it — the same
+/// handshake, and the same reason, as the pipe's connection state.
+#[derive(Default)]
+struct PendingView(Mutex<Option<String>>);
+
 /// Whether the launcher is showing a view opened in place (Settings) rather
 /// than the results list.
 ///
@@ -479,6 +490,19 @@ fn frontend_ready(
     }
     // The connect event may have fired before the frontend was listening.
     pipe_client::emit_conn_state(&app, pipe.is_connected());
+    // And so may a view request: `--settings`, first-run onboarding, or
+    // §5.1's conflict remedy all run during `setup`, before this page existed.
+    // Taken, not cloned — a reload must not reopen a view the user has since
+    // left.
+    if let Some(pending) = app.try_state::<PendingView>() {
+        let view = pending.0.lock().ok().and_then(|mut g| g.take());
+        if let Some(view) = view {
+            log::debug!("frontend ready: replaying {view}");
+            if let Err(e) = app.emit(&view, ()) {
+                log::warn!("could not replay {view}: {e}");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -674,6 +698,12 @@ const FALLBACK_BASE_SCORE: f32 = 0.5;
 /// the catalog's own bands (§5.11) or portable mode would bury real matches
 /// under whatever the OS index happened to return. Checked at compile time
 /// because both sides are constants and neither should drift into the other.
+///
+/// This bounds the *base*, deliberately, not the base plus frecency. A file
+/// you open daily is meant to climb past a substring match you have never
+/// opened — that is what §7.1 is for, and apps, settings and windows have
+/// always behaved that way. The bound that matters is that an *unranked* hit
+/// does not start above a scored one.
 const _: () = assert!(FALLBACK_BASE_SCORE < matcher::SUBSTRING);
 
 #[derive(Serialize, Clone)]
@@ -897,6 +927,18 @@ fn get_settings(app: AppHandle, store: tauri::State<'_, Arc<SettingsStore>>) -> 
     }
 }
 
+/// Whether saving these settings should go to the registrar.
+///
+/// A changed chord obviously must. An unchanged one must too when the current
+/// chord is not actually held: §5.1 offers Ctrl+Space among its alternatives,
+/// so the chord a user clicks off the conflict banner can be the one already
+/// in their settings. Treating that as a no-op makes the offered remedy do
+/// nothing at all — no retry, no cleared banner, and a "saved" toast — while
+/// the program that took the chord may well have released it since startup.
+fn should_rebind(current: &settings::Hotkey, next: &settings::Hotkey, contested: bool) -> bool {
+    current != next || contested
+}
+
 /// §5.9: every mutation goes through the shell. A changed hotkey is rebound
 /// atomically before anything is persisted, so the file can never name a
 /// chord the running shell does not hold.
@@ -907,8 +949,19 @@ fn save_settings(
     next: Settings,
 ) -> Result<SettingsView, String> {
     let current = store.get();
-    if next.hotkey != current.hotkey {
-        rebind_hotkey(&app, Some(&current.hotkey), &next.hotkey)?;
+    // Retried even when the chord has not changed, if it is not currently
+    // held: §5.1 offers Ctrl+Space as an alternative, so the chord a user
+    // picks off the conflict banner can be the one they already have. Skipping
+    // on equality would make that click do nothing at all — no retry, no
+    // cleared banner, and a "saved" toast — while the other program may well
+    // have let the chord go since startup.
+    let contested = HotkeyState::get(&app).is_some();
+    if should_rebind(&current.hotkey, &next.hotkey, contested) {
+        // `None` when nothing is bound: there is no old chord to restore, and
+        // passing the contested one would unregister a registration we do not
+        // hold.
+        let old = (!contested).then_some(&current.hotkey);
+        rebind_hotkey(&app, old, &next.hotkey)?;
     }
     let warning = next.hotkey.warning().map(str::to_string);
     if next.diagnostics != current.diagnostics {
@@ -960,6 +1013,17 @@ fn show_view(app: &AppHandle, event: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("launcher") {
         if !window.is_visible().unwrap_or(false) {
             show(app);
+        }
+    }
+    // Until the page has signalled ready once, this emit goes nowhere.
+    let warm = app
+        .try_state::<WarmState>()
+        .is_some_and(|w| w.0.load(Ordering::SeqCst));
+    if !warm {
+        if let Some(pending) = app.try_state::<PendingView>() {
+            if let Ok(mut g) = pending.0.lock() {
+                *g = Some(event.to_string());
+            }
         }
     }
     app.emit(event, ())
@@ -1138,6 +1202,7 @@ pub fn run() {
         .manage(icon_cache)
         .manage(WarmState::default())
         .manage(HotkeyState::default())
+        .manage(PendingView::default())
         .invoke_handler(tauri::generate_handler![
             search,
             hide_window,
@@ -1303,6 +1368,23 @@ mod tests {
         assert_eq!(chord.rejection(), None);
         let live = Some("Alt + Space could not be registered.".to_string());
         assert_eq!(hotkey_error(live.clone(), &chord), live);
+    }
+
+    #[test]
+    fn the_offered_alternative_is_retried_even_when_it_is_the_current_chord() {
+        let chord = alt_space();
+        let other = settings::Hotkey {
+            ctrl: true,
+            alt: false,
+            ..alt_space()
+        };
+        // Nothing wrong: an unchanged chord is a no-op, a changed one binds.
+        assert!(!should_rebind(&chord, &chord, false));
+        assert!(should_rebind(&chord, &other, false));
+        // Contested: §5.1's alternatives include chords a user may already
+        // have, and clicking one has to actually try again.
+        assert!(should_rebind(&chord, &chord, true));
+        assert!(should_rebind(&chord, &other, true));
     }
 
     #[test]

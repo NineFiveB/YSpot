@@ -17,7 +17,7 @@
 // an existing install sees this once too.
 
 import { useCallback, useEffect, useState, type ReactElement } from "react";
-import { describeHotkey } from "./Settings";
+import { ALTERNATIVES, describeHotkey } from "./Settings";
 import * as ipc from "./lib/ipc";
 
 interface Props {
@@ -85,10 +85,41 @@ export default function Onboarding({ onClose }: Props): ReactElement {
                 ? `That chord could not be registered: ${state.hotkeyError}`
                 : `Press ${state ? describeHotkey(state.hotkey) : "the hotkey"} anywhere to summon YSpot.`}
             </p>
-            <p className="settings-note">
-              If something else already owns it — PowerToys Run and Copilot both like
-              Alt+Space — you can change it in Settings at any time.
-            </p>
+            {/*
+              §5.1 wants the conflict named AND one-click alternatives, wherever
+              it is shown. Offering them only in Settings would leave the wizard
+              reporting a launcher the user cannot summon and no way out of it
+              — and this is the first screen, before they know Settings exists.
+            */}
+            {state?.hotkeyError ? (
+              <div className="settings-alternatives">
+                {ALTERNATIVES.map((h) => (
+                  <button
+                    key={describeHotkey(h)}
+                    className="chord"
+                    disabled={!settings}
+                    onClick={() => {
+                      if (!settings) return;
+                      setError(null);
+                      void ipc
+                        .saveSettings({ ...settings, hotkey: h })
+                        // Re-read rather than assume: the chosen chord can be
+                        // taken too, and the next screen must not claim a
+                        // binding that did not happen.
+                        .then(refresh)
+                        .catch((e) => setError(String(e)));
+                    }}
+                  >
+                    {describeHotkey(h)}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="settings-note">
+                If something else takes it later — PowerToys Run and Copilot both like
+                Alt+Space — you can change it in Settings at any time.
+              </p>
+            )}
           </>
         ) : null}
 

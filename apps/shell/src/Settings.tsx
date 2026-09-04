@@ -57,8 +57,12 @@ export function describeChord(h: ipc.Hotkey): string {
   return parts.join("+");
 }
 
-/** §5.1 offers these one click away when the chosen chord is taken. */
-const ALTERNATIVES: ipc.Hotkey[] = [
+/**
+ * §5.1 offers these one click away when the chosen chord is taken. Exported
+ * because onboarding runs the same conflict flow — §5.1 asks for the
+ * alternatives wherever the conflict is shown, not only in Settings.
+ */
+export const ALTERNATIVES: ipc.Hotkey[] = [
   { ctrl: true, alt: false, shift: false, win: false, code: "Space" },
   { ctrl: true, alt: true, shift: false, win: false, code: "Space" },
   { ctrl: true, alt: false, shift: true, win: false, code: "Space" },
