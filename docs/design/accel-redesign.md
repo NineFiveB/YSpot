@@ -474,14 +474,22 @@ written for:
    not reproduce: the measurement is **97.4% at L = 36**, past the worst real
    corpus (34.6, the 554k walk).
 
-**What this does and does not settle.** The corpus is synthetic: generated
-names of a controlled mean length under one parent. It exercises the same
-per-entry structures a real volume does, and `ram_bytes()` agrees with the
-allocator to within 0.1%, but it is not a real name-length *distribution*.
-And the number measured is allocator bytes, while §10's gate is RSS: M0's
-1.09M run reported 163 MB RSS against a model of ~155, so roughly 5% slack
-sits on top of every figure above. Applying it, L = 36 lands at ~205 MB —
-marginally over — while L ≤ 31 stays clear.
+**What this does and does not settle.** The corpus is synthetic — generated
+names of a controlled mean length under one parent — and the first version of
+this note called that a caveat. It mostly is not, and the test now says so:
+the arenas store names end to end, so their size is the *sum* of the lengths
+and nothing else, and every other per-entry structure is a fixed stride or a
+fixed-size set. Two corpora with the same mean and deliberately opposite
+shapes (clustered, versus seven short names to one very long) measure
+**identical to three decimal places** in both steady state and peak. Only the
+mean counts, which is the one parameter the table is indexed by.
+
+What does remain: the number measured is allocator bytes, while §10's gate is
+RSS. M0's 1.09M run reported 163 MB RSS against a model of ~155, so roughly
+5% slack sits on top of every figure above. Applying it, L = 36 lands at
+~205 MB — marginally over — while L ≤ 31 stays clear. That is the real
+remaining uncertainty, and it is a question about allocator behaviour rather
+than about the corpus.
 
 So the honest reading is that Phase A holds across the measured range with
 the margin thinning at the top of it, not that it fails at L = 34.6. Step 12

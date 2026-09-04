@@ -59,6 +59,17 @@ jobs:
       - name: "Side-effecting shell tests (clipboard, Recycle Bin)"
         run: cargo test -p yspot-shell -- --ignored
 
+      # §10's memory budget is a per-1M number, and the index structures that
+      # do NOT scale with entry count (a flat 2 MiB `tri_present`, `frn_map`'s
+      # power-of-two buckets) make a small run say nothing about it — so this
+      # measures at a real million and is #[ignore]d for developers. Release,
+      # because a million-entry churn in debug is a minute rather than seconds,
+      # and the crate is already built release for the benchmark below.
+      #
+      # Separate from the --ignored step above, which is scoped to yspot-shell.
+      - name: "Compaction peak against the §3.4 memory budget"
+        run: cargo test --release -p yspot-index --test compaction_peak -- --ignored --nocapture
+
       # SPEC §10 M1 exits on "all M0 budgets still green under the CI
       # benchmark", so this is now GATING (--strict): a p95 or memory budget
       # miss fails the build.

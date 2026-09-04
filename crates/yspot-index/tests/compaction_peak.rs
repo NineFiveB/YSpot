@@ -15,11 +15,13 @@
 //! the steady state after a compaction, the state at the moment the trigger
 //! fires, and the true allocation peak *during* `compact()`.
 //!
-//! **Everything runs in one test, on purpose.** The counters are global to the
-//! process, and the harness runs `#[test]` functions on threads by default —
-//! two measurements in flight at once would each be reading the other's
-//! allocations. Splitting these into separate test functions is a mistake that
-//! looks like a refactor.
+//! **Measurements are serialised by a lock, and must be.** The counters are
+//! global to the process and the harness runs `#[test]` functions on threads,
+//! so two measurements in flight at once each read the other's allocations —
+//! not as noise, but as numbers two to three times too large that still look
+//! like plausible megabytes. A comment saying "keep this to one test" was the
+//! first attempt and it lasted exactly until the next test was added; the lock
+//! in [`measure_with`] is the version that cannot be forgotten.
 //!
 //! **What the allocator can and cannot see.** It counts bytes handed out by
 //! the global allocator, which is what the process asks for — not RSS, which
@@ -32,6 +34,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use yspot_index::index::VolumeIndex;
 use yspot_index::{EntrySink, UsnEvent};
@@ -101,16 +104,21 @@ unsafe impl GlobalAlloc for Tracking {
 #[global_allocator]
 static ALLOC: Tracking = Tracking;
 
-/// Names whose mean *folded* length is about `target_len`.
+/// Roughly ±40% around the mean: what an ordinary directory looks like.
+const TIGHT: [i32; 8] = [-7, 4, -3, 9, -5, 2, 6, -6];
+
+/// The same mean, wildly different shape: seven short names to one very long
+/// one. Both spreads sum to zero, so both corpora carry the same total arena
+/// bytes at the same entry count.
+const HEAVY_TAILED: [i32; 8] = [-18, -18, -18, -18, -18, -18, -18, 126];
+
+/// A name whose mean *folded* length across the corpus is `target_len`.
 ///
-/// Deliberately varied rather than uniform: the arena packs them end to end,
-/// so a fixed length would hide the rounding that real corpora pay, and the
-/// whole point is to land on a realistic mean.
-fn name_for(i: usize, target_len: usize) -> String {
-    // A spread of roughly ±40% around the target, cycling so the mean lands
-    // where it is asked to.
-    const SPREAD: [i32; 8] = [-7, 4, -3, 9, -5, 2, 6, -6];
-    let delta = SPREAD[i % SPREAD.len()];
+/// Varied rather than uniform: the arena packs names end to end, so a fixed
+/// length would hide the rounding a real corpus pays. `spread` sums to zero,
+/// which is what puts the mean where it is asked for.
+fn name_from(i: usize, target_len: usize, spread: &[i32]) -> String {
+    let delta = spread[i % spread.len()];
     let len = (target_len as i32 + delta).max(4) as usize;
     let stem = format!("f{i:0>9}");
     let mut s = String::with_capacity(len);
@@ -136,12 +144,23 @@ fn per_1m(bytes: usize, entries: usize) -> f64 {
     bytes as f64 / entries as f64 * 1_000_000.0 / (1024.0 * 1024.0)
 }
 
+/// The ordinary corpus: clustered lengths around the mean.
+fn measure(entries: usize, target_len: usize) -> Measured {
+    measure_with(entries, target_len, &TIGHT)
+}
+
+/// Held for the whole of a measurement: the counters below it are global.
+static MEASURING: Mutex<()> = Mutex::new(());
+
 /// Fill, settle, churn to the trigger, compact — recording the allocator the
 /// whole way.
-fn measure(entries: usize, target_len: usize) -> Measured {
+fn measure_with(entries: usize, target_len: usize, spread: &[i32]) -> Measured {
+    // Poisoning is irrelevant here: a panicking measurement leaves no state
+    // behind that a later one reads, only counters each one re-baselines.
+    let _serial = MEASURING.lock().unwrap_or_else(|e| e.into_inner());
     let mut ix = VolumeIndex::new(0, "C:\\".to_string());
     for i in 0..entries {
-        ix.add(i as u64 + 2, 1, &name_for(i, target_len), 0);
+        ix.add(i as u64 + 2, 1, &name_from(i, target_len, spread), 0);
     }
     ix.finish();
     ix.finalize();
@@ -157,7 +176,7 @@ fn measure(entries: usize, target_len: usize) -> Measured {
         ix.apply(UsnEvent::Create {
             frn: next,
             parent_frn: 1,
-            name: name_for(next as usize, target_len),
+            name: name_from(next as usize, target_len, spread),
             flags: 0,
         });
         next += 1;
@@ -202,6 +221,55 @@ fn measure(entries: usize, target_len: usize) -> Measured {
     }
 }
 
+/// Whether the corpus being synthetic actually matters.
+///
+/// Everything above is generated names, and the obvious objection is that a
+/// real volume's name lengths are not shaped like that. Structurally it should
+/// not matter: the arenas store names end to end, so their size is the *sum*
+/// of the lengths and nothing else, and every other per-entry structure here
+/// is a fixed stride or a fixed-size set. Distribution shape should be
+/// invisible to memory, and only the mean should count.
+///
+/// That is a claim, so it is tested rather than asserted in prose: two corpora
+/// with the same mean and very different shapes — one clustered, one seven
+/// short names to a very long one — must land in the same place. If they ever
+/// do not, the memory model has a term in it nobody has written down, and the
+/// §G table's synthetic caveat becomes a real one.
+#[test]
+fn the_shape_of_the_names_does_not_move_the_budget_only_their_mean() {
+    const ENTRIES: usize = 120_000;
+
+    let tight = measure_with(ENTRIES, 30, &TIGHT);
+    let tailed = measure_with(ENTRIES, 30, &HEAVY_TAILED);
+
+    // Same mean by construction; confirm the corpora really did land together
+    // before comparing what they cost.
+    let mean_gap = (tight.mean_folded - tailed.mean_folded).abs();
+    assert!(
+        mean_gap < 0.5,
+        "the two corpora do not share a mean: {:.2} vs {:.2}",
+        tight.mean_folded,
+        tailed.mean_folded
+    );
+
+    for (what, a, b) in [
+        ("steady", tight.steady, tailed.steady),
+        ("peak", tight.peak, tailed.peak),
+    ] {
+        let ratio = a as f64 / b as f64;
+        println!(
+            "{what}: clustered {:.1} MB/1M vs heavy-tailed {:.1} (ratio {ratio:.3})",
+            per_1m(a, tight.entries),
+            per_1m(b, tailed.entries),
+        );
+        assert!(
+            (0.98..=1.02).contains(&ratio),
+            "{what} moved {:.1}% when only the name-length SHAPE changed — the memory model              depends on something other than the mean, and §G's synthetic corpus stops being              a fair stand-in for a real one",
+            (ratio - 1.0).abs() * 100.0
+        );
+    }
+}
+
 /// The §F memory table at the size the cap is actually written for.
 ///
 /// §10's budget is *per 1M entries*, and several structures here do not scale
@@ -214,31 +282,60 @@ fn measure(entries: usize, target_len: usize) -> Measured {
 ///
 /// Hence two tests: the fast one below guards the transient invariant on every
 /// `cargo test`, and this one produces the numbers the §F table and the Step 12
-/// ruling are actually about. `#[ignore]`d for runtime, like the rest of this
-/// repo's slow and side-effecting tests; CI runs it with `--ignored`.
+/// ruling are actually about. `#[ignore]`d for runtime — a million-entry churn
+/// is a minute in debug — and run by CI in release as its own step, because the
+/// repo's blanket `--ignored` pass is scoped to `yspot-shell`.
+///
+/// **What it gates, and what it only reports.** §10 promises RSS under 200 MB
+/// at 1M files, and real volumes measure L = 25 (the 1.09M MFT run) to 34.6
+/// (the 554k walk, a user-file-heavy subtree rather than a volume). The two
+/// rows inside that range are asserted. The L = 36 row is a stress point past
+/// anything measured, kept because it is where the margin goes thin and that
+/// is worth seeing — but failing a build on it would be gating a number no
+/// real corpus has produced.
 #[test]
-#[ignore = "builds and churns 1M entries; CI runs it with --ignored"]
+#[ignore = "builds and churns 1M entries; CI runs it in release as its own step"]
 fn the_memory_budget_at_one_million_entries() {
     const ENTRIES: usize = 1_000_000;
+    /// §10's hard cap, MB per 1M entries.
+    const CAP: f64 = 200.0;
+    /// Past the worst real corpus (L = 34.6): reported, not gated.
+    const STRESS_ABOVE: f64 = 35.0;
 
     println!(
         "
      L   steady   trigger     peak   transient   ram_bytes()   (MB per 1M entries)"
     );
+    let mut asserted = 0;
     for target in [25usize, 30, 35] {
         let m = measure(ENTRIES, target);
         let peak = per_1m(m.peak, m.entries);
+        let stress = m.mean_folded > STRESS_ABOVE;
         println!(
-            "  {:>4.1}   {:>6.1}   {:>7.1}   {:>6.1}   {:>9.2}   {:>11.1}   {}",
+            "  {:>4.1}   {:>6.1}   {:>7.1}   {:>6.1}   {:>9.2}   {:>11.1}   {:.1}% of cap{}",
             m.mean_folded,
             per_1m(m.steady, m.entries),
             per_1m(m.trigger, m.entries),
             peak,
             per_1m(m.peak.saturating_sub(m.trigger), m.entries),
             per_1m(m.reported as usize, m.entries),
-            if peak > 200.0 { "OVER THE CAP" } else { "" },
+            peak / CAP * 100.0,
+            if stress {
+                "  (stress row, not gated)"
+            } else {
+                ""
+            },
         );
+        if !stress {
+            assert!(
+                peak < CAP,
+                "compaction peak {peak:.1} MB/1M is over §10's {CAP} cap at L={:.1}, which is                  inside the range real volumes measure (25–34.6)",
+                m.mean_folded
+            );
+            asserted += 1;
+        }
     }
+    assert!(asserted >= 2, "the gated rows stopped being gated");
 }
 
 /// The §F memory table, measured.
