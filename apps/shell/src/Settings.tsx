@@ -233,12 +233,12 @@ export default function Settings({ onClose }: Props): ReactElement {
             </div>
             <input
               type="checkbox"
-              checked={view.settings.diagnostics?.crashReports ?? false}
+              checked={view.settings.diagnostics?.crash_reports ?? false}
               onChange={(e) =>
                 void apply(
                   {
                     ...view.settings,
-                    diagnostics: { crashReports: e.target.checked },
+                    diagnostics: { crash_reports: e.target.checked },
                   },
                   e.target.checked ? "Crash reports on" : "Crash reports off",
                 )

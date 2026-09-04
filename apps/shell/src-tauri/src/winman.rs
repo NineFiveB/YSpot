@@ -82,17 +82,13 @@ impl WindowCache {
         if stale {
             guard.0 = enumerate();
             guard.1 = Some(Instant::now());
-            log::debug!(
-                "windows: {} alt-tab-eligible ({})",
-                guard.0.len(),
-                guard
-                    .0
-                    .iter()
-                    .take(5)
-                    .map(|w| format!("{:?}", w.title))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
+            // Count, not titles. A window title is a document name, an email
+            // subject, a browser tab — "Reset your password — <bank>" — and
+            // `RUST_LOG=debug` is the documented way to diagnose the
+            // launcher, so anything printed here ends up in a log file the
+            // user may hand to someone else. The count is what actually
+            // answers "did enumeration find anything".
+            log::debug!("windows: {} alt-tab-eligible", guard.0.len());
         }
         guard.0.clone()
     }

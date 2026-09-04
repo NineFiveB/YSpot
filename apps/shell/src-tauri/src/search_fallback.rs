@@ -123,9 +123,12 @@ fn build_query(query: &str, max: usize) -> Result<(String, String), SearchError>
             .ConnectionString()
             .map_err(|e| SearchError::Failed(format!("connection string ({e})")))?;
         let (sql, connection) = (take_cotaskmem(sql), take_cotaskmem(connection));
-        // The generated SQL is the first thing to look at when a query that
-        // works in another tool returns nothing here.
-        log::debug!("windows search sql: {sql}");
+        // The generated SQL embeds the user's raw query verbatim, so it is
+        // not logged. The SELECT list is fixed by the caller above, which
+        // leaves the length as the only part that says anything — enough to
+        // tell "the helper produced nothing" from "the provider refused it",
+        // which is what this line was for.
+        log::debug!("windows search sql: {} chars", sql.len());
         Ok((sql, connection))
     }
 }

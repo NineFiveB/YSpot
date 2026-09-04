@@ -99,7 +99,7 @@ export default function Onboarding({ onClose }: Props): ReactElement {
               and asks for administrator rights once.
             </p>
             <p className="settings-note">
-              {state?.service_connected
+              {state?.serviceConnected
                 ? "It is installed and running, so file search is already instant."
                 : "It is not running. YSpot works without it — apps, settings, the calculator, clipboard history and window management are unaffected — and file search falls back to Windows Search, which is slower."}
             </p>
@@ -155,12 +155,12 @@ export default function Onboarding({ onClose }: Props): ReactElement {
             <label className="clip-toggle">
               <input
                 type="checkbox"
-                checked={state?.crash_reports ?? false}
+                checked={state?.crashReports ?? false}
                 onChange={(e) => {
                   const want = e.target.checked;
                   if (!settings) return;
                   void ipc
-                    .saveSettings({ ...settings, diagnostics: { crashReports: want } })
+                    .saveSettings({ ...settings, diagnostics: { crash_reports: want } })
                     .then(refresh)
                     .catch((err) => setError(String(err)));
                 }}

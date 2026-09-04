@@ -144,6 +144,28 @@ pub struct Diagnostics {
     pub crash_reports: bool,
 }
 
+/// §7.4 clipboard history settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Clipboard {
+    /// Whether new items are recorded. On by default, but pausing it is a
+    /// privacy control — someone unticks it before working with a password
+    /// vault — so it lives here rather than in memory: a pause that forgets
+    /// itself at the next logon is worse than no pause at all, because the
+    /// user believes the history is still off.
+    #[serde(default = "yes")]
+    pub capture: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for Clipboard {
+    fn default() -> Self {
+        Clipboard { capture: true }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
@@ -152,6 +174,8 @@ pub struct Settings {
     pub theme: Theme,
     #[serde(default)]
     pub diagnostics: Diagnostics,
+    #[serde(default)]
+    pub clipboard: Clipboard,
     /// Whether first-run onboarding has been completed (§5.9). Absent in a
     /// file written before onboarding existed, which reads as `false` — so
     /// an existing install sees the wizard once, which is the right answer:
@@ -317,6 +341,42 @@ mod tests {
         // §8.5 and §5.9 both make this opt-in; a default of `true` would be
         // the kind of thing nobody notices until it ships.
         assert!(!Settings::default().diagnostics.crash_reports);
+    }
+
+    #[test]
+    fn clipboard_capture_is_on_unless_the_file_says_otherwise() {
+        assert!(Settings::default().clipboard.capture);
+        // A file written before the field existed keeps recording, which is
+        // the previous behaviour; one that says "paused" stays paused.
+        let older: Settings = serde_json::from_str(r#"{"theme":"dark"}"#).unwrap();
+        assert!(older.clipboard.capture);
+        let paused: Settings = serde_json::from_str(r#"{"clipboard":{"capture":false}}"#).unwrap();
+        assert!(!paused.clipboard.capture);
+    }
+
+    /// The frontend reads and writes this file's exact key names, and getting
+    /// one wrong fails silently in both directions: a misspelled key on read
+    /// is `undefined`, and on write it lands in the flattened `extra` bag
+    /// while the real field defaults. Both happened. Pin the names.
+    #[test]
+    fn the_wire_keys_are_the_ones_the_frontend_uses() {
+        let json = serde_json::to_value(Settings::default()).unwrap();
+        let obj = json.as_object().expect("an object");
+        for key in ["hotkey", "theme", "diagnostics", "clipboard", "onboarded"] {
+            assert!(obj.contains_key(key), "settings.json lost `{key}`");
+        }
+        assert!(
+            json["diagnostics"].get("crash_reports").is_some(),
+            "diagnostics.crash_reports renamed; Settings.tsx and Onboarding.tsx write this key"
+        );
+        assert!(
+            json["clipboard"].get("capture").is_some(),
+            "clipboard.capture renamed"
+        );
+        // And a round trip must not quietly relocate a known field into the
+        // unknown-key bag, which is what a rename would look like.
+        let back: Settings = serde_json::from_value(json).unwrap();
+        assert!(back.extra.is_empty(), "a known field leaked into `extra`");
     }
 
     #[test]

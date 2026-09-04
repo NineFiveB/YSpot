@@ -325,13 +325,25 @@ export interface Hotkey {
 
 /** §8.5 consent, opt-in and stored so onboarding sets it once. */
 export interface Diagnostics {
-  crashReports: boolean;
+  // snake_case, unlike the rest of the IPC surface. `Settings` is not just a
+  // wire type — it IS the on-disk shape of settings.json — so the Rust side
+  // carries no `rename_all`, and these keys have to match the file. Writing
+  // `crashReports` here does not fail: `Settings` keeps unknown keys in a
+  // flattened bag, so the wrong spelling was persisted as junk while the
+  // real consent silently stayed false.
+  crash_reports: boolean;
+}
+
+/** §7.4 clipboard settings. Same snake_case rule as `Diagnostics`. */
+export interface ClipboardSettings {
+  capture: boolean;
 }
 
 export interface Settings {
   hotkey: Hotkey;
   theme: "system" | "light" | "dark";
   diagnostics: Diagnostics;
+  clipboard: ClipboardSettings;
   [key: string]: unknown;
 }
 
@@ -436,9 +448,9 @@ export function setAutostart(enabled: boolean): Promise<unknown> {
 export interface OnboardingState {
   hotkey: Hotkey;
   hotkeyError: string | null;
-  service_connected: boolean;
+  serviceConnected: boolean;
   autostart: boolean;
-  crash_reports: boolean;
+  crashReports: boolean;
 }
 
 export function onboardingState(): Promise<OnboardingState> {

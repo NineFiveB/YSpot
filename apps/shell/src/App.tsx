@@ -103,9 +103,24 @@ export default function App(): ReactElement {
 
   inSettingsRef.current = inSettings;
 
+  /**
+   * The list the last merge produced.
+   *
+   * Not the same thing as the `rows` state during the gap between a commit
+   * and React rendering it: `applyBuffered` runs in a rAF callback, so its
+   * `setRows` goes through the scheduler rather than flushing synchronously,
+   * and Chromium dispatches a keydown queued in that window ahead of the
+   * posted render. An arrow key landing there would otherwise freeze the
+   * pre-merge order as if it were what the user could see — which appends
+   * everything the merge had just interleaved to the bottom of the list, the
+   * exact reorder-under-the-cursor §5.11 rule 3 exists to prevent.
+   */
+  const mergedRef = useRef<ipc.Row[]>([]);
+
   /** Recompute the display list and selection from the generation state. */
   const commit = useCallback((st: GenState) => {
     const merged = mergeRows(st);
+    mergedRef.current = merged;
     setRows(merged);
     setSelected(selectionIndex(merged, st.selectedKey));
     return merged;
@@ -227,7 +242,18 @@ export default function App(): ReactElement {
     track(ipc.onOpenSettingsView(() => setView("settings")));
     track(ipc.onOpenClipboardView(() => setView("clipboard")));
     track(ipc.onOpenOnboardingView(() => setView("onboarding")));
-    track(ipc.onViewReset(() => setView("search")));
+    track(
+      ipc.onViewReset(() => {
+        setView("search");
+        // The action panel is part of the surface the dismiss tore down. It
+        // renders conditionally on `panelOpen && selectedItem`, so a flag
+        // left set means it can remount over the next summon's results and
+        // steal focus mid-typing — and because `panelOpenRef` gates §5.7's
+        // refocus rule, a stale `true` leaves the launcher deaf to the
+        // keyboard entirely.
+        setPanelOpen(false);
+      }),
+    );
     track(
       ipc.onWindowShown(() => {
         noteShown();
@@ -273,6 +299,15 @@ export default function App(): ReactElement {
     window.setTimeout(() => inputRef.current?.focus(), 0);
   }, []);
 
+  // The ref exists so the capture-phase key handler below can read the panel
+  // state without re-subscribing on every toggle — not so it can hold a
+  // second opinion about it. Deriving it here means anything that closes the
+  // panel closes it for the refocus rule too, whether or not it remembered
+  // to touch the ref.
+  useEffect(() => {
+    panelOpenRef.current = panelOpen;
+  }, [panelOpen]);
+
   // Capture-phase keydown: typing always goes to the query field (§5.7), and
   // the raw keydown timestamp feeds the latency HUD (§5.10 instrument).
   useEffect(() => {
@@ -299,6 +334,7 @@ export default function App(): ReactElement {
       fallbackBufferRef.current = [];
       setFallbackNote(null);
       // Selection resets to row 0 only here — on a generation change (§5.11).
+      mergedRef.current = [];
       setRows([]);
       setSelected(0);
       appliedGenRef.current = gen;
@@ -395,23 +431,23 @@ export default function App(): ReactElement {
   const clampSel = (i: number): number => Math.max(0, Math.min(i, maxIndex));
 
   /** Arrow/page keys: move the selection and stick it to that row (§5.11). */
-  const moveSelection = useCallback(
-    (delta: number) => {
-      setSelected((prev) => {
-        const next = Math.max(0, Math.min(prev + delta, Math.max(0, rows.length - 1)));
-        const st = stateRef.current;
-        const row = rows[next];
-        if (row) {
-          st.selectedKey = row.key;
-          // Freeze what is on screen: from here, late arrivals append below
-          // rather than reorder around the user's cursor (§5.11 rule 3).
-          st.frozen = rows;
-        }
-        return next;
-      });
-    },
-    [rows],
-  );
+  const moveSelection = useCallback((delta: number) => {
+    setSelected((prev) => {
+      // `mergedRef`, not the `rows` state: see the note on the ref. The two
+      // agree except in the one frame that matters here.
+      const list = mergedRef.current;
+      const next = Math.max(0, Math.min(prev + delta, Math.max(0, list.length - 1)));
+      const st = stateRef.current;
+      const row = list[next];
+      if (row) {
+        st.selectedKey = row.key;
+        // Freeze what is on screen: from here, late arrivals append below
+        // rather than reorder around the user's cursor (§5.11 rule 3).
+        st.frozen = list;
+      }
+      return next;
+    });
+  }, []);
 
   const activateIndex = useCallback(
     (index: number, action = "open") => {

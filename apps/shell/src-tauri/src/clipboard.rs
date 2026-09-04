@@ -44,16 +44,16 @@ use windows::Win32::System::DataExchange::{
     IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
 use windows::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, VK_CONTROL, VK_V,
 };
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowThreadProcessId,
-    RegisterClassW, TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_CLIPBOARDUPDATE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetForegroundWindow, GetMessageW,
+    GetWindowThreadProcessId, RegisterClassW, TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLIPBOARDUPDATE, WNDCLASSW,
 };
 
 use crate::matcher::{self, Ranges, Target};
@@ -121,14 +121,44 @@ struct Entry {
     /// Hash of the full content, for the "same thing copied twice" check.
     hash: u64,
     target: Target,
+    /// The sealed full content, for an entry that has no row on disk yet.
+    ///
+    /// Captures that land before the loader thread installs the connection —
+    /// or at all, when there is no database — would otherwise be listed with
+    /// an id no `SELECT` can resolve, so the row is visible and unpastable.
+    /// Holding the ciphertext here keeps the index self-sufficient; `attach`
+    /// clears it as each entry gains a real row.
+    pending: Option<Vec<u8>>,
+}
+
+/// Where the on-disk half of the history stands.
+///
+/// `clear` and `delete` are privacy controls, so "the database has not opened
+/// yet", "it failed to open" and "there is no database to open" have to be
+/// three different answers rather than one absent connection: only the last
+/// of them means a deletion is already complete.
+enum Db {
+    /// The loader thread is still opening and decrypting. Anything captured
+    /// now is memory-only until `attach` reconciles it.
+    Loading,
+    Ready(rusqlite::Connection),
+    /// The open failed. Rows already on disk cannot be reached, and saying a
+    /// deletion succeeded would be a lie about the thing that matters most.
+    Failed,
+    /// No store to open (no `LOCALAPPDATA`): memory-only by design, so there
+    /// is nothing on disk that a deletion could miss.
+    Absent,
 }
 
 pub struct ClipboardStore {
-    conn: Mutex<Option<rusqlite::Connection>>,
+    db: Mutex<Db>,
     entries: Mutex<Vec<Entry>>,
     /// §7.4's exclusion formats, registered once.
     exclusions: Exclusions,
     enabled: AtomicBool,
+    /// A `clear` that arrived while the store was still loading, to be
+    /// applied by `attach` against the rows it has only just read.
+    cleared_while_loading: AtomicBool,
 }
 
 #[derive(Clone, Copy)]
@@ -157,18 +187,28 @@ impl Exclusions {
 }
 
 impl ClipboardStore {
-    pub fn open() -> Arc<ClipboardStore> {
+    /// `capture` is the persisted §7.4 setting, so a paused history comes
+    /// back paused rather than quietly recording again after a restart.
+    pub fn open(capture: bool) -> Arc<ClipboardStore> {
         let path = std::env::var_os("LOCALAPPDATA").map(|b| {
             std::path::PathBuf::from(b)
                 .join("YSpot")
                 .join("clipboard.db")
         });
         let store = Arc::new(ClipboardStore {
-            conn: Mutex::new(None),
+            db: Mutex::new(if path.is_some() {
+                Db::Loading
+            } else {
+                Db::Absent
+            }),
             entries: Mutex::new(Vec::new()),
             exclusions: Exclusions::register(),
-            enabled: AtomicBool::new(true),
+            enabled: AtomicBool::new(capture),
+            cleared_while_loading: AtomicBool::new(false),
         });
+        if !capture {
+            log::info!("clipboard capture is paused (§7.4, from settings)");
+        }
         match path {
             Some(p) => {
                 // Loading decrypts one preview per entry, so it happens off
@@ -191,32 +231,114 @@ impl ClipboardStore {
         if let Some(dir) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 log::warn!("clipboard: create {}: {e}", dir.display());
+                *self.db.lock().unwrap_or_else(|e| e.into_inner()) = Db::Failed;
                 return;
             }
         }
-        match open_db(path) {
-            Ok((conn, rows)) => {
-                log::info!(
-                    "clipboard: {} entries loaded from {}",
-                    rows.len(),
+        let (conn, rows) = match open_db(path) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "clipboard: cannot open {} ({e}); history is memory-only",
                     path.display()
                 );
-                // The connection goes in FIRST: a capture that lands while
-                // this is running must reach the database, and the index it
-                // prepends to is replaced below rather than appended to.
-                *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(conn);
-                let mut index = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-                // Anything captured during the load is newer than everything
-                // on disk, so it stays at the front.
-                let seen: std::collections::HashSet<u64> = index.iter().map(|e| e.hash).collect();
-                index.extend(rows.into_iter().filter(|r| !seen.contains(&r.hash)));
-                index.truncate(INDEX_ENTRIES);
+                *self.db.lock().unwrap_or_else(|e| e.into_inner()) = Db::Failed;
+                return;
             }
-            Err(e) => log::error!(
-                "clipboard: cannot open {} ({e}); history is memory-only",
-                path.display()
-            ),
+        };
+        log::info!(
+            "clipboard: {} entries loaded from {}",
+            rows.len(),
+            path.display()
+        );
+        {
+            // Both locks, `db` before `entries`, which is the order every
+            // other path takes them in. A capture that lands mid-reconcile
+            // waits here and then sees a ready connection, so there is no
+            // window in which an entry is written memory-only by accident.
+            let mut guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            let mut index = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+
+            // A clear issued while this was loading names exactly the rows
+            // this thread has just read. Apply it here rather than letting
+            // the load put back what the user asked us to forget.
+            let rows = if self.cleared_while_loading.swap(false, Ordering::SeqCst) {
+                if let Err(e) = conn.execute("DELETE FROM entries", []) {
+                    log::error!("clipboard: deferred clear failed: {e}");
+                }
+                log::info!(
+                    "clipboard: deferred clear applied; {} loaded rows discarded",
+                    rows.len()
+                );
+                Vec::new()
+            } else {
+                rows
+            };
+
+            // Give every memory-only entry a real row. Oldest first, so the
+            // rowids the inserts hand out ascend with time like the rest of
+            // the table's do.
+            for e in index.iter_mut().rev() {
+                // Cloned, not borrowed: the entry is written to below, and a
+                // reference into its own `pending` would still be live.
+                let Some(content) = e.pending.clone() else {
+                    continue;
+                };
+                // The same text may already be stored from an earlier
+                // session. Adopt that row — it is the one holding the
+                // content blob — instead of inserting a second copy.
+                let existing: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM entries WHERE hash = ?1",
+                        [e.hash as i64],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                if let Some(id) = existing {
+                    let _ = conn.execute("UPDATE entries SET ts = ?2 WHERE id = ?1", [id, e.ts]);
+                    e.id = id;
+                    e.pending = None;
+                    continue;
+                }
+                let Some(preview_enc) = protect(e.preview.as_bytes()) else {
+                    log::warn!("clipboard: DPAPI protect failed; entry stays memory-only");
+                    continue;
+                };
+                let r = conn.execute(
+                    "INSERT INTO entries (kind, content, preview, source, ts, hash)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        e.kind.as_str(),
+                        content,
+                        preview_enc,
+                        e.source,
+                        e.ts,
+                        e.hash as i64
+                    ],
+                );
+                match r {
+                    Ok(_) => {
+                        e.id = conn.last_insert_rowid();
+                        e.pending = None;
+                    }
+                    // Left memory-only: still listed, still pastable from
+                    // `pending`, just not durable.
+                    Err(err) => log::warn!("clipboard: reconciling insert failed: {err}"),
+                }
+            }
+
+            // Anything captured during the load is newer than everything on
+            // disk, so it stays at the front — and now that duplicates have
+            // adopted the stored row's id, dropping the disk copy here drops
+            // a genuine duplicate rather than the only usable one.
+            let seen: std::collections::HashSet<u64> = index.iter().map(|e| e.hash).collect();
+            index.extend(rows.into_iter().filter(|r| !seen.contains(&r.hash)));
+            index.truncate(INDEX_ENTRIES);
+            *guard = Db::Ready(conn);
         }
+        // §7.4's limits are about how long something is kept, not about how
+        // recently something was copied, so they apply on every start.
+        self.prune();
     }
 
     /// Search the history. An empty query lists the most recent entries,
@@ -249,8 +371,22 @@ impl ClipboardStore {
     /// The full text of an entry, decrypted. A file list comes back as one
     /// path per line, which is what it was stored as.
     pub fn content(&self, id: i64) -> Option<String> {
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = guard.as_ref()?;
+        // An entry with no disk row carries its own sealed copy: whatever
+        // the index lists has to be pastable.
+        let pending = {
+            let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .and_then(|e| e.pending.clone())
+        };
+        if let Some(blob) = pending {
+            return String::from_utf8(unprotect(&blob)?).ok();
+        }
+        let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        let Db::Ready(conn) = &*guard else {
+            return None;
+        };
         let blob: Vec<u8> = conn
             .query_row("SELECT content FROM entries WHERE id = ?1", [id], |r| {
                 r.get(0)
@@ -259,35 +395,67 @@ impl ClipboardStore {
         String::from_utf8(unprotect(&blob)?).ok()
     }
 
+    /// Forget one entry, on disk as well as in the index.
+    ///
+    /// Reports failure rather than success when the row cannot be reached: a
+    /// history that says "deleted" and keeps the row is worse than one that
+    /// admits it could not.
     pub fn delete(&self, id: i64) -> Result<(), String> {
+        let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|e| e.id != id);
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(conn) = guard.as_ref() {
-            conn.execute("DELETE FROM entries WHERE id = ?1", [id])
-                .map_err(|e| e.to_string())?;
+        match &*guard {
+            Db::Ready(conn) => conn
+                .execute("DELETE FROM entries WHERE id = ?1", [id])
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            // A memory-only entry has no row anywhere else, so dropping it
+            // from the index above is the whole of the deletion.
+            _ if id < 0 => Ok(()),
+            Db::Absent => Ok(()),
+            Db::Loading => Err("clipboard history is still loading — try again in a moment".into()),
+            Db::Failed => Err(
+                "clipboard history could not be opened, so the stored copy is still there".into(),
+            ),
         }
-        Ok(())
     }
 
     pub fn clear(&self) -> Result<(), String> {
+        let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
         self.entries
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(conn) = guard.as_ref() {
-            conn.execute("DELETE FROM entries", [])
-                .map_err(|e| e.to_string())?;
+        match &*guard {
+            Db::Ready(conn) => {
+                conn.execute("DELETE FROM entries", [])
+                    .map_err(|e| e.to_string())?;
+                log::info!("clipboard history cleared");
+                Ok(())
+            }
+            // The rows exist but this thread cannot name them yet. Record
+            // the intent: `attach` applies it against what it loaded, so the
+            // success reported here is one that actually happens.
+            Db::Loading => {
+                self.cleared_while_loading.store(true, Ordering::SeqCst);
+                log::info!("clipboard history cleared (applied when the store finishes loading)");
+                Ok(())
+            }
+            Db::Absent => Ok(()),
+            Db::Failed => Err(
+                "clipboard history could not be opened, so the stored copy is still there".into(),
+            ),
         }
-        log::info!("clipboard history cleared");
-        Ok(())
     }
 
     /// Stop or resume capture — the setting a user reaches for when they are
     /// about to paste something they do not want remembered.
+    ///
+    /// Persisting it is the caller's job (`clipboard_set_enabled`), because a
+    /// pause that forgets itself at the next logon is worse than no pause at
+    /// all: the user believes the history is still off.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::SeqCst);
         log::info!(
@@ -321,8 +489,8 @@ impl ClipboardStore {
                 let ts = existing.ts;
                 entries.insert(0, existing);
                 drop(entries);
-                let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(conn) = guard.as_ref() {
+                let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+                if let Db::Ready(conn) = &*guard {
                     let _ = conn.execute("UPDATE entries SET ts = ?2 WHERE id = ?1", [id, ts]);
                 }
                 return;
@@ -336,10 +504,10 @@ impl ClipboardStore {
             log::warn!("clipboard: DPAPI protect failed; entry dropped");
             return;
         };
-        let id = {
-            let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            match guard.as_ref() {
-                Some(conn) => {
+        let (id, pending) = {
+            let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+            match &*guard {
+                Db::Ready(conn) => {
                     let r = conn.execute(
                         "INSERT INTO entries (kind, content, preview, source, ts, hash)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -353,15 +521,17 @@ impl ClipboardStore {
                         ],
                     );
                     match r {
-                        Ok(_) => conn.last_insert_rowid(),
+                        Ok(_) => (conn.last_insert_rowid(), None),
                         Err(e) => {
                             log::warn!("clipboard: insert failed: {e}");
                             return;
                         }
                     }
                 }
-                // Memory-only: a negative id cannot collide with a rowid.
-                None => -(ts * 1000 + (hash % 1000) as i64),
+                // Memory-only: a negative id cannot collide with a rowid, and
+                // the sealed content rides along so the entry is pastable
+                // before — or without — a database.
+                _ => (-(ts * 1000 + (hash % 1000) as i64), Some(content)),
             }
         };
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
@@ -375,6 +545,7 @@ impl ClipboardStore {
                 source: snap.source,
                 ts,
                 hash,
+                pending,
             },
         );
         entries.truncate(INDEX_ENTRIES);
@@ -382,11 +553,19 @@ impl ClipboardStore {
         self.prune();
     }
 
-    /// §7.4 retention: age and count, applied on the disk copy.
+    /// §7.4 retention: age and count.
+    ///
+    /// Applied to the in-memory index as well as the table. They are two
+    /// views of one history, and an entry the index still lists after its row
+    /// has been reaped is one the user can select but not paste.
     fn prune(&self) {
-        let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(conn) = guard.as_ref() else { return };
         let cutoff = now_ts() - RETENTION_DAYS * 86_400;
+        let guard = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|e| e.ts >= cutoff);
+        let Db::Ready(conn) = &*guard else { return };
         let _ = conn.execute("DELETE FROM entries WHERE ts < ?1", [cutoff]);
         let _ = conn.execute(
             "DELETE FROM entries WHERE id NOT IN
@@ -442,11 +621,15 @@ fn open_db(path: &std::path::Path) -> rusqlite::Result<(rusqlite::Connection, Ve
          );
          CREATE INDEX IF NOT EXISTS entries_ts ON entries (ts DESC);",
     )?;
+    // The age cutoff is applied here as well as in `prune`, so the index is
+    // never populated with rows that retention is about to reap.
     let mut stmt = conn.prepare(
-        "SELECT id, kind, preview, source, ts, hash FROM entries ORDER BY ts DESC LIMIT ?1",
+        "SELECT id, kind, preview, source, ts, hash FROM entries
+         WHERE ts >= ?2 ORDER BY ts DESC LIMIT ?1",
     )?;
+    let cutoff = now_ts() - RETENTION_DAYS * 86_400;
     let rows = stmt
-        .query_map([INDEX_ENTRIES as i64], |r| {
+        .query_map([INDEX_ENTRIES as i64, cutoff], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, String>(1)?,
@@ -472,6 +655,7 @@ fn open_db(path: &std::path::Path) -> rusqlite::Result<(rusqlite::Connection, Ve
                 source,
                 ts,
                 hash: hash as u64,
+                pending: None,
             })
         })
         .collect();
@@ -657,30 +841,43 @@ unsafe fn read_open_clipboard(ex: &Exclusions) -> Option<Snapshot> {
 /// The clipboard must be open.
 unsafe fn dword_value(format: u32) -> Option<u32> {
     // SAFETY: the caller holds the clipboard; the handle stays clipboard-owned.
+    // The block comes from another process and "this format carries a DWORD"
+    // is only a convention, so its size is checked rather than assumed — a
+    // short block would be read past the end, and the garbage that came back
+    // would decide whether §7.4's exclusion is honoured.
     unsafe {
         let h = GetClipboardData(format).ok()?;
-        let p = GlobalLock(HGLOBAL(h.0)) as *const u32;
+        let block = HGLOBAL(h.0);
+        let p = GlobalLock(block) as *const u32;
         if p.is_null() {
             return None;
         }
-        let v = *p;
-        let _ = GlobalUnlock(HGLOBAL(h.0));
-        Some(v)
+        let v = if GlobalSize(block) >= std::mem::size_of::<u32>() {
+            Some(*p)
+        } else {
+            log::debug!("clipboard: marker format {format} is smaller than a DWORD; ignored");
+            None
+        };
+        let _ = GlobalUnlock(block);
+        v
     }
 }
 
 /// # Safety
 /// `h` must be a clipboard-owned global holding a NUL-terminated wide string.
 unsafe fn wide_from_handle(h: HGLOBAL) -> Option<String> {
-    // SAFETY: locked and unlocked once; the string is NUL-terminated by the
-    // CF_UNICODETEXT contract.
+    // SAFETY: locked and unlocked once. The CF_UNICODETEXT contract says the
+    // string is NUL-terminated, but the block belongs to another process, so
+    // the scan is bounded by the block's actual size as well — a producer
+    // that omits the terminator must not walk us off the end of it.
     unsafe {
         let p = GlobalLock(h) as *const u16;
         if p.is_null() {
             return None;
         }
+        let limit = (GlobalSize(h) / std::mem::size_of::<u16>()).min(MAX_CONTENT_BYTES);
         let mut n = 0usize;
-        while *p.add(n) != 0 && n < MAX_CONTENT_BYTES {
+        while n < limit && *p.add(n) != 0 {
             n += 1;
         }
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, n));
@@ -819,12 +1016,27 @@ unsafe extern "system" fn wnd_proc(
 /// `CF_UNICODETEXT` (and file lists as their paths), so every paste already
 /// writes plain text and nothing else. It becomes a real distinction the day
 /// rich formats are captured.
-pub fn paste(text: &str) -> Result<(), String> {
+/// `target` is the window the caller restored focus to — `dismiss` does that,
+/// because the launcher has to be out of the way first. Injection happens only
+/// if that window really is foreground: Windows can refuse
+/// `SetForegroundWindow` under the foreground lock and activate whatever is
+/// next in Z-order instead, and synthesising Ctrl+V into a window nobody chose
+/// is how a stored password gets typed into a chat box.
+pub fn paste(text: &str, target: Option<isize>) -> Result<(), String> {
     crate::file_actions::copy_text(text)?;
-    crate::focus::restore_foreground();
+    const NOT_PASTED: &str = "could not return focus to the previous window — the entry is on \
+                              the clipboard, so you can paste it yourself";
+    let Some(target) = target else {
+        return Err(NOT_PASTED.into());
+    };
     // Give the restored window a moment to actually take focus; injecting
     // into a window that is not yet foreground pastes into nothing.
     std::thread::sleep(std::time::Duration::from_millis(60));
+    // SAFETY: GetForegroundWindow has no preconditions and may return null.
+    if unsafe { GetForegroundWindow() }.0 as isize != target {
+        log::warn!("clipboard: paste target is not foreground; Ctrl+V withheld (§7.4)");
+        return Err(NOT_PASTED.into());
+    }
     // SAFETY: a well-formed four-event array of the size passed alongside
     // it; every key that goes down comes back up, so no modifier is left
     // stuck even if the target ignores the paste.
@@ -878,17 +1090,24 @@ mod tests {
         assert_eq!(unprotect(&sealed), Some(big));
     }
 
+    /// A store that has not been attached to anything yet — the state the
+    /// real one is in for the whole of its background load.
+    fn loose_store() -> Arc<ClipboardStore> {
+        Arc::new(ClipboardStore {
+            db: Mutex::new(Db::Loading),
+            entries: Mutex::new(Vec::new()),
+            exclusions: Exclusions::register(),
+            enabled: AtomicBool::new(true),
+            cleared_while_loading: AtomicBool::new(false),
+        })
+    }
+
     fn store_at(tag: &str) -> (Arc<ClipboardStore>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("yspot-clip-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("clipboard.db");
-        let store = Arc::new(ClipboardStore {
-            conn: Mutex::new(None),
-            entries: Mutex::new(Vec::new()),
-            exclusions: Exclusions::register(),
-            enabled: AtomicBool::new(true),
-        });
+        let store = loose_store();
         store.attach(&path);
         (store, dir)
     }
@@ -907,8 +1126,10 @@ mod tests {
         let preview: String = snap.text.chars().take(PREVIEW_CHARS).collect();
         let preview_enc = protect(preview.as_bytes()).unwrap();
         let id = {
-            let guard = store.conn.lock().unwrap();
-            let conn = guard.as_ref().unwrap();
+            let guard = store.db.lock().unwrap();
+            let Db::Ready(conn) = &*guard else {
+                panic!("store is not open")
+            };
             conn.execute(
                 "INSERT INTO entries (kind, content, preview, source, ts, hash)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -934,6 +1155,28 @@ mod tests {
                 source: snap.source,
                 ts,
                 hash,
+                pending: None,
+            },
+        );
+    }
+
+    /// What `capture` does when there is no connection yet: index the entry
+    /// with a negative id and its own sealed copy of the content.
+    fn remember_in_memory(store: &ClipboardStore, text: &str, source: &str) {
+        let hash = fnv1a(text.as_bytes());
+        let ts = now_ts();
+        let preview: String = text.chars().take(PREVIEW_CHARS).collect();
+        store.entries.lock().unwrap().insert(
+            0,
+            Entry {
+                id: -(ts * 1000 + (hash % 1000) as i64),
+                kind: ClipKind::Text,
+                target: Target::new(&preview),
+                preview,
+                source: source.to_string(),
+                ts,
+                hash,
+                pending: Some(protect(text.as_bytes()).unwrap()),
             },
         );
     }
@@ -957,12 +1200,7 @@ mod tests {
         }
 
         // Reopening decrypts the index back into something searchable.
-        let reopened = Arc::new(ClipboardStore {
-            conn: Mutex::new(None),
-            entries: Mutex::new(Vec::new()),
-            exclusions: Exclusions::register(),
-            enabled: AtomicBool::new(true),
-        });
+        let reopened = loose_store();
         reopened.attach(&dir.join("clipboard.db"));
         let hits = reopened.match_query("brown", 10);
         assert_eq!(hits.len(), 1);
@@ -1015,6 +1253,130 @@ mod tests {
         store.capture();
         assert!(store.match_query("", 10).is_empty());
         store.set_enabled(true);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An entry captured during the background load has no row to select
+    /// from, and used to be listed with an id nothing could resolve.
+    #[test]
+    fn an_entry_captured_before_the_database_opens_is_still_pastable() {
+        let store = loose_store();
+        remember_in_memory(&store, "typed while loading", "a.exe");
+        let hit = &store.match_query("", 10)[0];
+        assert!(hit.id < 0, "memory-only entries carry a synthetic id");
+        assert_eq!(
+            store.content(hit.id).as_deref(),
+            Some("typed while loading"),
+            "listed but unpastable"
+        );
+    }
+
+    /// ...and once the loader lands, it gains a real row rather than staying
+    /// a second-class entry for the life of the process.
+    #[test]
+    fn attach_gives_entries_captured_during_the_load_a_real_row() {
+        // A previous session stored something; this session re-copies the
+        // same text, plus something new, while the store is still loading.
+        let (seed, dir) = store_at("reconcile");
+        remember(&seed, "copied twice", "a.exe");
+        drop(seed);
+        let path = dir.join("clipboard.db");
+
+        let store = loose_store();
+        remember_in_memory(&store, "copied twice", "b.exe");
+        remember_in_memory(&store, "brand new", "b.exe");
+        store.attach(&path);
+
+        // Both are pastable, both have real rowids, and the duplicate did
+        // not become two rows.
+        let hits = store.match_query("", 10);
+        assert_eq!(hits.len(), 2, "the duplicate should have merged");
+        for h in &hits {
+            assert!(h.id > 0, "entry {} kept a memory-only id", h.preview);
+            assert!(store.content(h.id).is_some(), "{} is unpastable", h.preview);
+        }
+        assert_eq!(store.content(hits[0].id).as_deref(), Some("brand new"));
+
+        // Surviving a restart is the point of having given them rows.
+        drop(store);
+        let reopened = loose_store();
+        reopened.attach(&path);
+        assert_eq!(reopened.match_query("", 10).len(), 2);
+        let found = reopened.match_query("brand", 10)[0].id;
+        assert_eq!(reopened.content(found).as_deref(), Some("brand new"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clearing is a privacy control: it may not report a success it did not
+    /// earn, and it may not be undone by a load that was already in flight.
+    #[test]
+    fn clearing_is_honest_about_what_it_could_not_reach() {
+        let store = loose_store();
+        // Still loading: the rows exist but cannot be named yet. Reporting
+        // Ok is only allowed because `attach` is about to honour it.
+        assert!(store.clear().is_ok());
+        assert!(store.cleared_while_loading.load(Ordering::SeqCst));
+
+        // A failed open cannot delete anything, and says so.
+        let failed = loose_store();
+        *failed.db.lock().unwrap() = Db::Failed;
+        assert!(failed.clear().is_err(), "clear claimed a wipe it never did");
+        assert!(failed.delete(7).is_err());
+        // A memory-only entry has no stored copy, so removing it is complete.
+        assert!(failed.delete(-7).is_ok());
+    }
+
+    #[test]
+    fn a_clear_during_the_load_survives_the_load() {
+        let (seed, dir) = store_at("race");
+        remember(&seed, "from yesterday", "a.exe");
+        drop(seed);
+        let path = dir.join("clipboard.db");
+
+        let store = loose_store();
+        store.clear().unwrap();
+        store.attach(&path);
+        assert!(
+            store.match_query("", 10).is_empty(),
+            "the load put back what the user cleared"
+        );
+
+        // And it is gone from disk, not just from the index.
+        drop(store);
+        let reopened = loose_store();
+        reopened.attach(&path);
+        assert!(reopened.match_query("", 10).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// §7.4 retention has to reach the index too: an entry the view lists
+    /// after its row is reaped is one you can select but not paste.
+    #[test]
+    fn retention_expires_the_index_and_the_table_together() {
+        let (store, dir) = store_at("retention");
+        remember(&store, "recent", "a.exe");
+        remember(&store, "ancient", "a.exe");
+        let old = store.match_query("ancient", 10)[0].id;
+        let stale = now_ts() - (RETENTION_DAYS + 1) * 86_400;
+        {
+            let guard = store.db.lock().unwrap();
+            let Db::Ready(conn) = &*guard else {
+                panic!("open")
+            };
+            conn.execute("UPDATE entries SET ts = ?2 WHERE id = ?1", [old, stale])
+                .unwrap();
+        }
+        store.entries.lock().unwrap().iter_mut().for_each(|e| {
+            if e.id == old {
+                e.ts = stale;
+            }
+        });
+
+        store.prune();
+        let left = store.match_query("", 10);
+        assert_eq!(left.len(), 1, "the index still lists an expired entry");
+        assert_eq!(left[0].preview, "recent");
+        assert!(store.content(old).is_none(), "the row outlived retention");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

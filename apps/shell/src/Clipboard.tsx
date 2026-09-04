@@ -75,33 +75,49 @@ export default function Clipboard({ onClose }: Props): ReactElement {
       .catch((e) => setError(String(e)));
   }, [current, query, refresh]);
 
-  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
-    if (e.nativeEvent.isComposing) return;
-    switch (e.key) {
-      case "ArrowDown":
+  // The view's keys live on the window in the capture phase, the way
+  // Settings and Onboarding do it — not on the filter input.
+  //
+  // Hanging them off the input made the view a keyboard dead end after any
+  // click: a row, the checkbox or the Clear button takes focus, and App's
+  // §5.7 refocus rule deliberately stands down while a view is open, so
+  // nothing hands the keyboard back. The header promises "Enter pastes · Esc
+  // to go back", and after one click neither did anything.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.isComposing) return;
+      const claim = (): void => {
         e.preventDefault();
-        setSelected((s) => Math.min(s + 1, Math.max(0, items.length - 1)));
-        break;
-      case "ArrowUp":
-        e.preventDefault();
-        setSelected((s) => Math.max(0, s - 1));
-        break;
-      case "Enter":
-        e.preventDefault();
-        paste();
-        break;
-      case "Delete":
-        e.preventDefault();
-        remove();
-        break;
-      case "Escape":
-        e.preventDefault();
-        onClose();
-        break;
-      default:
-        break;
-    }
-  }
+        e.stopPropagation();
+      };
+      switch (e.key) {
+        case "ArrowDown":
+          claim();
+          setSelected((s) => Math.min(s + 1, Math.max(0, items.length - 1)));
+          break;
+        case "ArrowUp":
+          claim();
+          setSelected((s) => Math.max(0, s - 1));
+          break;
+        case "Enter":
+          claim();
+          paste();
+          break;
+        case "Delete":
+          claim();
+          remove();
+          break;
+        case "Escape":
+          claim();
+          onClose();
+          break;
+        default:
+          break;
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [items.length, onClose, paste, remove]);
 
   return (
     <div className="settings">
@@ -132,7 +148,6 @@ export default function Clipboard({ onClose }: Props): ReactElement {
             setSelected(0);
             refresh(e.target.value);
           }}
-          onKeyDown={onKeyDown}
         />
       </div>
 
@@ -151,6 +166,9 @@ export default function Clipboard({ onClose }: Props): ReactElement {
               role="option"
               aria-selected={i === clamped}
               className={i === clamped ? "clip-row clip-row-selected" : "clip-row"}
+              // Selecting a row must not take the keyboard away from the
+              // filter box; the click still fires, the caret just stays put.
+              onMouseDown={(e) => e.preventDefault()}
               onClick={() => setSelected(i)}
               onDoubleClick={() => paste()}
             >

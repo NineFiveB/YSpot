@@ -216,12 +216,15 @@ pub(crate) fn show(app: &AppHandle) {
     }
 }
 
-fn dismiss(app: &AppHandle) {
-    let Some(window) = app.get_webview_window("launcher") else {
-        return;
-    };
+/// Hide the launcher and put focus back where it came from.
+///
+/// Returns the window focus was handed to, for the one caller that needs to
+/// know: §7.4's paste synthesises Ctrl+V and must not do so if the restore was
+/// refused (`clipboard::paste`).
+fn dismiss(app: &AppHandle) -> Option<isize> {
+    let window = app.get_webview_window("launcher")?;
     if !window.is_visible().unwrap_or(false) {
-        return;
+        return None;
     }
     log::debug!("dismiss: hiding");
     if let Err(e) = window.hide() {
@@ -234,13 +237,14 @@ fn dismiss(app: &AppHandle) {
     }
     let _ = app.emit("view:reset", ());
     // §5.2 step 3: hand focus back exactly where it was.
-    focus::restore_foreground();
+    let restored = focus::restore_foreground();
     etw_mark::mark("hidden");
     let _ = app.emit("window:hidden", ());
     // Best effort: stop in-flight work for the current generation (§4.3 Cancel).
     if let Some(pipe) = app.try_state::<Arc<PipeClient>>() {
         let _ = pipe.cancel_current();
     }
+    restored
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +288,11 @@ fn search(
     gen: u64,
     text: String,
 ) -> Result<Accepted, String> {
-    log::debug!("search cmd: gen={gen} text={text:?}");
+    // Length, not the text. Everything typed or pasted into the query box
+    // would otherwise be written to a log file that persists across restarts
+    // and goes out with any support bundle — and people paste things into a
+    // launcher that they would not paste into a bug report.
+    log::debug!("search cmd: gen={gen} len={}", text.chars().count());
     // The shell's own answers first, and synchronously: matching a few
     // hundred names is microseconds and the calculator is a parse of one
     // line, so all of it fits the §2.5 shell-routing share and lands in the
@@ -685,10 +693,11 @@ fn clipboard_paste(
     let text = clip
         .content(id)
         .ok_or_else(|| format!("clipboard entry {id} is gone"))?;
-    // Dismiss FIRST: the paste restores the previous foreground window, and
-    // that cannot happen while the launcher still holds focus.
-    dismiss(&app);
-    clipboard::paste(&text)
+    // Dismiss FIRST: the paste needs the previous foreground window back, and
+    // that cannot happen while the launcher still holds focus. What it hands
+    // back is the window Ctrl+V is allowed to go to, and nothing else.
+    let restored = dismiss(&app);
+    clipboard::paste(&text, restored)
 }
 
 #[tauri::command]
@@ -706,9 +715,19 @@ fn clipboard_enabled(clip: tauri::State<'_, Arc<ClipboardStore>>) -> bool {
     clip.is_enabled()
 }
 
+/// §7.4: pause or resume capture, and remember which. The store holds the
+/// live flag; `settings.json` holds the decision, so it survives the restart
+/// the user is most likely to make right after pausing.
 #[tauri::command]
-fn clipboard_set_enabled(clip: tauri::State<'_, Arc<ClipboardStore>>, enabled: bool) {
+fn clipboard_set_enabled(
+    clip: tauri::State<'_, Arc<ClipboardStore>>,
+    store: tauri::State<'_, Arc<SettingsStore>>,
+    enabled: bool,
+) -> Result<(), String> {
     clip.set_enabled(enabled);
+    let mut next = store.get();
+    next.clipboard.capture = enabled;
+    store.save(next)
 }
 
 /// What first-run onboarding needs to tell the truth about this machine
@@ -964,7 +983,7 @@ pub fn run() {
     }
 
     let store = Arc::new(SettingsStore::open());
-    let clip = ClipboardStore::open();
+    let clip = ClipboardStore::open(store.get().clipboard.capture);
     // Behind the §11 Risk 6 trait, so the day Windows Search is not the
     // answer any more, only this line changes.
     let fallback: Arc<dyn FileSearch> = Arc::new(WindowsSearch);
