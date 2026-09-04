@@ -552,16 +552,39 @@ struct Snapshot {
     source: String,
 }
 
+/// How many times to retry opening the clipboard, and how long to wait
+/// between attempts.
+///
+/// The clipboard is one global lock, and `WM_CLIPBOARDUPDATE` arrives while
+/// the app that just wrote it may still hold it open. A single failed
+/// `OpenClipboard` would mean silently missing the entry — for a clipboard
+/// history, "you copied something and it is not in the list" is the whole
+/// product failing, so it is worth a few milliseconds of patience. Observed
+/// in practice: two writers in quick succession make the loser fail.
+const OPEN_ATTEMPTS: u32 = 8;
+const OPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(15);
+
 fn read_clipboard(ex: &Exclusions) -> Option<Snapshot> {
-    // SAFETY: every path below closes the clipboard exactly once.
-    unsafe {
-        if OpenClipboard(None).is_err() {
-            return None;
+    for attempt in 0..OPEN_ATTEMPTS {
+        // SAFETY: on success every path below closes the clipboard exactly
+        // once; on failure nothing was opened.
+        unsafe {
+            if OpenClipboard(None).is_ok() {
+                let result = read_open_clipboard(ex);
+                let _ = CloseClipboard();
+                return result;
+            }
         }
-        let result = read_open_clipboard(ex);
-        let _ = CloseClipboard();
-        result
+        if attempt + 1 < OPEN_ATTEMPTS {
+            std::thread::sleep(OPEN_RETRY);
+        }
     }
+    // Worth a line: a miss here is an entry the user expects to find later
+    // and will not, and the cause is another process, not us.
+    log::debug!(
+        "clipboard: could not open after {OPEN_ATTEMPTS} attempts; entry missed          (another process is holding it)"
+    );
+    None
 }
 
 /// # Safety
@@ -700,14 +723,20 @@ pub fn spawn_listener(store: Arc<ClipboardStore>) {
     }
 }
 
-/// The store the window procedure reaches, set once before the window is
-/// created and read only from that thread.
-static mut LISTENER_STORE: Option<Arc<ClipboardStore>> = None;
+thread_local! {
+    /// The store the window procedure reaches.
+    ///
+    /// Thread-local rather than a `static mut`: the window procedure runs on
+    /// exactly the thread that created the window and pumps its messages, so
+    /// the store never needs to cross threads, and a thread-local says that
+    /// in the type system instead of in a comment. A `static mut` would also
+    /// be a data race the moment anything called `spawn_listener` twice.
+    static LISTENER_STORE: std::cell::RefCell<Option<Arc<ClipboardStore>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn listener_thread(store: Arc<ClipboardStore>) {
-    // SAFETY: written once here before the window that reads it exists, and
-    // read only from this thread's window procedure.
-    unsafe { LISTENER_STORE = Some(store) };
+    LISTENER_STORE.with(|s| *s.borrow_mut() = Some(store));
     // SAFETY: a standard class registration and message-only window, with a
     // message loop that runs for the life of the process.
     unsafe {
@@ -766,8 +795,10 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_CLIPBOARDUPDATE {
-        // SAFETY: set before this window existed, read only on this thread.
-        let store = unsafe { (*std::ptr::addr_of!(LISTENER_STORE)).clone() };
+        // Cloned out of the cell before `capture` runs: capture takes locks
+        // and could, in principle, pump messages, and holding a `RefCell`
+        // borrow across that would panic on re-entry.
+        let store = LISTENER_STORE.with(|s| s.borrow().clone());
         if let Some(store) = store {
             store.capture();
         }
