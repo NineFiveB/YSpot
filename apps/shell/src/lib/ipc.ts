@@ -323,9 +323,15 @@ export interface Hotkey {
   code: string;
 }
 
+/** §8.5 consent, opt-in and stored so onboarding sets it once. */
+export interface Diagnostics {
+  crashReports: boolean;
+}
+
 export interface Settings {
   hotkey: Hotkey;
   theme: "system" | "light" | "dark";
+  diagnostics: Diagnostics;
   [key: string]: unknown;
 }
 
@@ -424,6 +430,11 @@ export function setInView(inView: boolean): Promise<unknown> {
 
 export function setAutostart(enabled: boolean): Promise<unknown> {
   return invoke("set_autostart", { enabled });
+}
+
+/** §5.9's log export: open the folder the logs and dumps live in. */
+export function openDiagnosticsFolder(): Promise<unknown> {
+  return invoke("open_diagnostics_folder");
 }
 
 export function getStatus(): Promise<unknown> {

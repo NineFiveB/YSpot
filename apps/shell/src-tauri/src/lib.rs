@@ -13,6 +13,7 @@ mod calc;
 mod clipboard;
 mod com;
 mod commands;
+mod diagnostics;
 mod etw_mark;
 mod file_actions;
 mod focus;
@@ -745,6 +746,13 @@ fn save_settings(
         rebind_hotkey(&app, Some(&current.hotkey), &next.hotkey)?;
     }
     let warning = next.hotkey.warning().map(str::to_string);
+    if next.diagnostics != current.diagnostics {
+        // §8.5: consent takes effect now, not at the next start.
+        if let Err(e) = diagnostics::set_crash_capture(next.diagnostics.crash_reports) {
+            log::warn!("crash capture could not be configured: {e}");
+        }
+        diagnostics::rotate_dumps();
+    }
     store.save(next.clone())?;
     // The launcher window is listening: a theme change applies at once
     // rather than at the next restart.
@@ -820,6 +828,17 @@ fn set_launcher_height(app: AppHandle, logical_height: u32) -> Result<(), String
 }
 
 /// §5.4 autostart state, for the Settings UI (§5.9) and the tray toggle.
+/// §5.9's "log export", as the honest version of it: open the folder the
+/// logs and dumps are already in. A zip would need an archiver dependency
+/// for something Explorer does better, and the §8.5 directories are plain
+/// files the user can already read.
+#[tauri::command]
+fn open_diagnostics_folder() -> Result<(), String> {
+    let dir = diagnostics::data_dir().ok_or_else(|| "LOCALAPPDATA unset".to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    shell_open(&dir.to_string_lossy())
+}
+
 #[tauri::command]
 fn get_autostart() -> bool {
     autostart::is_enabled()
@@ -886,7 +905,10 @@ fn shell_execute_inner(path: &str, params: Option<&str>) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 pub fn run() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // §8.5: a GUI process has no console, so the log has to go to a file or
+    // it goes nowhere — which is every run that is not launched from a
+    // terminal, i.e. every real one.
+    diagnostics::init();
     etw_mark::init();
 
     if autostart::started_hidden() {
@@ -965,6 +987,7 @@ pub fn run() {
             set_in_view,
             get_autostart,
             set_autostart,
+            open_diagnostics_folder,
             get_status,
             m0_mark,
             m0_report,
@@ -997,6 +1020,15 @@ pub fn run() {
             // §7.4: the capture listener owns a message-only window and its
             // own message loop, so it runs on a thread of its own.
             clipboard::spawn_listener(clip.clone());
+
+            // §8.5: crash capture follows the stored consent on every start,
+            // so revoking it on one machine is not undone by a restart, and
+            // dumps left behind are rotated away either way.
+            let consent = app.state::<Arc<SettingsStore>>().get().diagnostics;
+            if let Err(e) = diagnostics::set_crash_capture(consent.crash_reports) {
+                log::warn!("crash capture could not be configured: {e}");
+            }
+            diagnostics::rotate_dumps();
 
             // `yspot.exe --settings` opens the Settings window directly, for
             // a shortcut or a script; the launcher itself stays hidden.

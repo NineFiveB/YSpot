@@ -134,12 +134,24 @@ pub enum Theme {
     Dark,
 }
 
+/// §8.5: crash-report capture is opt-in, and the consent lives here so it
+/// survives restarts and so onboarding can set it once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Diagnostics {
+    /// Whether Windows may write a crash dump for this process at all. Off
+    /// by default (§5.9's onboarding step 5 is opt-in).
+    #[serde(default)]
+    pub crash_reports: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(default)]
     pub hotkey: Hotkey,
     #[serde(default)]
     pub theme: Theme,
+    #[serde(default)]
+    pub diagnostics: Diagnostics,
     /// Everything this build does not know about, kept so a newer build's
     /// settings survive a round trip through an older one.
     #[serde(flatten)]
@@ -283,6 +295,13 @@ mod tests {
         let win = with(|h| h.win = true);
         assert!(win.rejection().is_none());
         assert!(win.warning().is_some());
+    }
+
+    #[test]
+    fn crash_reporting_is_off_until_someone_says_otherwise() {
+        // §8.5 and §5.9 both make this opt-in; a default of `true` would be
+        // the kind of thing nobody notices until it ships.
+        assert!(!Settings::default().diagnostics.crash_reports);
     }
 
     #[test]

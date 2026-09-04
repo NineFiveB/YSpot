@@ -221,6 +221,46 @@ export default function Settings({ onClose }: Props): ReactElement {
             </select>
           </div>
 
+          <h2>Diagnostics</h2>
+
+          <div className="settings-row">
+            <div className="settings-label">
+              <div>Save crash reports</div>
+              <div className="settings-hint">
+                Lets Windows write a crash dump to your own machine if YSpot stops
+                unexpectedly. Nothing is sent anywhere — off, no dump is written at all.
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              checked={view.settings.diagnostics?.crashReports ?? false}
+              onChange={(e) =>
+                void apply(
+                  {
+                    ...view.settings,
+                    diagnostics: { crashReports: e.target.checked },
+                  },
+                  e.target.checked ? "Crash reports on" : "Crash reports off",
+                )
+              }
+            />
+          </div>
+
+          <div className="settings-row">
+            <div className="settings-label">
+              <div>Logs and crash dumps</div>
+              <div className="settings-hint">
+                Everything YSpot records about itself, on this machine only.
+              </div>
+            </div>
+            <button
+              className="clip-clear"
+              onClick={() => void ipc.openDiagnosticsFolder().catch((e) => setError(String(e)))}
+            >
+              Open folder
+            </button>
+          </div>
+
           <h2>Search</h2>
           <p className="settings-note">
             Indexed volumes, content-search scopes and exclusions live in the service, which
