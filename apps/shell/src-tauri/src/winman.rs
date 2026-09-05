@@ -549,8 +549,18 @@ fn move_to_next_monitor(hwnd: HWND) -> Result<(), String> {
         // window rect while iconic is an off-screen placeholder, and moving
         // that changes nothing anyone can see. The user asked for the window
         // on the other display, and seeing it arrive there is the feedback.
+        //
+        // The order matters. Minimizing clears WS_MAXIMIZE and stashes the
+        // intent in WINDOWPLACEMENT as WPF_RESTORETOMAXIMIZED, so IsZoomed is
+        // FALSE for a window minimized from maximized — and SW_RESTORE brings
+        // that window back MAXIMIZED. Asking "is it maximized" before the
+        // restore would move it as if it were normal and never re-maximize
+        // it; asking after is the truth.
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
         let zoomed = IsZoomed(hwnd).as_bool();
-        if zoomed || IsIconic(hwnd).as_bool() {
+        if zoomed {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let mut r = RECT::default();

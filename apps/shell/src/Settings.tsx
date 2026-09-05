@@ -79,9 +79,16 @@ export default function Settings({ onClose }: Props): ReactElement {
   const apply = useCallback(async (next: ipc.Settings, note: string) => {
     setError(null);
     try {
-      setView(await ipc.saveSettings(next));
-      setSaved(note);
-      window.setTimeout(() => setSaved(null), 2000);
+      const v = await ipc.saveSettings(next);
+      setView(v);
+      // A save can succeed while the chord did not bind — taking it back from
+      // YKeys while YKeys still holds it, or retrying a contested one. The
+      // settings are saved; the hotkey is not. The banner says the second
+      // half, and a cheerful toast beside it would say the opposite.
+      if (v.hotkeyError === null) {
+        setSaved(note);
+        window.setTimeout(() => setSaved(null), 2000);
+      }
     } catch (e) {
       // A rejected hotkey leaves the old one bound, so the view stays
       // truthful — only the message changes.
@@ -167,9 +174,11 @@ export default function Settings({ onClose }: Props): ReactElement {
             <div className="settings-label">
               <div>Hotkey</div>
               <div className="settings-hint">
-                {external
-                  ? "YKeys holds this chord. Change it in ykeys.json, not here."
-                  : "The chord that summons the launcher. While capturing, Esc keeps the current one."}
+                {external && chordLine === null
+                  ? "YKeys is set to hold this chord but has no spelling for it, so nothing does. Untick the YKeys option below to take it back."
+                  : external
+                    ? "YKeys holds this chord. Change it in ykeys.json, not here."
+                    : "The chord that summons the launcher. While capturing, Esc keeps the current one."}
               </div>
             </div>
             <button
@@ -204,8 +213,10 @@ export default function Settings({ onClose }: Props): ReactElement {
                   <>
                     {" "}
                     YKeys has no spelling for{" "}
-                    <strong>{describeHotkey(view.settings.hotkey)}</strong>; pick a
-                    different chord first.
+                    <strong>{describeHotkey(view.settings.hotkey)}</strong>
+                    {external
+                      ? ". Untick this to let YSpot hold it again, then pick another."
+                      : "; pick a different chord first."}
                   </>
                 )}
               </div>

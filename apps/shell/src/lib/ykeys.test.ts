@@ -16,8 +16,11 @@ describe("ykeysKey", () => {
   });
 
   it("translates the codes whose YKeys names differ, not just lower-cases them", () => {
-    // Each of these is a chord the shell's own registrar accepts, and each
+    // Each of these is a code the capture field can deliver, and each
     // lower-cased display name is one YKeys refuses with "unknown key".
+    // (Whether the shell's registrar can then bind it is a separate
+    // question — global-hotkey has no arm for IntlBackslash, for one — but
+    // the spelling is right for a hand-edited file either way.)
     expect(ykeysKey("Numpad1")).toBe("numpad1"); // display: "Numpad 1"
     expect(ykeysKey("NumpadAdd")).toBe("numpad_add");
     expect(ykeysKey("Backquote")).toBe("grave");
@@ -27,6 +30,9 @@ describe("ykeysKey", () => {
     expect(ykeysKey("IntlBackslash")).toBe("oem_102");
     expect(ykeysKey("Escape")).toBe("esc");
     expect(ykeysKey("Space")).toBe("space");
+    // Both Enter keys register as VK_RETURN, which is YKeys' "enter".
+    expect(ykeysKey("NumpadEnter")).toBe("enter");
+    expect(ykeysKey("NumpadEqual")).toBeNull();
   });
 
   it("says null for keys YKeys cannot bind rather than inventing a token", () => {

@@ -25,6 +25,11 @@ export function ykeysKey(code: string): string | null {
 const NAMED: Record<string, string> = {
   Space: "space",
   Enter: "enter",
+  // The registrar binds both Enter keys to VK_RETURN, so YKeys' "enter" is
+  // the identical RegisterHotKey call and a chord captured on the numpad
+  // hands over verbatim. (NumpadEqual stays null: it maps to VK_E, which
+  // nothing in YKeys names.)
+  NumpadEnter: "enter",
   Tab: "tab",
   Escape: "esc",
   Backspace: "backspace",

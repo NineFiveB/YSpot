@@ -1097,14 +1097,25 @@ fn save_settings(
             let old = (!contested).then_some(&current.hotkey);
             let r = rebind_hotkey(&app, old, &next.hotkey);
             if let Err(e) = r.outcome {
-                // Refused, so the settings keep the OLD chord. If that chord
-                // is bound again there is no conflict; if nothing is bound the
-                // standing message already names the old chord and must keep
-                // doing so — naming the rejected alternative under a button
-                // that still reads the old chord is its own bug.
-                if r.bound {
-                    set_standing_conflict(&app, None);
-                }
+                // Refused, so the settings keep the OLD chord. If that chord is
+                // bound again there is no conflict. If NOTHING is bound — the
+                // restore failed too, because something claimed the old chord
+                // in the unregister→register window — that is §5.1's silent
+                // degradation exactly, and it has to be published: this is the
+                // one path where the shell holds nothing and the file, the
+                // tray and Settings would all otherwise say the chord is fine.
+                // Named for the chord the settings still hold, not the
+                // rejected alternative.
+                set_standing_conflict(
+                    &app,
+                    (!r.bound).then(|| {
+                        format!(
+                            "{} is no longer registered, and {} could not take its place.",
+                            current.hotkey.accelerator(),
+                            next.hotkey.accelerator()
+                        )
+                    }),
+                );
                 return Err(e);
             }
             set_standing_conflict(&app, None);
