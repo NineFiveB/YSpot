@@ -1172,10 +1172,24 @@ impl VolumeIndex {
         self.arena_recs = recs;
 
         // `owner` maps arena blocks to records, so it follows the arenas.
+        //
+        // The rule is the one `push_arena_rec` applies incrementally and the
+        // one `slot_at` walks FORWARD from: `owner[b]` is the LAST record
+        // starting at or before byte `b * OWNER_BLOCK` — the record that
+        // CONTAINS that byte. Filling a block with the first record at or
+        // after its boundary looks equivalent and is off by one whenever a
+        // record straddles the boundary: the forward walk then starts one
+        // record too far, never moves back, and a hit in the straddling
+        // record's tail resolves to the NEXT file. Measured before this was
+        // fixed: 21% of post-compaction searches returned another file's FRN.
         self.owner.clear();
         for (ri, rec) in self.arena_recs.iter().enumerate() {
-            while self.owner.len() * OWNER_BLOCK <= rec.off as usize {
-                self.owner.push(ri as u32);
+            // Blocks whose first byte precedes this record are owned by the
+            // record before it. Block 0 has no predecessor and clamps to 0,
+            // which is harmless: it holds the opening fence, never a hit.
+            let prev = ri.saturating_sub(1) as u32;
+            while self.owner.len() * OWNER_BLOCK < rec.off as usize {
+                self.owner.push(prev);
             }
         }
         let last_rec = self.arena_recs.len().saturating_sub(1) as u32;
@@ -2500,6 +2514,20 @@ mod tests {
         // …and each entry is the LAST record starting at or before its block's
         // first byte. Block 0 is the arena's opening fence, before any record,
         // so it clamps to record 0 — it can never be a hit offset.
+        check_owner_invariant(&v, "before compaction");
+
+        // And after compaction, which rebuilds `owner` from scratch by a
+        // different code path than the incremental one — the path that was
+        // wrong for a long time while this test never called it.
+        v.compact();
+        assert_eq!(v.owner.len(), v.folded_arena.len().div_ceil(OWNER_BLOCK));
+        check_owner_invariant(&v, "after compaction");
+    }
+
+    /// Every `owner` entry is the last record starting at or before its
+    /// block's first byte. Block 0 is the arena's opening fence, before any
+    /// record, so it clamps to record 0 — it can never be a hit offset.
+    fn check_owner_invariant(v: &VolumeIndex, when: &str) {
         for (b, &ri) in v.owner.iter().enumerate() {
             let byte = b * OWNER_BLOCK;
             let want = v
@@ -2507,8 +2535,58 @@ mod tests {
                 .iter()
                 .rposition(|r| r.off as usize <= byte)
                 .unwrap_or(0);
-            assert_eq!(ri as usize, want, "owner[{b}] (arena byte {byte})");
+            assert_eq!(ri as usize, want, "owner[{b}] (arena byte {byte}) {when}");
         }
+    }
+
+    /// The user-visible form of a wrong `owner`: a search for one file
+    /// returning another file's FRN. Every name here carries a token unique
+    /// to it, so there is no score tie for a renumbered slot to hide behind
+    /// — the only acceptable answer to `q00014z` is entry 14.
+    #[test]
+    fn after_compaction_every_hit_still_names_the_file_that_contains_it() {
+        const ABSENT: u64 = 9_000_000;
+        let mut v = ix();
+        for i in 0..2_000u64 {
+            // Varying padding walks record starts across every offset within
+            // a 64-byte block, so plenty of records straddle a boundary.
+            let pad = "x".repeat((i % 23) as usize);
+            v.add(i + 1, ABSENT, &format!("{pad}-q{i:05}z.txt"), 0);
+        }
+        v.finalize();
+        for i in (0..2_000u64).step_by(3) {
+            v.apply(crate::UsnEvent::Delete { frn: i + 1 });
+        }
+        for i in (1..2_000u64).step_by(3) {
+            v.apply(crate::UsnEvent::Rename {
+                frn: i + 1,
+                new_parent_frn: ABSENT,
+                new_name: format!("renamed-q{i:05}z.txt"),
+            });
+        }
+        v.compact();
+
+        let mut wrong = 0;
+        for i in 0..2_000u64 {
+            if i % 3 == 0 {
+                continue; // deleted
+            }
+            let hits = v.search(&format!("q{i:05}z"), 4, &|| false);
+            match hits.first() {
+                Some(h) if h.frn == i + 1 => {}
+                Some(h) => {
+                    wrong += 1;
+                    if wrong <= 5 {
+                        eprintln!("query q{i:05}z: got frn {} ({:?})", h.frn, v.name_of(h.frn));
+                    }
+                }
+                None => panic!("query q{i:05}z found nothing after compaction"),
+            }
+        }
+        assert_eq!(
+            wrong, 0,
+            "{wrong} searches resolved to a different file after compaction"
+        );
     }
 
     #[test]

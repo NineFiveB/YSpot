@@ -12,6 +12,7 @@
 
 import { useCallback, useEffect, useState, type ReactElement } from "react";
 import * as ipc from "./lib/ipc";
+import { ykeysChord } from "./lib/ykeys";
 
 /** The modifier keys, which are never the chord's own key. */
 const MODIFIER_CODES = new Set([
@@ -44,20 +45,6 @@ function prettyCode(code: string): string {
 }
 
 /**
- * The same chord in YKeys' spelling — lowercase, `+`-joined, no spaces — so the
- * line in the hint can be copied into `ykeys.json` as it stands.
- */
-export function describeChord(h: ipc.Hotkey): string {
-  const parts: string[] = [];
-  if (h.ctrl) parts.push("ctrl");
-  if (h.alt) parts.push("alt");
-  if (h.shift) parts.push("shift");
-  if (h.win) parts.push("win");
-  parts.push(prettyCode(h.code).toLowerCase());
-  return parts.join("+");
-}
-
-/**
  * §5.1 offers these one click away when the chosen chord is taken. Exported
  * because onboarding runs the same conflict flow — §5.1 asks for the
  * alternatives wherever the conflict is shown, not only in Settings.
@@ -86,6 +73,8 @@ export default function Settings({ onClose }: Props): ReactElement {
   // §5.1 as amended: with YKeys holding the chord, this view reports the
   // binding rather than owning it.
   const external = view?.settings.hotkey_source === "ykeys";
+  // The chord in YKeys' own vocabulary, or null when it has none.
+  const chordLine = view ? ykeysChord(view.settings.hotkey) : null;
 
   const apply = useCallback(async (next: ipc.Settings, note: string) => {
     setError(null);
@@ -105,7 +94,11 @@ export default function Settings({ onClose }: Props): ReactElement {
   // this handler owns every key — including Esc, which cancels rather than
   // leaving the view.
   useEffect(() => {
-    if (!capturing || !view) return;
+    // Not while YKeys holds the chord: the button is disabled, but a capture
+    // begun before the toggle was ticked would still be armed, and the next
+    // keypress would register a shell hotkey under a setting that says the
+    // shell registers nothing.
+    if (!capturing || !view || external) return;
     const onKey = (e: KeyboardEvent): void => {
       e.preventDefault();
       e.stopPropagation();
@@ -131,7 +124,13 @@ export default function Settings({ onClose }: Props): ReactElement {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [capturing, view, apply]);
+  }, [capturing, view, apply, external]);
+
+  // A capture in progress when the hand-off happens is cancelled, so the
+  // button does not sit reading "Press a chord…" while disabled.
+  useEffect(() => {
+    if (external) setCapturing(false);
+  }, [external]);
 
   // Esc leaves the view (§5.7 pops the navigation stack), except while a
   // chord is being captured — handled above.
@@ -192,13 +191,29 @@ export default function Settings({ onClose }: Props): ReactElement {
               <div className="settings-hint">
                 One daemon owns the keyboard instead of every app claiming a chord of
                 its own. YKeys registers it and summons YSpot by message, which costs
-                nothing extra — add this to <code>~/.config/ykeys/ykeys.json</code>:
-                <code className="settings-code">"{describeChord(view.settings.hotkey)}": "@signal:YSpot.Signal"</code>
+                nothing extra.
+                {chordLine !== null ? (
+                  <>
+                    {" "}
+                    Add this to <code>~/.config/ykeys/ykeys.json</code>:
+                    <code className="settings-code">"{chordLine}": "@signal:YSpot.Signal"</code>
+                  </>
+                ) : (
+                  // Said rather than guessed: a line YKeys refuses leaves
+                  // neither process holding the chord after a restart.
+                  <>
+                    {" "}
+                    YKeys has no spelling for{" "}
+                    <strong>{describeHotkey(view.settings.hotkey)}</strong>; pick a
+                    different chord first.
+                  </>
+                )}
               </div>
             </div>
             <input
               type="checkbox"
               checked={external}
+              disabled={chordLine === null && !external}
               onChange={(e) =>
                 void apply(
                   {
@@ -228,6 +243,10 @@ export default function Settings({ onClose }: Props): ReactElement {
                   <button
                     key={describeHotkey(h)}
                     className="chord"
+                    // The banner can show for any failed action; under YKeys
+                    // these would register a shell hotkey the setting says
+                    // does not exist.
+                    disabled={external}
                     onClick={() =>
                       void apply({ ...view.settings, hotkey: h }, "Hotkey updated")
                     }

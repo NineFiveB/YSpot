@@ -434,11 +434,13 @@ fn place(hwnd: HWND, tile: Tile) -> Result<(), String> {
 
 /// Where a window lands when it moves to another display (§7.5).
 ///
-/// Proportional, not absolute. Monitors differ in size and in DPI, so a window
-/// that kept its pixel rect would arrive clipped off the edge of a smaller
-/// screen or marooned in the corner of a larger one. Carrying its position and
-/// size across as fractions of the work area is what makes the move read as
-/// "the same window, other screen".
+/// Proportional, not absolute. Monitors differ in size, so a window that kept
+/// its pixel rect would arrive clipped off the edge of a smaller screen or
+/// marooned in the corner of a larger one. Carrying its position and size
+/// across as fractions of the work area is what makes the move read as "the
+/// same window, other screen". DPI is NOT handled here: a per-monitor-aware
+/// app rescales itself when it crosses a DPI boundary, and
+/// [`move_to_next_monitor`] reapplies this rect afterwards for that reason.
 pub fn remap_rect(
     rect: (i32, i32, i32, i32),
     from: (i32, i32, i32, i32),
@@ -542,13 +544,26 @@ fn move_to_next_monitor(hwnd: HWND) -> Result<(), String> {
         // A maximized window has to be restored before it can be moved, or
         // SetWindowPos fights the maximized state and it snaps back. Maximized
         // on the way in means maximized on the way out, on the new screen.
+        //
+        // A minimized one has to be restored too, and stays restored: its
+        // window rect while iconic is an off-screen placeholder, and moving
+        // that changes nothing anyone can see. The user asked for the window
+        // on the other display, and seeing it arrive there is the feedback.
         let zoomed = IsZoomed(hwnd).as_bool();
-        if zoomed {
+        if zoomed || IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let mut r = RECT::default();
         GetWindowRect(hwnd, &mut r).map_err(|e| format!("window rect: {e}"))?;
         let (x, y, w, h) = remap_rect((r.left, r.top, r.right, r.bottom), from, to);
+        SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE)
+            .map_err(|e| format!("move to next display: {e}"))?;
+        // Twice, on purpose. Crossing a DPI boundary makes Windows send the
+        // target WM_DPICHANGED during that first move, and a per-monitor-aware
+        // app answers by rescaling itself by the DPI ratio — on top of the
+        // proportional remap, so a half-screen window lands at a quarter. The
+        // documented remedy is to apply the intended rect again once the app
+        // has done its own adjustment, which is this second call.
         SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE)
             .map_err(|e| format!("move to next display: {e}"))?;
         if zoomed {

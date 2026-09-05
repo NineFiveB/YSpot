@@ -88,81 +88,89 @@ impl HotkeyState {
     }
 }
 
-/// Register `hotkey`, replacing whatever is bound now.
+/// What the registrar did, and what this shell holds afterwards.
+struct Rebind {
+    outcome: Result<(), String>,
+    /// Whether ANY chord is registered by this process after the call —
+    /// the one asked for, or the one put back. This is what decides whether
+    /// a refusal is a standing conflict or a non-event.
+    bound: bool,
+}
+
+/// Register `next`, replacing `old` if given.
 ///
 /// §5.1's atomicity rule: unregister the old chord, register the new one,
 /// and if that fails put the old one back — a failed rebind must not leave
-/// the launcher unreachable.
+/// the launcher unreachable. This function only talks to the registrar; what
+/// the outcome MEANS (a conflict to show, or nothing) depends on why it was
+/// called, so the caller publishes that through [`set_standing_conflict`].
 fn rebind_hotkey(
     app: &AppHandle,
     old: Option<&settings::Hotkey>,
     next: &settings::Hotkey,
-) -> Result<(), String> {
-    let shortcut = shortcut_of(next).ok_or_else(|| format!("unknown key {:?}", next.code))?;
+) -> Rebind {
+    let Some(shortcut) = shortcut_of(next) else {
+        return Rebind {
+            outcome: Err(format!("unknown key {:?}", next.code)),
+            bound: old.is_some(),
+        };
+    };
     if let Some(reason) = next.rejection() {
-        return Err(reason.to_string());
+        return Rebind {
+            outcome: Err(reason.to_string()),
+            bound: old.is_some(),
+        };
     }
     let manager = app.global_shortcut();
     let previous = old.and_then(shortcut_of);
     if let Some(p) = previous {
         let _ = manager.unregister(p);
     }
-    // Whether the chord the settings still name is held after all this. Not
-    // the same question as whether this call succeeded, and it is the one the
-    // standing conflict has to answer.
-    let mut restored = false;
-    let outcome = match manager.register(shortcut) {
+    match manager.register(shortcut) {
         Ok(()) => {
             log::info!("hotkey bound to {} (§5.1)", next.accelerator());
-            Ok(())
+            Rebind {
+                outcome: Ok(()),
+                bound: true,
+            }
         }
         Err(e) => {
             // Put the old chord back before reporting, so the launcher stays
             // reachable while the user picks another one.
-            if let Some(p) = previous {
-                restored = manager.register(p).is_ok();
-            }
+            let restored = previous.is_some_and(|p| manager.register(p).is_ok());
             let owner = next
                 .likely_owner()
                 .map(|o| format!(" It is probably held by {o}."))
                 .unwrap_or_default();
-            Err(format!(
-                "{} could not be registered.{owner} ({e})",
-                next.accelerator()
-            ))
-        }
-    };
-    // A rejected rebind that put the working chord back leaves the launcher
-    // perfectly reachable: `save_settings` returns before it persists anything,
-    // so the settings still name the old chord and the old chord is registered.
-    // Recording a conflict there would strand a banner and a tray tooltip on a
-    // machine where nothing is wrong. The startup call has no previous chord to
-    // restore, which is exactly when the conflict is real.
-    let standing = match &outcome {
-        Ok(()) => None,
-        Err(_) if restored => {
-            log::info!("hotkey: rebind refused; the previous chord is still bound (§5.1)");
-            None
-        }
-        // Nothing is bound: neither the chord asked for nor the one that was
-        // working. Name the chord the settings still hold, since that is the
-        // one the user has to fix and the one every other surface shows.
-        Err(message) => Some(match old {
-            Some(o) => format!(
-                "{} is no longer registered, and {} could not take its place.",
-                o.accelerator(),
-                next.accelerator()
-            ),
-            None => message.clone(),
-        }),
-    };
-    if let Some(state) = app.try_state::<HotkeyState>() {
-        if let Ok(mut g) = state.0.lock() {
-            *g = standing.clone();
+            Rebind {
+                outcome: Err(format!(
+                    "{} could not be registered.{owner} ({e})",
+                    next.accelerator()
+                )),
+                bound: restored,
+            }
         }
     }
-    tray::set_hotkey_conflict(app, standing.as_deref());
-    outcome
+}
+
+/// Give a chord back. Used when YKeys takes the hotkey over (§5.1 amended):
+/// two registrations of one chord is how a launcher gets summoned twice.
+fn unregister_hotkey(app: &AppHandle, chord: &settings::Hotkey) {
+    if let Some(s) = shortcut_of(chord) {
+        let _ = app.global_shortcut().unregister(s);
+        log::info!("hotkey {} released (§5.1)", chord.accelerator());
+    }
+}
+
+/// Publish §5.1's standing conflict to every surface that reports it: the
+/// state onboarding and Settings read, and the tray tooltip.
+fn set_standing_conflict(app: &AppHandle, message: Option<String>) {
+    if let Some(state) = app.try_state::<HotkeyState>() {
+        if let Ok(mut g) = state.0.lock() {
+            *g = message.clone();
+        }
+    }
+    tray::set_hotkey_conflict(app, message.as_deref());
 }
 
 #[derive(Default)]
@@ -1015,16 +1023,40 @@ fn get_settings(app: AppHandle, store: tauri::State<'_, Arc<SettingsStore>>) -> 
     }
 }
 
-/// Whether saving these settings should go to the registrar.
+/// What a settings save asks of the registrar.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Registrar {
+    /// Nothing about the chord or its owner changed, and the chord is held.
+    Nothing,
+    /// The user handed the chord to YKeys: release ours if we hold it.
+    HandToYkeys,
+    /// The user took the chord back from YKeys: bind it, from nothing.
+    TakeBack,
+    /// A different chord, shell-owned: §5.1's atomic replace.
+    Replace,
+    /// The same chord, shell-owned, but not held: try again.
+    Retry,
+}
+
+/// The decision table for [`save_settings`], on its own so it can be read
+/// and tested as one.
 ///
-/// A changed chord obviously must. An unchanged one must too when the current
-/// chord is not actually held: §5.1 offers Ctrl+Space among its alternatives,
-/// so the chord a user clicks off the conflict banner can be the one already
-/// in their settings. Treating that as a no-op makes the offered remedy do
-/// nothing at all — no retry, no cleared banner, and a "saved" toast — while
-/// the program that took the chord may well have released it since startup.
-fn should_rebind(current: &settings::Hotkey, next: &settings::Hotkey, contested: bool) -> bool {
-    current != next || contested
+/// Two things it has to get right that a simple "did the chord change" did
+/// not. `hotkey_source` is a runtime setting: flipping it has to (un)register
+/// now, not at the next restart, or the toast lies. And a contested chord is
+/// not a reason to refuse an unrelated save — the theme, a consent, or the
+/// YKeys hand-off that is the very remedy for the conflict — which is what
+/// happened when every save while contested went through the registrar and
+/// took its `Err` as the save's.
+fn registrar_action(current: &Settings, next: &Settings, contested: bool) -> Registrar {
+    use settings::HotkeySource::{Shell, Ykeys};
+    match (current.hotkey_source, next.hotkey_source) {
+        (_, Ykeys) => Registrar::HandToYkeys,
+        (Ykeys, Shell) => Registrar::TakeBack,
+        (Shell, Shell) if current.hotkey != next.hotkey => Registrar::Replace,
+        (Shell, Shell) if contested => Registrar::Retry,
+        (Shell, Shell) => Registrar::Nothing,
+    }
 }
 
 /// §5.9: every mutation goes through the shell. A changed hotkey is rebound
@@ -1037,19 +1069,46 @@ fn save_settings(
     next: Settings,
 ) -> Result<SettingsView, String> {
     let current = store.get();
-    // Retried even when the chord has not changed, if it is not currently
-    // held: §5.1 offers Ctrl+Space as an alternative, so the chord a user
-    // picks off the conflict banner can be the one they already have. Skipping
-    // on equality would make that click do nothing at all — no retry, no
-    // cleared banner, and a "saved" toast — while the other program may well
-    // have let the chord go since startup.
     let contested = HotkeyState::get(&app).is_some();
-    if should_rebind(&current.hotkey, &next.hotkey, contested) {
-        // `None` when nothing is bound: there is no old chord to restore, and
-        // passing the contested one would unregister a registration we do not
-        // hold.
-        let old = (!contested).then_some(&current.hotkey);
-        rebind_hotkey(&app, old, &next.hotkey)?;
+    match registrar_action(&current, &next, contested) {
+        Registrar::Nothing => {}
+        Registrar::HandToYkeys => {
+            // Release ours if we hold one; a chord this process does not
+            // register cannot be in conflict, so the standing one clears.
+            if current.hotkey_source.registers_in_shell() && !contested {
+                unregister_hotkey(&app, &current.hotkey);
+            }
+            set_standing_conflict(&app, None);
+        }
+        Registrar::TakeBack | Registrar::Retry => {
+            // Nothing of ours is bound in either case, so there is nothing to
+            // restore — and a refusal is a standing conflict on the chord the
+            // settings hold, not a reason to refuse the save. §5.1's
+            // alternatives include chords a user may already have, and
+            // whoever took the chord may have let it go since startup, which
+            // is why the unchanged case is worth a retry at all.
+            let r = rebind_hotkey(&app, None, &next.hotkey);
+            set_standing_conflict(&app, r.outcome.err());
+        }
+        Registrar::Replace => {
+            // §5.1's atomic rule: the new chord binds or the old one stays,
+            // and the file never names a chord this process does not hold.
+            // The old chord is only ours to give back if we actually hold it.
+            let old = (!contested).then_some(&current.hotkey);
+            let r = rebind_hotkey(&app, old, &next.hotkey);
+            if let Err(e) = r.outcome {
+                // Refused, so the settings keep the OLD chord. If that chord
+                // is bound again there is no conflict; if nothing is bound the
+                // standing message already names the old chord and must keep
+                // doing so — naming the rejected alternative under a button
+                // that still reads the old chord is its own bug.
+                if r.bound {
+                    set_standing_conflict(&app, None);
+                }
+                return Err(e);
+            }
+            set_standing_conflict(&app, None);
+        }
     }
     let warning = next.hotkey.warning().map(str::to_string);
     if next.diagnostics != current.diagnostics {
@@ -1389,7 +1448,9 @@ pub fn run() {
 
             let current = app.state::<Arc<SettingsStore>>().get();
             let hotkey_failed = if current.hotkey_source.registers_in_shell() {
-                match rebind_hotkey(app.handle(), None, &current.hotkey) {
+                let r = rebind_hotkey(app.handle(), None, &current.hotkey);
+                set_standing_conflict(app.handle(), r.outcome.as_ref().err().cloned());
+                match r.outcome {
                     Ok(()) => false,
                     Err(e) => {
                         log::error!("hotkey registration failed: {e} Rebind it in Settings.");
@@ -1474,21 +1535,59 @@ mod tests {
         assert_eq!(hotkey_error(live.clone(), &chord), live);
     }
 
+    fn with(source: settings::HotkeySource, hotkey: settings::Hotkey) -> Settings {
+        Settings {
+            hotkey,
+            hotkey_source: source,
+            ..Settings::default()
+        }
+    }
+
     #[test]
-    fn the_offered_alternative_is_retried_even_when_it_is_the_current_chord() {
-        let chord = alt_space();
-        let other = settings::Hotkey {
+    fn the_registrar_decision_table() {
+        use settings::HotkeySource::{Shell, Ykeys};
+        let a = alt_space();
+        let b = settings::Hotkey {
             ctrl: true,
             alt: false,
             ..alt_space()
         };
-        // Nothing wrong: an unchanged chord is a no-op, a changed one binds.
-        assert!(!should_rebind(&chord, &chord, false));
-        assert!(should_rebind(&chord, &other, false));
-        // Contested: §5.1's alternatives include chords a user may already
-        // have, and clicking one has to actually try again.
-        assert!(should_rebind(&chord, &chord, true));
-        assert!(should_rebind(&chord, &other, true));
+
+        // Nothing changed and the chord is held: leave the registrar alone.
+        assert_eq!(
+            registrar_action(&with(Shell, a.clone()), &with(Shell, a.clone()), false),
+            Registrar::Nothing
+        );
+        // A different chord: §5.1's atomic replace.
+        assert_eq!(
+            registrar_action(&with(Shell, a.clone()), &with(Shell, b.clone()), false),
+            Registrar::Replace
+        );
+        // The same chord, not held: §5.1's alternatives include chords a user
+        // may already have, so clicking one has to actually try again.
+        assert_eq!(
+            registrar_action(&with(Shell, a.clone()), &with(Shell, a.clone()), true),
+            Registrar::Retry
+        );
+        // Handing the chord to YKeys is a runtime act, contested or not — it
+        // is the remedy for a contested chord, so it must not be refused then.
+        assert_eq!(
+            registrar_action(&with(Shell, a.clone()), &with(Ykeys, a.clone()), true),
+            Registrar::HandToYkeys
+        );
+        assert_eq!(
+            registrar_action(&with(Ykeys, a.clone()), &with(Ykeys, b.clone()), false),
+            Registrar::HandToYkeys
+        );
+        // And taking it back binds now, not at the next restart.
+        assert_eq!(
+            registrar_action(&with(Ykeys, a.clone()), &with(Shell, a.clone()), false),
+            Registrar::TakeBack
+        );
+        assert_eq!(
+            registrar_action(&with(Ykeys, a), &with(Shell, b), false),
+            Registrar::TakeBack
+        );
     }
 
     fn request(gen: u64, text: &str) -> FallbackRequest {
