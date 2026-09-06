@@ -290,8 +290,33 @@ export function fileRow(item: ResultItem): Row {
   };
 }
 
+/**
+ * One generation counter for every consumer of the search events.
+ *
+ * The pipe client keeps a single stale-drop watermark and the service a single
+ * cancellation watermark, both of which assume generations only go up. The
+ * root list and the File Search view both issue queries, so they draw from
+ * the same counter and each keeps only the results for the generation IT
+ * issued last.
+ */
+let generation = 0;
+
+export function nextGen(): number {
+  return ++generation;
+}
+
+/** What `nextGen` will return next, for callers that must predict it. */
+export function peekNextGen(): number {
+  return generation + 1;
+}
+
 export function search(gen: number, text: string): Promise<unknown> {
   return invoke("search", { gen, text });
+}
+
+/** §7.3's File Search: the query is parsed for `kind:`/`ext:`/`path:` first. */
+export function filesSearch(gen: number, text: string): Promise<unknown> {
+  return invoke("files_search", { gen, text });
 }
 
 export function hideWindow(): Promise<unknown> {
@@ -440,6 +465,11 @@ export function clipboardSetEnabled(enabled: boolean): Promise<unknown> {
 /** The shell asking the launcher to show its clipboard view (§7.4). */
 export function onOpenClipboardView(cb: () => void): Promise<UnlistenFn> {
   return listen("view:clipboard", () => cb());
+}
+
+/** The shell asking the launcher to show File Search (§7.3). */
+export function onOpenFilesView(cb: () => void): Promise<UnlistenFn> {
+  return listen("view:files", () => cb());
 }
 
 /** The shell asking the launcher to show its Settings view (§5.9). */

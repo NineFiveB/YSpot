@@ -7,7 +7,7 @@
 // never rises. So both sides pin the string.
 
 import { describe, expect, it } from "vitest";
-import { fallbackFileRow, fileRow, rowKey, type ResultItem } from "./ipc";
+import { fallbackFileRow, fileRow, nextGen, peekNextGen, rowKey, type ResultItem } from "./ipc";
 
 const item = (over: Partial<ResultItem> = {}): ResultItem => ({
   id: { volumeIdx: 2, frn: "9007199254740993" },
@@ -46,5 +46,19 @@ describe("file row identity", () => {
     // a hardcoded constant here would silently discard the ranking.
     const row = fallbackFileRow({ path: "C:\a.txt", name: "a.txt", score: 0.57 });
     expect(row.score).toBe(0.57);
+  });
+});
+
+describe("the shared generation counter", () => {
+  it("only goes up, and peek predicts the next value exactly", () => {
+    // Two consumers issue generations — the root list and File Search — and
+    // the pipe's stale-drop watermark assumes they only increase. The M0
+    // self-measurement marks a keydown against the generation it is ABOUT to
+    // start, so peek has to be exact, not approximate.
+    const a = nextGen();
+    expect(peekNextGen()).toBe(a + 1);
+    const b = nextGen();
+    expect(b).toBe(a + 1);
+    expect(peekNextGen()).toBe(b + 1);
   });
 });

@@ -45,6 +45,11 @@ pub fn all() -> Vec<Command> {
             "Clipboard History",
             &["paste", "clipboard", "copied", "history"][..],
         ),
+        (
+            "yspot.files",
+            "File Search",
+            &["files", "find file", "search files", "documents"][..],
+        ),
         ("yspot.quit", "Quit YSpot", &["exit", "close yspot"][..]),
     ]
     .into_iter()

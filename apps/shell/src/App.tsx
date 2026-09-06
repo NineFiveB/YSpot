@@ -16,6 +16,7 @@ import {
   type ReactElement,
 } from "react";
 import Clipboard from "./Clipboard";
+import Files from "./Files";
 import Onboarding from "./Onboarding";
 import Settings from "./Settings";
 import { ActionPanel } from "./components/ActionPanel";
@@ -37,6 +38,8 @@ const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 /** Logical window heights per view (§5.3 scales these by the monitor's DPI). */
 const SEARCH_HEIGHT = 480;
 const SETTINGS_HEIGHT = 620;
+/** §7.3's inline cap on file rows in the root list (default 5). */
+const INLINE_FILE_CAP = 5;
 const CLIPBOARD_HEIGHT = 600;
 const ONBOARDING_HEIGHT = 520;
 
@@ -73,9 +76,9 @@ export default function App(): ReactElement {
   const [panelOpen, setPanelOpen] = useState(false);
   // §5.7's navigation stack, one level deep for now: the results list, or a
   // view opened in place. Esc pops back.
-  const [view, setView] = useState<"search" | "settings" | "clipboard" | "onboarding">(
-    "search",
-  );
+  const [view, setView] = useState<
+    "search" | "settings" | "clipboard" | "files" | "onboarding"
+  >("search");
   const inSettings = view !== "search";
   const [lat, setLat] = useState<LatencySnapshot>(statsSnapshot());
 
@@ -119,6 +122,13 @@ export default function App(): ReactElement {
 
   /** Recompute the display list and selection from the generation state. */
   const commit = useCallback((st: GenState) => {
+    // §7.3: inline file hits are capped so the root list stays scannable;
+    // the File Search command holds the full list. Top of the ranking, not
+    // first to arrive — batches land in score order within themselves only.
+    if (st.files.length > INLINE_FILE_CAP) {
+      st.files.sort((a, b) => b.score - a.score);
+      st.files.length = INLINE_FILE_CAP;
+    }
     const merged = mergeRows(st);
     mergedRef.current = merged;
     setRows(merged);
@@ -241,6 +251,7 @@ export default function App(): ReactElement {
     );
     track(ipc.onOpenSettingsView(() => setView("settings")));
     track(ipc.onOpenClipboardView(() => setView("clipboard")));
+    track(ipc.onOpenFilesView(() => setView("files")));
     track(ipc.onOpenOnboardingView(() => setView("onboarding")));
     track(
       ipc.onViewReset(() => {
@@ -284,7 +295,7 @@ export default function App(): ReactElement {
     const height =
       view === "settings"
         ? SETTINGS_HEIGHT
-        : view === "clipboard"
+        : view === "clipboard" || view === "files"
           ? CLIPBOARD_HEIGHT
           : view === "onboarding"
             ? ONBOARDING_HEIGHT
@@ -327,7 +338,10 @@ export default function App(): ReactElement {
 
   const startGeneration = useCallback(
     (text: string): number => {
-      const gen = ++genRef.current;
+      // From the shared counter: the File Search view issues generations
+      // too, and the pipe's watermark needs them all monotonic.
+      const gen = ipc.nextGen();
+      genRef.current = gen;
       stateRef.current = emptyGen(gen);
       shellBufferRef.current = [];
       filesBufferRef.current = [];
@@ -355,7 +369,7 @@ export default function App(): ReactElement {
   const measureOne = useCallback(
     (text: string) =>
       new Promise<number | null>((resolve) => {
-        const gen = genRef.current + 1;
+        const gen = ipc.peekNextGen();
         markKeydown(gen, performance.now());
         const timer = window.setTimeout(() => {
           if (measureResolversRef.current.delete(gen)) resolve(null);
@@ -569,6 +583,8 @@ export default function App(): ReactElement {
           <Settings onClose={closeView} />
         ) : view === "onboarding" ? (
           <Onboarding onClose={closeView} />
+        ) : view === "files" ? (
+          <Files onClose={closeView} />
         ) : (
           <Clipboard onClose={closeView} />
         )}

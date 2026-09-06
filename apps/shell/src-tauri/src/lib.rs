@@ -43,6 +43,7 @@ use settings::{Settings, SettingsStore};
 use settings_catalog::SettingsCatalog;
 use std::str::FromStr;
 use tauri::{AppHandle, Emitter, Manager};
+use yspot_proto::Filters;
 
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 
@@ -448,6 +449,110 @@ fn search(
     Ok(Accepted { accepted: true })
 }
 
+/// §7.3's `kind:` categories, as extension sets. The service ignores `kind`
+/// (M0 left it for the shell), so it is expanded here into the `ext` filter
+/// the service does honour. `folder` is not an extension and needs a
+/// directory flag the protocol does not carry yet, so it is refused by name.
+const KIND_EXTS: &[(&str, &[&str])] = &[
+    (
+        "document",
+        &[
+            "pdf", "doc", "docx", "odt", "rtf", "txt", "md", "xls", "xlsx", "ods", "csv", "ppt",
+            "pptx", "odp",
+        ],
+    ),
+    (
+        "image",
+        &[
+            "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "tif", "tiff", "ico",
+        ],
+    ),
+    (
+        "audio",
+        &["mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "wma"],
+    ),
+    ("video", &["mp4", "mkv", "mov", "avi", "webm", "m4v", "wmv"]),
+    (
+        "archive",
+        &["zip", "7z", "rar", "tar", "gz", "bz2", "xz", "zst", "iso"],
+    ),
+];
+
+/// Split a File Search query into the name query and §7.3's filters.
+///
+/// `kind:image`, `ext:rs,toml`, `path:src` — case-insensitive on the key,
+/// repeatable (`ext:` accumulates, later `path:`/`kind:` win), combined with
+/// AND by the service. Everything else is the name. Returns the reason when a
+/// filter cannot be honoured, so the view can say so instead of applying it
+/// to nothing.
+fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
+    let mut filters = Filters::default();
+    let mut words: Vec<&str> = Vec::new();
+    for token in raw.split_whitespace() {
+        let Some((key, value)) = token.split_once(':') else {
+            words.push(token);
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "ext" => filters.ext.extend(
+                value
+                    .split(',')
+                    .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|e| !e.is_empty()),
+            ),
+            "path" if !value.is_empty() => filters.path_substr = Some(value.to_string()),
+            "kind" => {
+                let want = value.to_ascii_lowercase();
+                if want == "folder" {
+                    return Err("kind:folder is not available yet — the index carries no                                 folder filter"
+                        .to_string());
+                }
+                match KIND_EXTS.iter().find(|(k, _)| *k == want) {
+                    Some((_, exts)) => filters.ext.extend(exts.iter().map(|e| e.to_string())),
+                    None => {
+                        return Err(format!(
+                            "unknown kind:{value}; try document, image, audio, video or archive"
+                        ))
+                    }
+                }
+            }
+            // `content:` is M2's full-text index (§3.5); until then it is a
+            // word like any other, which is the least surprising fallback.
+            _ => words.push(token),
+        }
+    }
+    Ok((words.join(" "), filters))
+}
+
+/// §7.3's File Search: the same index and the same generation counter as the
+/// root list, a long page instead of a short one, and the query parsed for
+/// filters first. Results arrive on the same events; the view keeps the ones
+/// for its generation.
+#[tauri::command]
+fn files_search(
+    app: AppHandle,
+    pipe: tauri::State<'_, Arc<PipeClient>>,
+    gen: u64,
+    text: String,
+) -> Result<Accepted, String> {
+    const PAGE: u32 = 200;
+    let (name, filters) = parse_file_query(&text)?;
+    log::debug!(
+        "files cmd: gen={gen} len={} ext={} path={}",
+        name.chars().count(),
+        filters.ext.len(),
+        filters.path_substr.is_some()
+    );
+    if !pipe.is_connected() {
+        // Windows Search takes the name only; the view says the filters did
+        // not apply.
+        run_fallback_search(&app, gen, name, "fast indexing off");
+        return Ok(Accepted { accepted: true });
+    }
+    pipe.search_with(gen, name, filters, PAGE)?;
+    Ok(Accepted { accepted: true })
+}
+
 /// §7.1 icon extraction, off the query path: the frontend asks per visible
 /// row and renders a placeholder until this resolves (§5.10).
 #[tauri::command]
@@ -615,7 +720,11 @@ fn execute_action(
     // than the end of the errand, and Settings opens IN the launcher, so
     // dismissing would close the thing the user just asked for.
     let stays_open = matches!(action.as_str(), "copy_path" | "copy_file" | "copy")
-        || (kind == "command" && matches!(id.as_str(), "yspot.settings" | "yspot.clipboard"));
+        || (kind == "command"
+            && matches!(
+                id.as_str(),
+                "yspot.settings" | "yspot.clipboard" | "yspot.files"
+            ));
     if !stays_open {
         // Dismissed BEFORE the action so focus lands on whatever the action
         // raises (§5.2 hands focus back to the previous foreground window,
@@ -636,6 +745,7 @@ fn execute_action(
         "command" => match id.as_str() {
             "yspot.settings" => show_settings(&app).map(|()| false),
             "yspot.clipboard" => show_view(&app, "view:clipboard").map(|()| false),
+            "yspot.files" => show_view(&app, "view:files").map(|()| false),
             "yspot.quit" => {
                 log::info!("quit from the launcher; the indexing service keeps running (§5.5)");
                 app.exit(0);
@@ -1389,6 +1499,7 @@ pub fn run() {
             onboarding_state,
             finish_onboarding,
             clipboard_list,
+            files_search,
             clipboard_paste,
             clipboard_delete,
             clipboard_clear,
@@ -1653,6 +1764,31 @@ mod tests {
         q.submit(request(1, "r"));
         assert!(!q.is_current(1));
         assert!(q.is_current(2));
+    }
+
+    #[test]
+    fn file_queries_split_into_a_name_and_filters() {
+        let (name, f) = parse_file_query("report kind:document path:projects ext:.PDF,md").unwrap();
+        assert_eq!(name, "report");
+        assert_eq!(f.path_substr.as_deref(), Some("projects"));
+        // kind expands to its set, ext accumulates, dots and case normalise.
+        assert!(f.ext.contains(&"docx".to_string()));
+        assert!(f.ext.contains(&"pdf".to_string()));
+        assert!(f.ext.contains(&"md".to_string()));
+
+        // Nothing to filter: everything is the name, including a token that
+        // merely contains a colon.
+        let (name, f) = parse_file_query("notes 12:30").unwrap();
+        assert_eq!(name, "notes 12:30");
+        assert!(f.ext.is_empty() && f.path_substr.is_none());
+
+        // Refused by name rather than applied to nothing.
+        assert!(parse_file_query("x kind:folder")
+            .unwrap_err()
+            .contains("folder"));
+        assert!(parse_file_query("x kind:banana")
+            .unwrap_err()
+            .contains("banana"));
     }
 
     #[test]

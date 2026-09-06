@@ -175,6 +175,19 @@ impl PipeClient {
 
     /// §4.6 `search`: filename query, empty scopes, default filters, 50 rows.
     pub fn search(&self, gen: u64, text: String) -> Result<(), String> {
+        self.search_with(gen, text, Filters::default(), MAX_RESULTS)
+    }
+
+    /// The root list's query, with §7.3's filters and a page size of the
+    /// caller's choosing. The File Search view asks for a long page; the
+    /// service clamps it (§4.3).
+    pub fn search_with(
+        &self,
+        gen: u64,
+        text: String,
+        filters: Filters,
+        max_results: u32,
+    ) -> Result<(), String> {
         self.current_gen.store(gen, Ordering::SeqCst);
         *self.current_text.lock().unwrap_or_else(|e| e.into_inner()) = text.clone();
         self.send(Message::SearchQuery {
@@ -182,8 +195,8 @@ impl PipeClient {
             gen,
             text,
             scopes: Vec::new(),
-            filters: Filters::default(),
-            max_results: MAX_RESULTS,
+            filters,
+            max_results,
         })
     }
 
