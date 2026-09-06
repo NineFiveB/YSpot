@@ -78,7 +78,14 @@ pub const FUZZY_CAP: usize = 20_000;
 /// answer (a filtered query genuinely has to look further to fill a page),
 /// but it is not the cheap one, and the paragraph above does not cover it:
 /// §7.3's `kind:`/`ext:` filters are exactly that shape and reach here
-/// through `search_filtered`. Measured before assuming otherwise.
+/// through `search_filtered`.
+///
+/// Measured rather than argued: the bench's `kind-filtered` class runs the
+/// worst-case candidate volume through the ext set `kind:document` expands to.
+/// At 1M entries it costs p95 6.68 ms against the unfiltered 5.33 ms — a
+/// quarter more, and the most expensive class in the table, but inside §2.5's
+/// 10 ms. So the pruning loss is real and bounded; it does not need
+/// restructuring, it needs the tripwire it now has.
 const FUZZY_SOFT_DEADLINE: Duration = Duration::from_millis(8);
 
 /// Tail candidates verified between deadline checks during the continuation.

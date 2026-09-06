@@ -295,6 +295,24 @@ const CJK: &[&str] = &[
 ];
 
 /// Extension mix, weighted by repetition (crude but explicit and readable).
+/// What §7.3's `kind:document` expands to in the shell, intersected with the
+/// extensions this corpus actually generates. The shell turns one `kind:`
+/// token into a list this long and hands it to `search_filtered` as an
+/// `accept` closure over the name — so this is the real shape of a filtered
+/// File Search query, not a synthetic one.
+const DOCUMENT_EXTS: &[&str] = &["pdf", "docx", "txt", "md", "xlsx", "pptx", "csv"];
+
+/// The name test `session.rs` applies for an `ext:` filter: case-insensitive
+/// match on the final extension.
+fn ext_matches(name: &str, exts: &[&str]) -> bool {
+    let Some(dot) = name.rfind('.') else {
+        return false;
+    };
+    let got = &name[dot + 1..];
+    exts.iter()
+        .any(|e| got.len() == e.len() && got.eq_ignore_ascii_case(e))
+}
+
 const FILE_EXTS: &[&str] = &[
     "txt", "txt", "txt", "md", "md", "rs", "rs", "ts", "ts", "tsx", "js", "js", "json", "json",
     "json", "png", "png", "jpg", "jpg", "pdf", "pdf", "docx", "docx", "xlsx", "pptx", "dll", "dll",
@@ -921,6 +939,31 @@ fn measure_class(
     iterations: usize,
     max_results: usize,
 ) -> ClassResult {
+    measure_class_filtered(ix, name, note, queries, iterations, max_results, &|_| true)
+}
+
+/// [`measure_class`], with the caller-supplied name filter §7.3's `kind:` and
+/// `ext:` tokens compile to.
+///
+/// Worth its own class because the filter changes the SHAPE of the search, not
+/// just its inputs. `Selector::offer` consults `accept` before admitting, so a
+/// filter selective enough to keep the heap under its cap leaves the score
+/// floor at negative infinity — and then every whole-pass skip is disabled and
+/// the fuzzy continuation runs to its soft deadline. The comment on
+/// `FUZZY_SOFT_DEADLINE` used to claim the §2.5 budget was "unaffected by
+/// construction" because a full page never continues; that holds only for
+/// pages filled with ACCEPTED rows, which is exactly what a filter prevents.
+/// This class is here so the cost is a measured number rather than an argument.
+#[allow(clippy::too_many_arguments)]
+fn measure_class_filtered(
+    ix: &VolumeIndex,
+    name: &'static str,
+    note: &'static str,
+    queries: Vec<String>,
+    iterations: usize,
+    max_results: usize,
+    accept: &dyn Fn(&str) -> bool,
+) -> ClassResult {
     if queries.is_empty() {
         return ClassResult {
             name,
@@ -936,7 +979,7 @@ fn measure_class(
 
     let warmup = (iterations / 10).clamp(3, 25);
     for i in 0..warmup {
-        let hits = ix.search(&queries[i % queries.len()], max_results, &|| false);
+        let hits = ix.search_filtered(&queries[i % queries.len()], max_results, &|| false, accept);
         std::hint::black_box(&hits);
     }
 
@@ -945,7 +988,7 @@ fn measure_class(
     for i in 0..iterations {
         let q = &queries[i % queries.len()];
         let t0 = Instant::now();
-        let hits = ix.search(q, max_results, &|| false);
+        let hits = ix.search_filtered(q, max_results, &|| false, accept);
         samples.push(us(t0));
         total_hits += std::hint::black_box(&hits).len();
     }
@@ -1746,6 +1789,15 @@ fn run(cfg: &Config) -> Report {
             COMMON_SUBSTRINGS.iter().map(|s| s.to_string()).collect(),
             it,
             mr,
+        ),
+        measure_class_filtered(
+            &ix,
+            "kind-filtered",
+            "common-substr + §7.3 kind:document; the filter keeps the page unfilled",
+            COMMON_SUBSTRINGS.iter().map(|s| s.to_string()).collect(),
+            it,
+            mr,
+            &|name| ext_matches(name, DOCUMENT_EXTS),
         ),
         measure_class(
             &ix,
