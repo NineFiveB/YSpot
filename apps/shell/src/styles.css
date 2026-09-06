@@ -471,14 +471,15 @@ mark {
   margin-top: 2px;
 }
 
-/* A full path on one line, trimmed at the START so the file's own folder is
-   what survives — the drive letter is the least informative part. */
+/* A full path on one line. Trimmed at the END, like Explorer, and the whole
+   path is in the tooltip. The `direction: rtl` trick that trims at the start
+   was tried and reverted: it reorders neutral characters at the ends of the
+   string (`C++` becomes `++C`, `Notes (old)` grows a leading paren) and
+   scrambles any folder named in an RTL script. */
 .files-path {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
 }
 
 .files-note {

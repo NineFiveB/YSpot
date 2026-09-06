@@ -538,14 +538,22 @@ fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
     }
     filters.ext = match (kind_exts, exts.is_empty()) {
         (Some(set), false) => {
-            let both: Vec<String> = exts.into_iter().filter(|e| set.contains(e)).collect();
-            if both.is_empty() {
+            let both: Vec<String> = exts.iter().filter(|e| set.contains(e)).cloned().collect();
+            if !both.is_empty() {
+                both
+            } else if exts
+                .iter()
+                .any(|e| set.iter().any(|k| k.starts_with(e.as_str())))
+            {
+                // `kind:image ext:p` on the way to `png`: not disjoint yet,
+                // just unfinished. The kind alone applies until it is.
+                set
+            } else {
                 return Err(
                     "that ext: is not one of the kind: you asked for, so nothing could match"
                         .to_string(),
                 );
             }
-            both
         }
         (Some(set), true) => set,
         (None, _) => exts,
@@ -553,8 +561,10 @@ fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
     let name = words.join(" ");
     // The index answers a name query; a filter on its own would ask it to
     // list everything of a kind, which it cannot. Said, rather than answered
-    // with a silent "no files match".
-    if name.is_empty() && (!filters.ext.is_empty() || filters.path_substr.is_some()) {
+    // with a silent "no files match". That includes the not-yet-a-filter
+    // forms — a bare `kind:` or `ext:`, a half-typed `kind:im` — which set
+    // nothing and would otherwise send an empty query.
+    if name.is_empty() && !raw.trim().is_empty() {
         return Err(
             "add a word from the name — filters narrow a search, they cannot list the index on their own"
                 .to_string(),
@@ -1860,13 +1870,21 @@ mod tests {
         let (name, f) = parse_file_query("x kind:im").unwrap();
         assert_eq!(name, "x");
         assert!(f.ext.is_empty());
-        // Filters alone cannot list the index.
-        assert!(parse_file_query("kind:image")
+        // Filters alone cannot list the index — including the forms that
+        // set no filter yet, which would otherwise send an empty query.
+        for q in ["kind:image", "path:src", "kind:", "kind:im", "ext:"] {
+            assert!(
+                parse_file_query(q).unwrap_err().contains("add a word"),
+                "{q:?}"
+            );
+        }
+        // An ext still being typed under a kind is the kind alone, not a
+        // refusal on every keystroke; a finished mismatch is refused.
+        let (_, f) = parse_file_query("x kind:image ext:p").unwrap();
+        assert!(f.ext.contains(&"png".to_string()) && f.ext.contains(&"jpg".to_string()));
+        assert!(parse_file_query("x kind:image ext:zzz")
             .unwrap_err()
-            .contains("add a word"));
-        assert!(parse_file_query("path:src")
-            .unwrap_err()
-            .contains("add a word"));
+            .contains("ext:"));
         // A drive letter is a name, not a filter key.
         let (name, f) = parse_file_query(r"c:\users report").unwrap();
         assert_eq!(name, r"c:\users report");

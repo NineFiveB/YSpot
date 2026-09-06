@@ -42,10 +42,16 @@ export default function Files({ onClose }: Props): ReactElement {
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [panelOpen, setPanelOpen] = useState(false);
+  /** The generation whose final batch has landed, for the announcement. */
+  const [settled, setSettled] = useState(0);
+  /** Windows Search itself could not answer (§3.1: never an empty list). */
+  const [unavailable, setUnavailable] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   /** The generation this view last asked for; anything else is not ours. */
   const genRef = useRef(0);
   const queryRef = useRef("");
+  /** Mirror of `rows`, readable outside React's render cycle. */
+  const rowsRef = useRef<ipc.Row[]>([]);
 
   const run = useCallback((text: string) => {
     // A generation from the shared counter, so the pipe's stale-drop
@@ -54,10 +60,12 @@ export default function Files({ onClose }: Props): ReactElement {
     const gen = ipc.nextGen();
     genRef.current = gen;
     queryRef.current = text;
+    rowsRef.current = [];
     setRows([]);
     setSelected(0);
     setNote(null);
     setError(null);
+    setUnavailable(false);
     setAnnouncement("");
     // Sent even when empty: the shell answers an empty query by cancelling
     // whatever this view had in flight, so clearing the box does not leave a
@@ -93,20 +101,27 @@ export default function Files({ onClose }: Props): ReactElement {
           const seen = new Set(prev.map((r) => r.key));
           const fresh = payload.items.map(ipc.fileRow).filter((r) => !seen.has(r.key));
           const next = fresh.length === 0 ? prev : [...prev, ...fresh];
-          // §5.12: announce the settled set, once, not every batch.
-          if (payload.isFinal) setAnnouncement(announceText(queryRef.current, next));
+          rowsRef.current = next;
           return next;
         });
-        if (payload.isFinal) setPending(false);
+        if (payload.isFinal) {
+          setPending(false);
+          // Announced from an effect keyed on the generation, not from inside
+          // the updater above: React may run an updater later than the event
+          // that queued it, past a reset for a newer generation.
+          setSettled(payload.gen);
+        }
       }),
     );
     track(
       ipc.onSearchFallback((payload) => {
         if (payload.gen !== genRef.current) return;
         const next = payload.items.map(ipc.fallbackFileRow);
+        rowsRef.current = next;
         setRows(next);
         setPending(false);
-        setAnnouncement(announceText(queryRef.current, next));
+        setUnavailable(payload.unavailable !== null);
+        setSettled(payload.gen);
         // Windows Search answers by name only; the filters are for the
         // service's index. Said, rather than silently applied to nothing.
         setNote(
@@ -116,11 +131,29 @@ export default function Files({ onClose }: Props): ReactElement {
         );
       }),
     );
+    track(
+      ipc.onIndexState((p) => {
+        // A query in flight when the service goes away never gets its final
+        // batch, and "Searching…" would sit there until the next keystroke.
+        // Ask again: the shell now answers through Windows Search, and says
+        // so in the note.
+        if (p.connected === false && genRef.current !== 0 && queryRef.current.trim() !== "") {
+          run(queryRef.current);
+        }
+      }),
+    );
     return () => {
       disposed = true;
       unlisteners.forEach((u) => u());
     };
-  }, []);
+  }, [run]);
+
+  // §5.12: the settled count, announced once per generation — and only if
+  // that generation is still the one on screen.
+  useEffect(() => {
+    if (settled === 0 || settled !== genRef.current) return;
+    setAnnouncement(announceText(queryRef.current, rowsRef.current));
+  }, [settled]);
 
   const clamped = Math.min(selected, Math.max(0, rows.length - 1));
   const current = rows[clamped];
@@ -134,13 +167,21 @@ export default function Files({ onClose }: Props): ReactElement {
       ?.scrollIntoView({ block: "nearest" });
   }, [current]);
 
+  // The panel takes focus on mount and leaves handing it back to its caller
+  // — the root list does this in closePanel, and this view must too, or a
+  // closed panel leaves focus on <body> and typing reaches nothing (§5.7).
+  const closePanel = useCallback(() => {
+    setPanelOpen(false);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  }, []);
+
   const act = useCallback(
     (action: string) => {
       if (!current) return;
-      setPanelOpen(false);
+      closePanel();
       void ipc.executeAction(current, action).catch((e) => setError(String(e)));
     },
-    [current],
+    [current, closePanel],
   );
 
   // Window-level, capture phase, like the other views: a click on a row must
@@ -258,7 +299,7 @@ export default function Files({ onClose }: Props): ReactElement {
               ? "Type a name. Narrow it with kind:document, kind:image, kind:audio, kind:video, kind:archive, ext:pdf,docx or path:projects — they combine."
               : pending
                 ? "Searching…"
-                : error
+                : error || unavailable
                   ? ""
                   : "No files match."}
           </p>
@@ -295,7 +336,7 @@ export default function Files({ onClose }: Props): ReactElement {
           actions={actionsFor(current)}
           subject={current.name}
           onRun={act}
-          onClose={() => setPanelOpen(false)}
+          onClose={closePanel}
         />
       ) : null}
     </div>
