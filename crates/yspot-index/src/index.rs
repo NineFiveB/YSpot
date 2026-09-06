@@ -2981,34 +2981,31 @@ mod tests {
         for (q, want) in QUERIES.iter().zip(&before) {
             let got = v.search(q, 32, &|| false);
             assert_eq!(got.len(), want.len(), "query {q:?}: result count");
-            // Scores are fully determined by the corpus, so the SCORE vector
-            // must be identical. The FRN at a given ROW need not be: compaction
-            // renumbers slots, and `Scored::cmp` breaks exactly-equal scores by
-            // entry index, so tied rows may swap — behavior change 6, which is
-            // signed off.
+            // The full result vector, byte for byte — Step 9's gate. Scores
+            // are determined by the corpus. And the FRN at each row is too:
+            // `Scored::cmp` breaks exact ties by entry index, and compaction's
+            // `remap` is built in ascending old-slot order, so the relative
+            // order of every live slot survives renumbering; nothing else
+            // between `before` and here touches a slot (a rename keeps its
+            // own). An earlier version of this check tolerated FRN swaps at
+            // tied scores on the theory that renumbering could reorder them.
+            // It cannot — and that tolerance is exactly how a wrong `owner`,
+            // answering with a DIFFERENT file at the same score, lived here.
             for (i, (g, w)) in got.iter().zip(want).enumerate() {
                 assert_eq!(
                     g.score.to_bits(),
                     w.score.to_bits(),
                     "query {q:?} row {i}: score"
                 );
+                assert_eq!(
+                    g.frn, w.frn,
+                    "query {q:?} row {i}: a different file answered"
+                );
                 assert!(
                     v.name_of(g.frn).is_some(),
                     "query {q:?} row {i}: unresolvable"
                 );
             }
-            // But the SET of files must be the same one. A tie swap moves an
-            // FRN between rows; a wrong `owner` replaces it with a different
-            // file's, which is invisible to a per-row score check on a corpus
-            // this uniform — that is how the block-boundary bug lived here.
-            let mut got_frns: Vec<u64> = got.iter().map(|h| h.frn).collect();
-            let mut want_frns: Vec<u64> = want.iter().map(|h| h.frn).collect();
-            got_frns.sort_unstable();
-            want_frns.sort_unstable();
-            assert_eq!(
-                got_frns, want_frns,
-                "query {q:?}: a different file answered"
-            );
         }
 
         // Paths are reconstructed from the parent chain and the name arena, so

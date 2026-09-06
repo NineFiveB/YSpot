@@ -162,6 +162,14 @@ fn unregister_hotkey(app: &AppHandle, chord: &settings::Hotkey) {
     }
 }
 
+/// [`set_standing_conflict`], but only when there is something to say — a
+/// `None` here means "leave whatever is published alone", not "clear it".
+fn set_standing_conflict_if(app: &AppHandle, message: Option<String>) {
+    if message.is_some() {
+        set_standing_conflict(app, message);
+    }
+}
+
 /// Publish §5.1's standing conflict to every surface that reports it: the
 /// state onboarding and Settings read, and the tray tooltip.
 fn set_standing_conflict(app: &AppHandle, message: Option<String>) {
@@ -1097,18 +1105,24 @@ fn save_settings(
             let old = (!contested).then_some(&current.hotkey);
             let r = rebind_hotkey(&app, old, &next.hotkey);
             if let Err(e) = r.outcome {
-                // Refused, so the settings keep the OLD chord. If that chord is
-                // bound again there is no conflict. If NOTHING is bound — the
-                // restore failed too, because something claimed the old chord
-                // in the unregister→register window — that is §5.1's silent
-                // degradation exactly, and it has to be published: this is the
-                // one path where the shell holds nothing and the file, the
-                // tray and Settings would all otherwise say the chord is fine.
-                // Named for the chord the settings still hold, not the
-                // rejected alternative.
-                set_standing_conflict(
+                // Refused, so the settings keep the OLD chord.
+                //
+                // Three cases. Old chord bound again: no conflict. Old chord
+                // was never ours this session (`old` is None because it was
+                // already contested): the standing message from startup —
+                // with its likely-owner hint — is still the true one, and
+                // must be left alone; `bound` is false here trivially, not
+                // because anything was lost. Old chord GIVEN UP and not
+                // recovered, because something claimed it in the
+                // unregister→register window: that is §5.1's silent
+                // degradation and the one case that needs a new message,
+                // named for the chord the settings still hold.
+                if r.bound {
+                    set_standing_conflict(&app, None);
+                }
+                set_standing_conflict_if(
                     &app,
-                    (!r.bound).then(|| {
+                    (old.is_some() && !r.bound).then(|| {
                         format!(
                             "{} is no longer registered, and {} could not take its place.",
                             current.hotkey.accelerator(),
