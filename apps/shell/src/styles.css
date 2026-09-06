@@ -471,6 +471,20 @@ mark {
   margin-top: 2px;
 }
 
+/* A full path on one line, trimmed at the START so the file's own folder is
+   what survives — the drive letter is the least informative part. */
+.files-path {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+}
+
+.files-note {
+  padding: 0 12px 8px;
+}
+
 .clip-footer {
   flex: none;
   display: flex;

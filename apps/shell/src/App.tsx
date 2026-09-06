@@ -432,7 +432,10 @@ export default function App(): ReactElement {
     setQuery(text);
     queryRef.current = text;
     if (text !== "") {
-      markKeydown(genRef.current + 1, keydownTsRef.current ?? performance.now());
+      // The generation the keystroke is ABOUT to start, from the shared
+      // counter: after the File Search view has issued queries, genRef + 1
+      // is not it, and the latency sample for this keystroke would be lost.
+      markKeydown(ipc.peekNextGen(), keydownTsRef.current ?? performance.now());
     }
     keydownTsRef.current = null;
     // An empty query still dispatches: the higher generation cancels the

@@ -488,13 +488,21 @@ const KIND_EXTS: &[(&str, &[&str])] = &[
 fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
     let mut filters = Filters::default();
     let mut words: Vec<&str> = Vec::new();
+    // Kept apart until the end: the service ORs everything in `ext`, and
+    // §7.3 says the filters combine with AND, so `kind:image ext:png` has to
+    // become the INTERSECTION — not the union that pouring both into one list
+    // would give.
+    let mut kind_exts: Option<Vec<String>> = None;
+    let mut exts: Vec<String> = Vec::new();
     for token in raw.split_whitespace() {
-        let Some((key, value)) = token.split_once(':') else {
+        // A drive letter is not a filter key: `c:\\users` is a name to search
+        // for, however much it looks like `x:value`.
+        let Some((key, value)) = token.split_once(':').filter(|(k, _)| k.len() > 1) else {
             words.push(token);
             continue;
         };
         match key.to_ascii_lowercase().as_str() {
-            "ext" => filters.ext.extend(
+            "ext" => exts.extend(
                 value
                     .split(',')
                     .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
@@ -504,11 +512,18 @@ fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
             "kind" => {
                 let want = value.to_ascii_lowercase();
                 if want == "folder" {
-                    return Err("kind:folder is not available yet — the index carries no                                 folder filter"
-                        .to_string());
+                    return Err(
+                        "kind:folder is not available yet — the index carries no folder filter"
+                            .to_string(),
+                    );
                 }
                 match KIND_EXTS.iter().find(|(k, _)| *k == want) {
-                    Some((_, exts)) => filters.ext.extend(exts.iter().map(|e| e.to_string())),
+                    Some((_, set)) => kind_exts = Some(set.iter().map(|e| e.to_string()).collect()),
+                    // Typed so far, not typed wrong: `kind:im` is on its way to
+                    // `kind:image`, and an error on every keystroke between
+                    // would blank the list five times. A prefix of a known kind
+                    // is no filter yet; the name still searches.
+                    None if KIND_EXTS.iter().any(|(k, _)| k.starts_with(want.as_str())) => {}
                     None => {
                         return Err(format!(
                             "unknown kind:{value}; try document, image, audio, video or archive"
@@ -521,7 +536,31 @@ fn parse_file_query(raw: &str) -> Result<(String, Filters), String> {
             _ => words.push(token),
         }
     }
-    Ok((words.join(" "), filters))
+    filters.ext = match (kind_exts, exts.is_empty()) {
+        (Some(set), false) => {
+            let both: Vec<String> = exts.into_iter().filter(|e| set.contains(e)).collect();
+            if both.is_empty() {
+                return Err(
+                    "that ext: is not one of the kind: you asked for, so nothing could match"
+                        .to_string(),
+                );
+            }
+            both
+        }
+        (Some(set), true) => set,
+        (None, _) => exts,
+    };
+    let name = words.join(" ");
+    // The index answers a name query; a filter on its own would ask it to
+    // list everything of a kind, which it cannot. Said, rather than answered
+    // with a silent "no files match".
+    if name.is_empty() && (!filters.ext.is_empty() || filters.path_substr.is_some()) {
+        return Err(
+            "add a word from the name — filters narrow a search, they cannot list the index on their own"
+                .to_string(),
+        );
+    }
+    Ok((name, filters))
 }
 
 /// §7.3's File Search: the same index and the same generation counter as the
@@ -535,8 +574,24 @@ fn files_search(
     gen: u64,
     text: String,
 ) -> Result<Accepted, String> {
-    const PAGE: u32 = 200;
-    let (name, filters) = parse_file_query(&text)?;
+    // §7.3 has the service stat size/mtime for the returned page, and this
+    // view shows neither — so the page is long enough to be the "full list"
+    // the root list defers to, and no longer.
+    const PAGE: u32 = 100;
+    // An empty box, or a query the parser refuses, must not leave the last
+    // long page running on the service for nothing: the pipe has no other
+    // way to learn this view stopped caring.
+    if text.trim().is_empty() {
+        let _ = pipe.cancel_current();
+        return Ok(Accepted { accepted: true });
+    }
+    let (name, filters) = match parse_file_query(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let _ = pipe.cancel_current();
+            return Err(e);
+        }
+    };
     log::debug!(
         "files cmd: gen={gen} len={} ext={} path={}",
         name.chars().count(),
@@ -1771,10 +1826,11 @@ mod tests {
         let (name, f) = parse_file_query("report kind:document path:projects ext:.PDF,md").unwrap();
         assert_eq!(name, "report");
         assert_eq!(f.path_substr.as_deref(), Some("projects"));
-        // kind expands to its set, ext accumulates, dots and case normalise.
-        assert!(f.ext.contains(&"docx".to_string()));
-        assert!(f.ext.contains(&"pdf".to_string()));
-        assert!(f.ext.contains(&"md".to_string()));
+        // kind ∩ ext: the document set narrowed to the two extensions named,
+        // dots and case normalised on the way.
+        let mut ext = f.ext.clone();
+        ext.sort();
+        assert_eq!(ext, vec!["md".to_string(), "pdf".to_string()]);
 
         // Nothing to filter: everything is the name, including a token that
         // merely contains a colon.
@@ -1789,6 +1845,32 @@ mod tests {
         assert!(parse_file_query("x kind:banana")
             .unwrap_err()
             .contains("banana"));
+    }
+
+    #[test]
+    fn file_filters_combine_with_and_and_refuse_what_cannot_match() {
+        // kind ∩ ext, not kind ∪ ext: the service ORs the list it is given.
+        let (_, f) = parse_file_query("x kind:image ext:png,rs").unwrap();
+        assert_eq!(f.ext, vec!["png".to_string()]);
+        // Disjoint: nothing could match, and saying so beats an empty list.
+        assert!(parse_file_query("x kind:image ext:rs")
+            .unwrap_err()
+            .contains("ext:"));
+        // A prefix of a kind, mid-typing, is no filter yet rather than an error.
+        let (name, f) = parse_file_query("x kind:im").unwrap();
+        assert_eq!(name, "x");
+        assert!(f.ext.is_empty());
+        // Filters alone cannot list the index.
+        assert!(parse_file_query("kind:image")
+            .unwrap_err()
+            .contains("add a word"));
+        assert!(parse_file_query("path:src")
+            .unwrap_err()
+            .contains("add a word"));
+        // A drive letter is a name, not a filter key.
+        let (name, f) = parse_file_query(r"c:\users report").unwrap();
+        assert_eq!(name, r"c:\users report");
+        assert!(f.ext.is_empty());
     }
 
     #[test]

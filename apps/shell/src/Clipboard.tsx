@@ -62,6 +62,14 @@ export default function Clipboard({ onClose }: Props): ReactElement {
   const clamped = Math.min(selected, Math.max(0, items.length - 1));
   const current = items[clamped];
 
+  // Keep the selected row in view; `nearest` only scrolls when it is off
+  // screen. Found while reviewing File Search, which copied this view's
+  // shape — and its omission.
+  useEffect(() => {
+    if (!current) return;
+    document.getElementById(`clip-${current.id}`)?.scrollIntoView({ block: "nearest" });
+  }, [current]);
+
   const paste = useCallback(() => {
     if (!current) return;
     void ipc.clipboardPaste(current.id).catch((e) => setError(String(e)));

@@ -8,27 +8,44 @@
 // filters first. `kind:image`, `ext:rs,toml` and `path:src` combine with AND;
 // the words left over are the name query.
 //
+// Every §7.3 action is reachable here the way it is in the root list: the
+// same modifier chords (Ctrl+Shift+E reveal, Ctrl+C / Ctrl+Shift+C copy) and
+// the same Ctrl+K panel, over the same rows. §5.7 says every action is
+// keyboard-reachable; a second surface with fewer verbs would break that
+// quietly.
+//
 // What is not here, and why, is recorded in docs/M1.md: `content:` routes to
 // the full-text index, which is M2; the preview pane is a body of work of
 // its own; and `kind:folder` needs a directory filter the protocol does not
 // carry yet.
 
 import { useCallback, useEffect, useRef, useState, type ReactElement } from "react";
+import { ActionPanel } from "./components/ActionPanel";
+import { actionsFor, shortcutAction } from "./lib/actions";
+import { announceText } from "./lib/announce";
 import * as ipc from "./lib/ipc";
 
 interface Props {
   onClose: () => void;
 }
 
+/** Roughly a viewport of rows, for PageUp/PageDown. */
+const PAGE_STEP = 8;
+
 export default function Files({ onClose }: Props): ReactElement {
   const [query, setQuery] = useState("");
   const [rows, setRows] = useState<ipc.Row[]>([]);
   const [selected, setSelected] = useState(0);
+  /** True from the query being sent until its final batch (or fallback). */
+  const [pending, setPending] = useState(false);
+  const [announcement, setAnnouncement] = useState("");
   const [note, setNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   /** The generation this view last asked for; anything else is not ours. */
   const genRef = useRef(0);
+  const queryRef = useRef("");
 
   const run = useCallback((text: string) => {
     // A generation from the shared counter, so the pipe's stale-drop
@@ -36,12 +53,20 @@ export default function Files({ onClose }: Props): ReactElement {
     // list ignores it because it is not the one IT issued, and vice versa.
     const gen = ipc.nextGen();
     genRef.current = gen;
+    queryRef.current = text;
     setRows([]);
     setSelected(0);
     setNote(null);
     setError(null);
-    if (text.trim() === "") return;
-    void ipc.filesSearch(gen, text).catch((e) => setError(String(e)));
+    setAnnouncement("");
+    // Sent even when empty: the shell answers an empty query by cancelling
+    // whatever this view had in flight, so clearing the box does not leave a
+    // 100-row search running on the service for nothing.
+    setPending(text.trim() !== "");
+    void ipc.filesSearch(gen, text).catch((e) => {
+      setPending(false);
+      setError(String(e));
+    });
   }, []);
 
   useEffect(() => {
@@ -67,14 +92,21 @@ export default function Files({ onClose }: Props): ReactElement {
         setRows((prev) => {
           const seen = new Set(prev.map((r) => r.key));
           const fresh = payload.items.map(ipc.fileRow).filter((r) => !seen.has(r.key));
-          return fresh.length === 0 ? prev : [...prev, ...fresh];
+          const next = fresh.length === 0 ? prev : [...prev, ...fresh];
+          // §5.12: announce the settled set, once, not every batch.
+          if (payload.isFinal) setAnnouncement(announceText(queryRef.current, next));
+          return next;
         });
+        if (payload.isFinal) setPending(false);
       }),
     );
     track(
       ipc.onSearchFallback((payload) => {
         if (payload.gen !== genRef.current) return;
-        setRows(payload.items.map(ipc.fallbackFileRow));
+        const next = payload.items.map(ipc.fallbackFileRow);
+        setRows(next);
+        setPending(false);
+        setAnnouncement(announceText(queryRef.current, next));
         // Windows Search answers by name only; the filters are for the
         // service's index. Said, rather than silently applied to nothing.
         setNote(
@@ -93,35 +125,85 @@ export default function Files({ onClose }: Props): ReactElement {
   const clamped = Math.min(selected, Math.max(0, rows.length - 1));
   const current = rows[clamped];
 
+  // Keep the selected row in view. `nearest` scrolls only when it is off
+  // screen, so arrowing inside the viewport does not jitter the list.
+  useEffect(() => {
+    if (!current) return;
+    document
+      .getElementById(`files-${current.key}`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [current]);
+
   const act = useCallback(
     (action: string) => {
       if (!current) return;
+      setPanelOpen(false);
       void ipc.executeAction(current, action).catch((e) => setError(String(e)));
     },
     [current],
   );
 
   // Window-level, capture phase, like the other views: a click on a row must
-  // not turn the view into a keyboard dead end.
+  // not turn the view into a keyboard dead end. While the action panel is
+  // open it owns the keyboard.
   useEffect(() => {
+    if (panelOpen) return;
+    const last = Math.max(0, rows.length - 1);
     const onKey = (e: KeyboardEvent): void => {
       if (e.isComposing) return;
       const claim = (): void => {
         e.preventDefault();
         e.stopPropagation();
       };
+      // §5.7's chords first, so Ctrl+C copies the file rather than the
+      // query text, exactly as in the root list.
+      if (current) {
+        const chord = shortcutAction(current, e);
+        if (chord) {
+          claim();
+          act(chord);
+          return;
+        }
+      }
       switch (e.key) {
         case "ArrowDown":
           claim();
-          setSelected((s) => Math.min(s + 1, Math.max(0, rows.length - 1)));
+          setSelected((s) => Math.min(s + 1, last));
           break;
         case "ArrowUp":
           claim();
           setSelected((s) => Math.max(0, s - 1));
           break;
+        case "PageDown":
+          claim();
+          setSelected((s) => Math.min(s + PAGE_STEP, last));
+          break;
+        case "PageUp":
+          claim();
+          setSelected((s) => Math.max(0, s - PAGE_STEP));
+          break;
+        case "End":
+          if (e.ctrlKey) {
+            claim();
+            setSelected(last);
+          }
+          break;
+        case "Home":
+          if (e.ctrlKey) {
+            claim();
+            setSelected(0);
+          }
+          break;
         case "Enter":
           claim();
-          act(e.ctrlKey ? "reveal" : "open");
+          act("open");
+          break;
+        case "k":
+        case "K":
+          if (e.ctrlKey && !e.altKey && current) {
+            claim();
+            setPanelOpen(true);
+          }
           break;
         case "Escape":
           claim();
@@ -133,7 +215,9 @@ export default function Files({ onClose }: Props): ReactElement {
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [rows.length, onClose, act]);
+  }, [rows.length, onClose, act, current, panelOpen]);
+
+  const empty = query.trim() === "";
 
   return (
     <div className="settings">
@@ -142,7 +226,7 @@ export default function Files({ onClose }: Props): ReactElement {
           ←
         </button>
         <h1>File Search</h1>
-        <span className="settings-esc">Enter opens · Ctrl+Enter reveals · Esc to go back</span>
+        <span className="settings-esc">Enter opens · Ctrl+K actions · Esc to go back</span>
       </div>
 
       <div className="query-bar">
@@ -156,6 +240,7 @@ export default function Files({ onClose }: Props): ReactElement {
           autoComplete="off"
           autoFocus
           role="combobox"
+          aria-label="File search"
           aria-expanded={rows.length > 0}
           aria-controls="files-listbox"
           aria-activedescendant={current ? `files-${current.key}` : undefined}
@@ -169,9 +254,13 @@ export default function Files({ onClose }: Props): ReactElement {
       <div className="clip-list" id="files-listbox" role="listbox" aria-label="File search results">
         {rows.length === 0 ? (
           <p className="settings-note">
-            {query.trim() === ""
+            {empty
               ? "Type a name. Narrow it with kind:document, kind:image, kind:audio, kind:video, kind:archive, ext:pdf,docx or path:projects — they combine."
-              : "No files match."}
+              : pending
+                ? "Searching…"
+                : error
+                  ? ""
+                  : "No files match."}
           </p>
         ) : (
           rows.map((row, i) => (
@@ -186,14 +275,29 @@ export default function Files({ onClose }: Props): ReactElement {
               onDoubleClick={() => act("open")}
             >
               <div className="clip-text">{row.name}</div>
-              <div className="clip-meta">{row.subtitle}</div>
+              <div className="clip-meta files-path" title={row.subtitle}>
+                {row.subtitle}
+              </div>
             </div>
           ))
         )}
       </div>
 
-      {note ? <p className="settings-note">{note}</p> : null}
+      {/* §5.12: the settled result count, announced politely, off-screen. */}
+      <div role="status" aria-live="polite" className="sr-only">
+        {announcement}
+      </div>
+      {note ? <p className="settings-note files-note">{note}</p> : null}
       {error ? <div className="settings-error">{error}</div> : null}
+
+      {panelOpen && current ? (
+        <ActionPanel
+          actions={actionsFor(current)}
+          subject={current.name}
+          onRun={act}
+          onClose={() => setPanelOpen(false)}
+        />
+      ) : null}
     </div>
   );
 }
