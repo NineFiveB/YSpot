@@ -52,6 +52,11 @@ export default function Files({ onClose }: Props): ReactElement {
   const queryRef = useRef("");
   /** Mirror of `rows`, readable outside React's render cycle. */
   const rowsRef = useRef<ipc.Row[]>([]);
+  /**
+   * Mirror of `pending`, for the disconnect listener below — it is subscribed
+   * once and cannot see state. Written wherever `pending` is.
+   */
+  const pendingRef = useRef(false);
 
   const run = useCallback((text: string) => {
     // A generation from the shared counter, so the pipe's stale-drop
@@ -67,11 +72,18 @@ export default function Files({ onClose }: Props): ReactElement {
     setError(null);
     setUnavailable(false);
     setAnnouncement("");
+    // A new generation empties the list, and the panel is over a row of the
+    // old one. Left open, it would unmount with its focus (no rows, no
+    // `current`) while still suppressing this view's keys — a dead end.
+    setPanelOpen(false);
     // Sent even when empty: the shell answers an empty query by cancelling
     // whatever this view had in flight, so clearing the box does not leave a
     // 100-row search running on the service for nothing.
-    setPending(text.trim() !== "");
+    const inFlight = text.trim() !== "";
+    pendingRef.current = inFlight;
+    setPending(inFlight);
     void ipc.filesSearch(gen, text).catch((e) => {
+      pendingRef.current = false;
       setPending(false);
       setError(String(e));
     });
@@ -105,6 +117,7 @@ export default function Files({ onClose }: Props): ReactElement {
           return next;
         });
         if (payload.isFinal) {
+          pendingRef.current = false;
           setPending(false);
           // Announced from an effect keyed on the generation, not from inside
           // the updater above: React may run an updater later than the event
@@ -119,6 +132,7 @@ export default function Files({ onClose }: Props): ReactElement {
         const next = payload.items.map(ipc.fallbackFileRow);
         rowsRef.current = next;
         setRows(next);
+        pendingRef.current = false;
         setPending(false);
         setUnavailable(payload.unavailable !== null);
         setSettled(payload.gen);
@@ -137,7 +151,18 @@ export default function Files({ onClose }: Props): ReactElement {
         // batch, and "Searching…" would sit there until the next keystroke.
         // Ask again: the shell now answers through Windows Search, and says
         // so in the note.
-        if (p.connected === false && genRef.current !== 0 && queryRef.current.trim() !== "") {
+        //
+        // In flight ONLY. A settled list is the user's — ranked, filtered,
+        // with the cursor somewhere in it — and a service restart is not a
+        // keystroke: §5.11 reserves a new generation for one. Replacing that
+        // list with Windows Search's unranked, unfiltered answer would be
+        // strictly worse, and the first version of this did exactly that.
+        if (
+          p.connected === false &&
+          pendingRef.current &&
+          genRef.current !== 0 &&
+          queryRef.current.trim() !== ""
+        ) {
           run(queryRef.current);
         }
       }),
