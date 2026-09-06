@@ -304,12 +304,6 @@ export default function App(): ReactElement {
     void ipc.setInView(view !== "search").catch(() => undefined);
   }, [view]);
 
-  // Leaving Settings puts focus back where §5.7 wants it: the query field.
-  const closeView = useCallback(() => {
-    setView("search");
-    window.setTimeout(() => inputRef.current?.focus(), 0);
-  }, []);
-
   // The ref exists so the capture-phase key handler below can read the panel
   // state without re-subscribing on every toggle — not so it can hold a
   // second opinion about it. Deriving it here means anything that closes the
@@ -360,6 +354,20 @@ export default function App(): ReactElement {
     },
     [],
   );
+
+  // Leaving Settings puts focus back where §5.7 wants it: the query field.
+  const closeView = useCallback(() => {
+    setView("search");
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+    // File Search draws generations from the same counter, and the pipe keeps
+    // one watermark: a query typed in there supersedes whatever the root list
+    // still had streaming, and those batches are dropped. Nothing would ever
+    // re-issue them, so coming back showed however much of the list had
+    // arrived before the view opened. Ask again.
+    if (queryRef.current.trim() !== "") {
+      startGeneration(queryRef.current);
+    }
+  }, [startGeneration]);
 
   // §10 M0 non-injecting self-measurement. Drives one real search generation
   // and resolves with keydown→results-applied ms (or null on timeout/no

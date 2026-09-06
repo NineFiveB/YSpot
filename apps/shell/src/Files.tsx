@@ -221,6 +221,17 @@ export default function Files({ onClose }: Props): ReactElement {
         e.preventDefault();
         e.stopPropagation();
       };
+      // §5.7's refocus rule, which App implements for the root list and
+      // stands down for a view — and its own input is unmounted here, so it
+      // could not help even if it tried. Without this, one mousedown on any
+      // non-row chrome (the heading, the empty-state paragraph, the list's
+      // padding) blurs to <body> and typing reaches nothing, while the keys
+      // below keep working and the view goes on looking alive. Tab heals on
+      // the next keypress the same way it does in the root list.
+      const box = inputRef.current;
+      if (box && document.activeElement !== box) {
+        box.focus();
+      }
       // §5.7's chords first, so Ctrl+C copies the file rather than the
       // query text, exactly as in the root list.
       if (current) {

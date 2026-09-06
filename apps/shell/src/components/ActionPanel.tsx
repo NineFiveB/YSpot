@@ -33,7 +33,15 @@ export function ActionPanel({ actions, subject, onRun, onClose }: Props): ReactE
     <div className="action-panel-scrim" onMouseDown={onClose}>
       <div
         className="action-panel"
-        onMouseDown={(e) => e.stopPropagation()}
+        onMouseDown={(e) => {
+          // Not the scrim's business, and not a reason to lose the keyboard:
+          // this panel's keys hang off its filter input, so a mousedown on
+          // the title, the list padding or the "No actions" row would blur to
+          // <body> and leave Esc, the arrows and Enter all dead with only a
+          // scrim click to escape. Anywhere but the input keeps focus put.
+          e.stopPropagation();
+          if (e.target !== inputRef.current) e.preventDefault();
+        }}
         role="dialog"
         aria-label={`Actions for ${subject}`}
       >

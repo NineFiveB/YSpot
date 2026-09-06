@@ -69,6 +69,16 @@ pub const FUZZY_CAP: usize = 20_000;
 /// that fills its page (the dense regimes) never continues, so the §2.5
 /// latency budget is unaffected by construction; the deadline caps the sparse
 /// case at roughly the §2.5 service allotment.
+///
+/// **"Fills its page" means fills it with ACCEPTED rows.** `Selector::offer`
+/// consults `accept` before admitting, so a caller-supplied filter selective
+/// enough to keep the heap under `cap` leaves `floor` at negative infinity —
+/// and then `rejects` is false for every candidate, every whole-pass skip is
+/// disabled, and this continuation runs to the deadline. That is the correct
+/// answer (a filtered query genuinely has to look further to fill a page),
+/// but it is not the cheap one, and the paragraph above does not cover it:
+/// §7.3's `kind:`/`ext:` filters are exactly that shape and reach here
+/// through `search_filtered`. Measured before assuming otherwise.
 const FUZZY_SOFT_DEADLINE: Duration = Duration::from_millis(8);
 
 /// Tail candidates verified between deadline checks during the continuation.

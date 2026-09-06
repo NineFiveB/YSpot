@@ -20,7 +20,6 @@
 //! - `Subscribe` is Ack'd but no events are emitted yet.
 
 use std::io::ErrorKind;
-use std::os::windows::fs::MetadataExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -513,14 +512,18 @@ fn run_search(state: &ServiceState, latest_gen: &AtomicU64, writer: &Mutex<PipeW
         return;
     }
 
-    // Lazily stat ONLY the returned page (§4.3): size + mtime.
-    // last_write_time() is already FILETIME ticks (100 ns since 1601 UTC).
-    for it in &mut items {
-        if let Ok(md) = std::fs::metadata(&it.path) {
-            it.size = Some(md.len());
-            it.mtime = Some(md.last_write_time());
-        }
-    }
+    // §4.3 has the service stat the returned page for `size`/`mtime`. It is
+    // not done, and the fields go out absent, which §4.3 allows ("may be
+    // absent") — because nothing reads them. `JsResultItem::from` in the
+    // shell's relay copies id/path/name/score/match_ranges and drops both,
+    // so they never cross the bridge, and no surface renders either.
+    //
+    // The cost was not free: one blocking `std::fs::metadata` per returned
+    // row, on the search worker, inside §2.5's 10 ms service budget — 50 per
+    // keystroke for the root list and 100 for File Search, every one of them
+    // discarded a layer later. On a cold or network path they dominate the
+    // query. Restore this with the first consumer (§7.3's preview pane, or a
+    // size column), and gate it on that consumer asking.
 
     // Final staleness check just before the write; stale results drop silently.
     if is_cancelled() {
