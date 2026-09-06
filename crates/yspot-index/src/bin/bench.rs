@@ -2066,8 +2066,25 @@ mod tests {
         let r = run(&cfg);
         assert_eq!(r.inserted, r.corpus_generated);
         assert!(r.ram_warm >= r.ram_cold);
-        assert_eq!(r.classes.len(), 10);
+        assert_eq!(r.classes.len(), 11);
         assert!(r.classes.iter().all(|c| !c.queries.is_empty()));
+        // The filtered class must actually be filtered — if its accept
+        // closure ever passed everything it would silently become a second
+        // copy of `common-substr` and gate nothing.
+        let filtered = r
+            .classes
+            .iter()
+            .find(|c| c.name == "kind-filtered")
+            .expect("the kind-filtered class");
+        assert!(filtered.mean_hits > 0.0, "filter rejected every name");
+        assert!(
+            DOCUMENT_EXTS
+                .iter()
+                .all(|e| ext_matches(&format!("x.{e}"), DOCUMENT_EXTS)),
+            "ext_matches disagrees with its own set"
+        );
+        assert!(!ext_matches("x.dll", DOCUMENT_EXTS));
+        assert!(!ext_matches("no-extension", DOCUMENT_EXTS));
         // The breakdown must account for every reported byte, or §4.3's
         // attribution is fiction.
         assert_eq!(r.ram_cold_parts.total(), r.ram_cold);
