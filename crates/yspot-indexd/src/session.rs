@@ -43,6 +43,26 @@ use crate::state::ServiceState;
 /// O(query) work that polls no cancellation.
 const MAX_QUERY_BYTES: usize = 1024;
 
+/// Caps on §4.3's filter fields, for the same reason `MAX_QUERY_BYTES` exists.
+///
+/// `text` is bounded because oversized input buys a caller uninterruptible
+/// work; `ext` and `path_substr` were not, though they buy MORE of it —
+/// `ext_matches` runs an O(exts) scan with a `to_lowercase` allocation for
+/// every candidate on the admission path. A client sending 200k one-character
+/// extensions in one 1 MiB frame turns each of thousands of admissions into a
+/// 200k-element scan: seconds of spinning on the search worker while it holds
+/// the index read lock, which starves the USN applier service-wide. §4.1
+/// grants interactive users open access to this pipe, so "the shell only ever
+/// sends a handful" is not a bound (SPEC §8.1: pipe input is untrusted).
+const MAX_EXT_FILTERS: usize = 64;
+const MAX_PATH_FILTER_BYTES: usize = 1024;
+
+/// Wide enough for anything the shell sends — §7.3's largest `kind:`
+/// expansion is `document`, at 14 extensions — and far below what a 1 MiB
+/// frame could carry. Checked here so a later widening has to be deliberate.
+const _: () = assert!(MAX_EXT_FILTERS >= 32 && MAX_EXT_FILTERS <= 64);
+const _: () = assert!(MAX_PATH_FILTER_BYTES <= MAX_QUERY_BYTES);
+
 /// Withdraws this connection's "active" vote however the session ends.
 ///
 /// §3.6 makes the machine idle only when every session reports idle, so a
@@ -259,6 +279,23 @@ pub fn run(pipe: Arc<Pipe>, state: Arc<ServiceState>) {
                         "query of {} bytes rejected (cap {})",
                         text.len(),
                         MAX_QUERY_BYTES
+                    );
+                    if !send(&writer, &empty_final(gen)) {
+                        return;
+                    }
+                    continue;
+                }
+                if filters.ext.len() > MAX_EXT_FILTERS
+                    || filters.ext.iter().any(|e| e.len() > MAX_QUERY_BYTES)
+                    || filters
+                        .path_substr
+                        .as_ref()
+                        .is_some_and(|p| p.len() > MAX_PATH_FILTER_BYTES)
+                {
+                    log::debug!(
+                        "filters rejected: {} ext(s), path {} byte(s) (caps {MAX_EXT_FILTERS},                          {MAX_PATH_FILTER_BYTES})",
+                        filters.ext.len(),
+                        filters.path_substr.as_ref().map_or(0, String::len)
                     );
                     if !send(&writer, &empty_final(gen)) {
                         return;

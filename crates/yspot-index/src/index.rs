@@ -909,9 +909,12 @@ impl VolumeIndex {
         }
         let n = self.entries.len();
         if self.depth_repair_state.len() < n {
-            // Slots appended since the repair started sit past the cursor, so
-            // they are swept in their turn; recycled slots below it already
-            // carry a fresh depth from `register_slot`.
+            // Slots appended since the repair started sit past the cursor and
+            // are swept in their turn. A slot RECYCLED below it is handled by
+            // `resweep_recycled`, which rewinds the cursor — `register_slot`
+            // alone is not enough, because it derives the new occupant's depth
+            // from the parent's CACHED value, which is the very thing an
+            // outstanding repair exists to correct.
             self.depth_repair_state.resize(n, D_UNKNOWN);
         }
         let start = self.depth_repair_cursor.min(n);
@@ -1715,6 +1718,25 @@ impl VolumeIndex {
             None => self.free_slots.pop().unwrap_or(self.entries.len() as u32),
         };
         self.register_slot(slot, frn, parent_frn, interned, flags);
+        self.resweep_recycled(slot);
+    }
+
+    /// Bring a recycled slot back into an outstanding depth repair.
+    ///
+    /// The sweep only ever starts a walk at slots at or after
+    /// `depth_repair_cursor`, so once it has passed a slot it never looks at
+    /// it again — whatever its mark. That is correct while a slot's occupant
+    /// is fixed, and wrong the moment one is reused: `register_slot` computes
+    /// the newcomer's depth from `rank_key[parent]`, the parent's cached
+    /// value, and if that parent is inside the subtree still waiting to be
+    /// repaired the newcomer inherits the stale depth and keeps it after the
+    /// repair finishes. Rewinding the cursor to the reused slot puts it back
+    /// in the sweep's path. Cheap: it only ever moves backwards to a slot the
+    /// sweep has already reached, and the marks below it are still valid.
+    fn resweep_recycled(&mut self, slot: u32) {
+        if self.depth_repair_armed.is_some() && (slot as usize) < self.depth_repair_cursor {
+            self.depth_repair_cursor = slot as usize;
+        }
     }
 
     /// Arm the depth repair if `slot` is a directory that is about to change
