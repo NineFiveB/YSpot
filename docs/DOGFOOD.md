@@ -76,7 +76,9 @@ YKeys `main` (`dotnet publish src/YKeys -r win-x64 -c Release -o publish`).
   gives one timeline across the pair.
 - `settings.json` — hotkey, theme, consents, `hotkey_source`.
 - `clipboard.db`, `frecency.db` — DPAPI-sealed and per-user.
-- `crashes\` — WER dumps, **only** if crash-report consent was given.
+- `crashes\` — minidumps the shell writes itself, **only** if crash-report
+  consent was given. Not WER: Windows reads the LocalDumps key only from
+  `HKLM`, which the shell has no rights to write.
 
 ## 6. When something goes wrong
 

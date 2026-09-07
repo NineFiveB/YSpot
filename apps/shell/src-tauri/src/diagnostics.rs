@@ -9,12 +9,20 @@
 //! every process, and two implementations of it would only stay identical
 //! until the first one was touched.
 //!
-//! Crash capture is WER LocalDumps for this per-user executable, which §8.5
-//! allows as the alternative to an in-process handler and which costs
-//! nothing at runtime: Windows writes the dump, we only say where. The
-//! registry value is written **only with consent** and removed the moment
-//! consent is withdrawn, so "no consent ⇒ dumps stay local" is enforced by
-//! there being no dump at all rather than by a promise not to send it.
+//! Crash capture is the **in-process** minidump handler of §8.5's first
+//! option: a top-level exception filter, plus a panic hook for the crashes
+//! SEH never sees, both writing the dump themselves. It began as WER
+//! LocalDumps under HKCU — the alternative §8.5 also allows — and moved
+//! because a registry key only catches what Windows dispatches as an
+//! exception, and the crash this shell actually dies from is a Rust panic
+//! unwinding out of an `extern "system"` boundary, which `__fastfail`s past
+//! every filter. `remove_stale_localdumps` tidies away the key that version
+//! left behind.
+//!
+//! Consent gates it at the source: `CAPTURE_ON` is set from the stored
+//! setting and read by `write_dump`, so "no consent ⇒ dumps stay local" holds
+//! because no dump is written at all, rather than by a promise not to send
+//! one.
 //!
 //! Upload is **not implemented**: there is no endpoint to upload to, and
 //! choosing one is a product decision rather than an implementation detail.
@@ -40,8 +48,9 @@ pub fn crashes_dir() -> Option<PathBuf> {
 /// Install the logger.
 ///
 /// The implementation is [`yspot_log`], shared with the service so both
-/// processes write §8.5's one format — the `process` field below is what
-/// tells them apart when the two logs are read together.
+/// processes write §8.5's one format. The `"shell"` passed here becomes the
+/// line's `process` field, which is what tells the two apart when the logs
+/// are read as one timeline.
 pub fn init() {
     yspot_log::init(
         "shell",
@@ -300,14 +309,39 @@ pub fn rotate_dumps() {
 mod tests {
     use super::*;
 
-    /// Writes to the real HKCU hive, so it is `#[ignore]`d — a developer's
-    /// `cargo test` must not change whether Windows dumps their processes.
+    /// Touches this developer's real `%LOCALAPPDATA%\YSpot\crashes` and
+    /// installs a process-wide exception filter, so it is `#[ignore]`d; CI
+    /// runs it with `--ignored`.
+    ///
+    /// It used to say it wrote the HKCU WER LocalDumps key. It has not done
+    /// that since review finding 38 replaced LocalDumps with the in-process
+    /// handler — `set_crash_capture` only REMOVES that key now — and a test
+    /// whose stated reason for being ignored is no longer true invites
+    /// someone to un-ignore it for the wrong reason.
     #[test]
-    #[ignore = "writes the real HKCU WER LocalDumps key; CI runs it with --ignored"]
-    fn crash_capture_registers_and_unregisters() {
+    #[ignore = "creates the real crashes dir and installs a process-wide filter; CI runs it with --ignored"]
+    fn crash_capture_arms_and_disarms_the_handler() {
         set_crash_capture(true).expect("enable");
+        // The gate the handler itself reads. Asserting on it is the whole
+        // point: before this, the test only proved the calls returned Ok,
+        // which they would have done with the body deleted.
+        assert!(
+            CAPTURE_ON.load(Ordering::SeqCst),
+            "capture was enabled but the flag the dump path reads is still off"
+        );
+        assert!(
+            crashes_dir().expect("LOCALAPPDATA").is_dir(),
+            "nowhere for a dump to land"
+        );
+
         set_crash_capture(false).expect("disable");
+        assert!(
+            !CAPTURE_ON.load(Ordering::SeqCst),
+            "consent was withdrawn and a crash would still be dumped"
+        );
+
         // Disabling twice is not an error: absent is the state we wanted.
         set_crash_capture(false).expect("disable again");
+        assert!(!CAPTURE_ON.load(Ordering::SeqCst));
     }
 }
