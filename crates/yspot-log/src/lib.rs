@@ -21,6 +21,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -37,10 +38,20 @@ struct FileLogger {
     stderr: bool,
 }
 
+/// After a failed rotation, how many more bytes to accept before trying
+/// again. Small enough that a transient block (an antivirus scan, a backup
+/// agent holding the file) is recovered from within one busy minute; large
+/// enough that a permanent one is not three syscalls on every single line.
+const ROTATE_RETRY_BYTES: u64 = 1024 * 1024;
+
 struct Rotating {
     path: PathBuf,
     file: File,
     written: u64,
+    /// The size at which to attempt the next rotation. Normally `MAX_BYTES`;
+    /// pushed out after a failure so a log that cannot be rotated is not
+    /// retried on every line.
+    rotate_at: u64,
 }
 
 impl Rotating {
@@ -54,10 +65,25 @@ impl Rotating {
             path,
             file,
             written,
+            rotate_at: MAX_BYTES,
         })
     }
 
     /// `shell.log` → `shell.1.log` → … → `shell.4.log`, oldest dropped.
+    ///
+    /// Ordered so that **nothing is destroyed until both fallible steps have
+    /// succeeded.** The obvious order — drop the oldest, shift the rest, then
+    /// rename the live file and reopen it — does the irreversible work first
+    /// and the failable work last, which turns any persistent failure into
+    /// total loss: a full disk, a directory whose ACL changed, or Controlled
+    /// Folder Access blocking the create, and five log lines later the shift
+    /// cascade has walked all five generations into the slot it deletes.
+    /// Fifty megabytes of the only record of what went wrong, gone in under a
+    /// second, silently, at exactly the moment it was needed.
+    ///
+    /// So: move the live file aside first (fails harmlessly, nothing lost),
+    /// then create its replacement (on failure, move it back), and only then
+    /// touch the history.
     fn rotate(&mut self) -> std::io::Result<()> {
         let stem = self
             .path
@@ -67,22 +93,65 @@ impl Rotating {
             .to_string();
         let dir = self.path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let nth = |i: usize| dir.join(format!("{stem}.{i}.log"));
+
+        // A leftover from a process that died mid-rotation. Removing it can
+        // fail harmlessly; the rename below is the operation that matters.
+        let pending = dir.join(format!("{stem}.rotating"));
+        let _ = std::fs::remove_file(&pending);
+
+        // Fallible step 1. A sharing violation — an editor, a backup agent, a
+        // tail running during the dogfood — lands here and costs nothing.
+        std::fs::rename(&self.path, &pending)?;
+
+        // Fallible step 2. If the replacement cannot be created, put the live
+        // file back so the next write still has somewhere to go.
+        let replacement = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = std::fs::rename(&pending, &self.path);
+                return Err(e);
+            }
+        };
+
+        // Past this point every step is destructive and none can fail in a way
+        // that loses the live log, which is now safely aside.
         let _ = std::fs::remove_file(nth(MAX_FILES - 1));
         for i in (1..MAX_FILES - 1).rev() {
             let _ = std::fs::rename(nth(i), nth(i + 1));
         }
-        let _ = std::fs::rename(&self.path, nth(1));
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let _ = std::fs::rename(&pending, nth(1));
+
+        self.file = replacement;
         self.written = 0;
+        self.rotate_at = MAX_BYTES;
         Ok(())
     }
 
     fn write_line(&mut self, line: &str) {
-        if self.written >= MAX_BYTES && self.rotate().is_err() {
-            return;
+        if self.written >= self.rotate_at && self.rotate().is_err() {
+            // Keep writing. §8.5's size cap guards disk usage; dropping the
+            // line guards nothing and costs the record. An oversized log beats
+            // no log, and the next attempt is a megabyte away rather than on
+            // the very next line.
+            self.rotate_at = self.written.saturating_add(ROTATE_RETRY_BYTES);
+            // Said in the file itself: this cannot go through `log`, which
+            // would re-enter the mutex this runs under, and a reader looking
+            // at a 40 MB log deserves to know why it is 40 MB.
+            let note = format!(
+                "{{\"ts\":\"{}\",\"level\":\"error\",\"process\":\"log\",\
+                 \"component\":\"yspot_log\",\"message\":\"could not rotate {}; \
+                 still writing to it, so it will exceed the {} MB cap\"}}\n",
+                timestamp(),
+                self.path.display().to_string().replace('\\', "\\\\"),
+                MAX_BYTES / (1024 * 1024)
+            );
+            if self.file.write_all(note.as_bytes()).is_ok() {
+                self.written += note.len() as u64;
+            }
         }
         if self.file.write_all(line.as_bytes()).is_ok() {
             self.written += line.len() as u64;
@@ -192,6 +261,14 @@ pub const RUN_START: &str = "run-start";
 /// The level comes from `RUST_LOG`, defaulting to §8.5's Info. Calling this
 /// twice is a no-op: `log` accepts one logger per process.
 pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
+    // Before any file is touched. A second call cannot install a logger, and
+    // opening the path anyway would create an empty log file and immediately
+    // abandon it — plus a directory tree to hold it.
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    if INSTALLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
     let requested = std::env::var("RUST_LOG").ok();
     let level = requested
         .as_deref()
@@ -211,7 +288,15 @@ pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
             Some(r)
         }
         Err(e) => {
-            eprintln!("log: cannot open {} ({e}); stderr only", p.display());
+            // Not `eprintln!`, which panics on a write error. Stderr
+            // redirected to a pipe whose reader has exited is a broken pipe,
+            // and dying here would defeat the entire point of this arm:
+            // losing logs is bad, refusing to start is worse.
+            let _ = writeln!(
+                std::io::stderr(),
+                "log: cannot open {} ({e}); stderr only",
+                p.display()
+            );
             None
         }
     });
@@ -230,21 +315,54 @@ pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
         return;
     }
     log::set_max_level(level);
-    log::info!(
-        "{RUN_START}: {process} {version}, pid {}, {}",
-        std::process::id(),
-        match &where_to {
-            Some(p) => format!("log {}", p.display()),
-            None => "no log file; stderr only".to_string(),
-        }
-    );
-    if let Some(v) = unparsed {
-        log::warn!(
-            "RUST_LOG={v:?} is not a level this logger understands, so it was \
-             ignored and the level is {level}. Use one of: error, warn, info, \
-             debug, trace."
+
+    // Not `log::info!`. The macros consult `max_level`, so `RUST_LOG=warn` —
+    // an ordinary way to quieten a noisy tool — would drop the banner and take
+    // every run boundary in the file with it, along with §8.5's crash-free
+    // metric, which is counted per run. The docstring above promises no
+    // process can forget this line; going through the logger directly is what
+    // makes that true rather than true-at-the-default-level.
+    //
+    // `Off` is still honoured. That one is not a side effect of turning the
+    // volume down, it is someone asking for silence.
+    if level != LevelFilter::Off {
+        emit(
+            Level::Info,
+            &format!(
+                "{RUN_START}: {process} {version}, pid {}, {}",
+                std::process::id(),
+                match &where_to {
+                    Some(p) => format!("log {}", p.display()),
+                    None => "no log file; stderr only".to_string(),
+                }
+            ),
         );
+        if let Some(v) = unparsed {
+            emit(
+                Level::Warn,
+                &format!(
+                    "RUST_LOG={v:?} is not a level this logger understands, so it \
+                     was ignored and the level is {level}. Use one of: error, \
+                     warn, info, debug, trace."
+                ),
+            );
+        }
     }
+}
+
+/// Write one record straight to the installed logger, past `max_level`.
+///
+/// For the handful of lines whose absence would make the file harder to read
+/// than a missing level would make it noisier: the run boundary, and the
+/// warning that the level itself was misconfigured.
+fn emit(level: Level, message: &str) {
+    log::logger().log(
+        &Record::builder()
+            .args(format_args!("{message}"))
+            .level(level)
+            .target(module_path!())
+            .build(),
+    );
 }
 
 /// Route panics into the log, so a crash leaves a line in the file.

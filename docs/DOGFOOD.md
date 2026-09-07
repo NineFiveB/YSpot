@@ -14,9 +14,9 @@ cargo build --release -p yspot-shell -p yspot-indexd
 ```
 
 **Build from the current `main`, not from a binary you already have.** The
-hardening review landed four in-process crashes' worth of fixes after the
-first release build was made, and one of them — a multi-byte character in a
-unit conversion — is reachable from a single keystroke. A stale exe would
+hardening review fixed a crash reachable from a single keystroke — a
+multi-byte character in a unit conversion — along with the crash handler that
+was supposed to have recorded it, after the first release build was made. A stale exe would
 spend the fortnight reproducing bugs that are already fixed, which is the one
 outcome that wastes the two weeks.
 
@@ -75,7 +75,9 @@ YKeys `main` (`dotnet publish src/YKeys -r win-x64 -c Release -o publish`).
   both carry a `process` field, so concatenating them and sorting by `ts`
   gives one timeline across the pair.
 - `settings.json` — hotkey, theme, consents, `hotkey_source`.
-- `clipboard.db`, `frecency.db` — DPAPI-sealed and per-user.
+- `clipboard.db` — a plain SQLite file whose every value is sealed
+  individually with DPAPI. `frecency.db` is **not** encrypted: it is launch
+  counts against app ids and `volume:frn` pairs, in the clear.
 - `crashes\` — minidumps the shell writes itself, **only** if crash-report
   consent was given. Not WER: Windows reads the LocalDumps key only from
   `HKLM`, which the shell has no rights to write.
@@ -92,8 +94,12 @@ service think?", so there is a script for it:
 .\scripts\Read-YSpotLogs.ps1                     # last 200 lines, merged
 .\scripts\Read-YSpotLogs.ps1 -Level error,warn -Tail 0
 .\scripts\Read-YSpotLogs.ps1 -Pattern 'pipe|reconnect'
+.\scripts\Read-YSpotLogs.ps1 -Simple -Pattern 'C:\Users\me\Documents'
 .\scripts\Read-YSpotLogs.ps1 -Raw > logs.txt     # to attach to an issue
 ```
+
+`-Pattern` is a regular expression; `-Simple` makes it literal text, which is
+what you want for any path, because a Windows path is not a valid regex.
 
 It merges at millisecond resolution, because a query and its answer are tens
 of milliseconds apart and a coarser sort would put them in the wrong order.
@@ -122,8 +128,10 @@ and the log file it resolved. That last part answers "am I even reading the
 right file" without leaving the log.
 
 Attach `-Raw` output and any dump in `crashes\`, and open an issue with the
-exact query or action. "It felt slow"
-is a bug too; say what you typed and roughly how long it took.
+exact query or action. Note that only the shell writes dumps: a service crash
+leaves its log line and nothing in `crashes\`, because §8.5 gives the service
+WER LocalDumps and that is the MSI's job, which is later. "It felt slow" is a
+bug too; say what you typed and roughly how long it took.
 
 ## 7. Stopping
 

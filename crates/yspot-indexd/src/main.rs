@@ -227,13 +227,17 @@ fn spawn_housekeeping(state: Arc<ServiceState>) {
         .spawn(move || {
             supervise(
                 "housekeeping",
-                "depth repair and compaction have stopped: ranking will drift                  and the index will never reclaim the space deleted files left",
+                "compaction has stopped, so the index will never reclaim the \
+                 space deleted files left. Depth repair keeps running on the \
+                 tail thread, but only when the journal produces an event, so \
+                 ranking depth on a quiet volume can now stay stale \
+                 indefinitely",
                 || loop {
                     std::thread::sleep(HOUSEKEEPING_TICK);
                     // §3.6 pause suspends index maintenance, not just tailing.
                     if !state.is_paused() {
                         repair_depths(&state);
-                        maybe_compact(&state);
+                        compact_or_die(&state);
                     }
                 },
             )
@@ -256,6 +260,11 @@ fn spawn_housekeeping(state: Arc<ServiceState>) {
 /// every tick produces a log full of noise and a service that looks healthy
 /// while spinning. Recording it once, loudly, is the honest answer; deciding
 /// what to do about it needs a person who has read the line.
+///
+/// Surviving is only the right answer because the two bodies leave the index
+/// INTACT when they stop — frozen or unmaintained, but internally consistent
+/// and safe to read. The one operation for which that is false is compaction,
+/// which is why it does not come through here: see [`compact_or_die`].
 fn supervise(name: &'static str, consequence: &'static str, body: impl FnOnce()) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
     // Both arms are failures: these bodies are infinite loops by construction,
@@ -269,8 +278,47 @@ fn supervise(name: &'static str, consequence: &'static str, body: impl FnOnce())
 fn epitaph(name: &str, panicked: bool, consequence: &str) -> String {
     let how = if panicked { "panicked" } else { "returned" };
     format!(
-        "the {name} thread {how} and will not run again. {consequence}.          The service is otherwise still up, so this will not look broken:          restart it."
+        "the {name} thread {how} and will not run again. {consequence}. The \
+         service is otherwise still up, so this will not look broken: restart it."
     )
+}
+
+/// Compact, and take the process down if compaction unwinds.
+///
+/// Everywhere else in this service, surviving a panic is the better answer.
+/// Here it is the worse one, and the difference is that `compact()` is
+/// **in place**. It renumbers roughly ten parallel structures in sequence to
+/// avoid a ~42 MB transient copy, and the `frn_map` remap is the last step,
+/// some hundred and fifty lines after the entry table is truncated. A panic
+/// anywhere in that window leaves slot ids from before the compaction pointing
+/// into a table from after it — and, because two of the arenas are rewritten
+/// through `as_mut_vec`, possibly bytes that are not valid UTF-8.
+///
+/// Nothing downstream would notice. The write lock's poisoning is discarded on
+/// purpose (`state.rs`), on the stated grounds that "the index is never left
+/// half-written by our writers" — true of every writer except this one, which
+/// arrived after that comment. So the torn index stays published, the pipe
+/// keeps accepting, and every subsequent search either panics its own session
+/// thread or, worse, quietly returns nothing.
+///
+/// A service answering searches from an index it cannot vouch for is the one
+/// failure this whole diagnostic effort exists to prevent, and it is not
+/// something a log line can mitigate: by the time anyone reads it, the wrong
+/// answers have already been believed. So this one dies, and says why. The
+/// index is rebuilt from the MFT on the next start, which costs seconds.
+fn compact_or_die(state: &Arc<ServiceState>) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| maybe_compact(state))).is_ok() {
+        return;
+    }
+    log::error!(
+        "compaction panicked, which leaves the index renumbered in part and \
+         internally inconsistent. Continuing would serve wrong answers from it \
+         and never say so, which is worse than stopping, so the service is \
+         exiting. It rebuilds from the MFT on the next start. The panic itself \
+         is logged above."
+    );
+    log::logger().flush();
+    std::process::exit(1);
 }
 
 fn spawn_usn_tail(state: Arc<ServiceState>, drive: String, cursor: UsnCursor) {

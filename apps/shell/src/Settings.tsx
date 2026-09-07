@@ -339,7 +339,10 @@ export default function Settings({ onClose }: Props): ReactElement {
             <div className="settings-label">
               <div>Logs and crash dumps</div>
               <div className="settings-hint">
-                Everything YSpot records about itself, on this machine only.
+                What the launcher records about itself, on this machine only.
+                The indexing service keeps its own log under %ProgramData%\
+                YSpot\logs — §8.5 puts each process&apos;s log where its
+                privilege allows, so this button cannot reach both.
               </div>
             </div>
             <button
