@@ -79,8 +79,23 @@ YKeys `main` (`dotnet publish src/YKeys -r win-x64 -c Release -o publish`).
 ## 6. When something goes wrong
 
 A crash, a wrong result, a hotkey that stopped working — the log usually says
-why. Grab the tail of both logs (`shell.log` and `indexd.log`) and any dump in
-`crashes\`, and open an issue with the exact query or action. "It felt slow"
+why. Both logs are JSON lines, and the two live in different directories
+because §8.5 puts each process's log where its privilege allows. Reading them
+as one timeline is what answers "the launcher showed nothing, what did the
+service think?", so there is a script for it:
+
+```
+.\scripts\Read-YSpotLogs.ps1                     # last 200 lines, merged
+.\scripts\Read-YSpotLogs.ps1 -Level error,warn -Tail 0
+.\scripts\Read-YSpotLogs.ps1 -Pattern 'pipe|reconnect'
+.\scripts\Read-YSpotLogs.ps1 -Raw > logs.txt     # to attach to an issue
+```
+
+It merges at millisecond resolution, because a query and its answer are tens
+of milliseconds apart and a coarser sort would put them in the wrong order.
+
+Attach `-Raw` output and any dump in `crashes\`, and open an issue with the
+exact query or action. "It felt slow"
 is a bug too; say what you typed and roughly how long it took.
 
 ## 7. Stopping
