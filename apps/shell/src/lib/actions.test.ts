@@ -3,7 +3,7 @@
 // later refactor breaks silently, so they get tests.
 
 import { describe, expect, it } from "vitest";
-import { actionsFor, filterActions, shortcutAction } from "./actions";
+import { actionsFor, filterActions, primaryAction, shortcutAction } from "./actions";
 import type { Row } from "./ipc";
 
 const appRow = (appKind: "packaged" | "win32"): Row => ({
@@ -200,5 +200,32 @@ describe("filterActions", () => {
     expect(filterActions(all, "copy").map((a) => a.id)).toEqual(["copy_path", "copy_file"]);
     expect(filterActions(all, "RECYCLE").map((a) => a.id)).toEqual(["delete"]);
     expect(filterActions(all, "zzz")).toHaveLength(0);
+  });
+});
+
+describe("primaryAction", () => {
+  // The bug this exists for: Enter hard-coded "open", so a calculator row got
+  // "open" while Ctrl+K -> Copy Result sent "copy". Both copied the answer,
+  // but the Rust side reads `stays_open` off the ACTION NAME, so only the
+  // panel's route left the launcher up. Same row, same declared action, two
+  // different behaviours.
+  it("is copy for a calculator row, which is what its own action table says", () => {
+    expect(primaryAction(calcRow())).toBe("copy");
+  });
+
+  it("is open for the kinds that really do open something", () => {
+    expect(primaryAction(fileRow())).toBe("open");
+    expect(primaryAction(settingRow())).toBe("open");
+    expect(primaryAction(appRow("win32"))).toBe("open");
+    expect(primaryAction(appRow("packaged"))).toBe("open");
+  });
+
+  // The invariant that keeps the two routes honest: whatever plain Enter runs
+  // must be the action the panel lists against the Enter shortcut.
+  it("always equals the action the panel shows against Enter", () => {
+    for (const row of [fileRow(), settingRow(), calcRow(), appRow("win32")]) {
+      const shown = actionsFor(row).find((a) => a.shortcut === "Enter");
+      expect(primaryAction(row)).toBe(shown?.id);
+    }
   });
 });

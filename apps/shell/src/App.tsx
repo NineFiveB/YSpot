@@ -21,7 +21,7 @@ import Onboarding from "./Onboarding";
 import Settings from "./Settings";
 import { ActionPanel } from "./components/ActionPanel";
 import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
-import { actionsFor, shortcutAction } from "./lib/actions";
+import { actionsFor, primaryAction, shortcutAction } from "./lib/actions";
 import * as ipc from "./lib/ipc";
 import { announceText } from "./lib/announce";
 import { mergeRows, selectionIndex } from "./lib/merge";
@@ -534,7 +534,7 @@ export default function App(): ReactElement {
         // A modifier chord runs its action directly (§5.7: every action is
         // keyboard-reachable, the common ones without the panel).
         const direct = shortcutAction(row, e);
-        activateIndex(clampSel(selected), direct ?? "open");
+        activateIndex(clampSel(selected), direct ?? primaryAction(row));
         break;
       }
       case "k":

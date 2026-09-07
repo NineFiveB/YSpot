@@ -79,6 +79,22 @@ export function actionsFor(row: Row): Action[] {
  * means nothing here. Keeps §5.7's "every action is keyboard-reachable"
  * true without going through the panel for the common ones.
  */
+/**
+ * What plain Enter runs on a row: the first action, which every kind declares
+ * with the `Enter` shortcut.
+ *
+ * Not the literal string "open". Every kind's primary action IS "open" except
+ * the calculator's, which is "copy" — and hard-coding "open" made Enter and
+ * Ctrl+K → Copy Result do two different things to the same row. Both copied
+ * the answer, but only the panel's route kept the launcher open, because the
+ * Rust side decides that from the action name (`stays_open` matches "copy",
+ * not "open"). So pressing Enter on `12 mi in km` copied the answer and then
+ * dismissed the launcher, while the row's own action table said otherwise.
+ */
+export function primaryAction(row: Row): string {
+  return actionsFor(row)[0]?.id ?? "open";
+}
+
 export function shortcutAction(
   row: Row,
   e: { key: string; ctrlKey: boolean; shiftKey: boolean; altKey: boolean },
