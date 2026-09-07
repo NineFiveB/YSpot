@@ -13,6 +13,13 @@ cd apps/shell && npm run build && cd ../..
 cargo build --release -p yspot-shell -p yspot-indexd
 ```
 
+**Build from the current `main`, not from a binary you already have.** The
+hardening review landed four in-process crashes' worth of fixes after the
+first release build was made, and one of them — a multi-byte character in a
+unit conversion — is reachable from a single keystroke. A stale exe would
+spend the fortnight reproducing bugs that are already fixed, which is the one
+outcome that wastes the two weeks.
+
 ## 2. Start the index service (elevated)
 
 There is no MSI yet (§9.1 is later), so the service runs as a console
