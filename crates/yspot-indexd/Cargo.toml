@@ -11,7 +11,7 @@ yspot-pipe = { path = "../yspot-pipe" }
 yspot-index = { path = "../yspot-index" }
 anyhow.workspace = true
 log.workspace = true
-env_logger.workspace = true
+yspot-log = { path = "../yspot-log" }
 
 # The pipe itself lives in yspot-pipe; the service only needs the error
 # constants it matches on at startup.

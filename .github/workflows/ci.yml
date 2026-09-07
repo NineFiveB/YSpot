@@ -163,7 +163,7 @@ jobs:
 
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           Get-Content walk.log, walk.err -ErrorAction SilentlyContinue
-          # env_logger writes to stderr, so assert against both streams.
+          # The logger mirrors every line to stderr, so assert against both.
           $out = @(Get-Content walk.log, walk.err -ErrorAction SilentlyContinue) -join "`n"
           foreach ($expected in @("walk complete", "pipe server listening")) {
             if ($out -notmatch [regex]::Escape($expected)) {

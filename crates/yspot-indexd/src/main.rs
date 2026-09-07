@@ -4,9 +4,17 @@
 //!   yspot-indexd --walk <path>   unelevated dev mode: filesystem walk
 //!   yspot-indexd --mft  <C:>     MFT enumeration + USN tailing (elevated)
 //!
-//! Common behavior: env_logger (RUST_LOG, default info); enumeration timing,
-//! entry count, and ram_bytes are logged at completion — those are the M0
-//! exit-criteria numbers (§10).
+//! Common behavior: §8.5's structured log (RUST_LOG, default info) to
+//! `%ProgramData%\YSpot\logs\indexd.log` AND the console; enumeration
+//! timing, entry count, and ram_bytes are logged at completion — those are
+//! the M0 exit-criteria numbers (§10).
+//!
+//! The file half is what makes the console mode survivable for a fortnight.
+//! A console is a buffer: it scrolls, it dies with its window, and a service
+//! that failed at 03:00 has left nothing to read by the time anyone looks.
+//! §8.5 puts the service's log under `%ProgramData%` rather than the shell's
+//! `%LOCALAPPDATA%` because the directory follows the writer's privilege, and
+//! it is world-READABLE so that exporting it needs no elevation (§5.9).
 
 mod idx_api;
 mod pipe;
@@ -22,10 +30,25 @@ use state::{Mode, ServiceState, VS_TAILING};
 
 const USAGE: &str = "usage: yspot-indexd --walk <path> | --mft <C:>";
 
+/// §8.5's log location for the service: `%ProgramData%\YSpot\logs`.
+///
+/// `None` if the variable is missing, which leaves the console as the only
+/// output rather than inventing a directory. Nothing here creates the ACL
+/// §8.5 specifies — that is the service MSI's job (§9.1), and until it
+/// exists the directory inherits `%ProgramData%`'s own, which is already
+/// world-readable and admin-writable. Close enough to run on, not close
+/// enough to ship: recorded in docs/M1.md.
+fn log_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("ProgramData").map(|b| {
+        std::path::PathBuf::from(b)
+            .join("YSpot")
+            .join("logs")
+            .join("indexd.log")
+    })
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis()
-        .init();
+    yspot_log::init("indexd", log_path());
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match parse_args(&args) {

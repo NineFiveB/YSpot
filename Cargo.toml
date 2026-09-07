@@ -4,6 +4,7 @@ members = [
     "crates/yspot-proto",
     "crates/yspot-pipe",
     "crates/yspot-index",
+    "crates/yspot-log",
     "crates/yspot-indexd",
     "apps/shell/src-tauri",
     "crates/yspot-m0",

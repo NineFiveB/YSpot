@@ -29,9 +29,14 @@ process. It needs an **administrator** prompt for the MFT/USN handle:
 .\target\release\yspot-indexd.exe --mft C:
 ```
 
-Leave that window open — closing it stops the service. It logs to the
-console only (`RUST_LOG=debug` for more). Order does not matter: the shell
-reconnects with backoff when the pipe appears.
+Leave that window open — closing it stops the service. Order does not
+matter: the shell reconnects with backoff when the pipe appears.
+
+It logs to `%ProgramData%\YSpot\logs\indexd.log` as well as the console
+(`RUST_LOG=debug` for more), in the same one-JSON-object-per-line format the
+shell uses. That matters here more than it looks: a console is a buffer that
+scrolls away, dies with its window, and is empty by the time you notice
+anything at 09:00. The file is what you actually read after a bad night.
 
 Without it, YSpot still works — apps, settings, calculator, clipboard,
 windows — and file search falls back to Windows Search (§9.5). That is a
@@ -64,6 +69,9 @@ YKeys `main` (`dotnet publish src/YKeys -r win-x64 -c Release -o publish`).
 `%LOCALAPPDATA%\YSpot\`:
 
 - `logs\shell.log` — structured JSON, rotated; the first thing to read.
+  The service writes the matching `%ProgramData%\YSpot\logs\indexd.log`;
+  both carry a `process` field, so concatenating them and sorting by `ts`
+  gives one timeline across the pair.
 - `settings.json` — hotkey, theme, consents, `hotkey_source`.
 - `clipboard.db`, `frecency.db` — DPAPI-sealed and per-user.
 - `crashes\` — WER dumps, **only** if crash-report consent was given.
@@ -71,7 +79,7 @@ YKeys `main` (`dotnet publish src/YKeys -r win-x64 -c Release -o publish`).
 ## 6. When something goes wrong
 
 A crash, a wrong result, a hotkey that stopped working — the log usually says
-why. Grab the tail of `shell.log`, the service console output, and any dump in
+why. Grab the tail of both logs (`shell.log` and `indexd.log`) and any dump in
 `crashes\`, and open an issue with the exact query or action. "It felt slow"
 is a bug too; say what you typed and roughly how long it took.
 

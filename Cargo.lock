@@ -5230,12 +5230,20 @@ name = "yspot-indexd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "env_logger",
  "log",
  "windows-sys 0.59.0",
  "yspot-index",
+ "yspot-log",
  "yspot-pipe",
  "yspot-proto",
+]
+
+[[package]]
+name = "yspot-log"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde_json",
 ]
 
 [[package]]
@@ -5273,7 +5281,6 @@ dependencies = [
 name = "yspot-shell"
 version = "0.1.0"
 dependencies = [
- "env_logger",
  "log",
  "png 0.18.1",
  "rusqlite",
@@ -5285,6 +5292,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "windows",
  "windows-sys 0.59.0",
+ "yspot-log",
  "yspot-pipe",
  "yspot-proto",
 ]
