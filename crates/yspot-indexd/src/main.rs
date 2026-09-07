@@ -92,7 +92,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let state = Arc::new(ServiceState::new(idx, root, Mode::Walk));
             // Dev mode has no USN tailing; the index is as live as it gets.
             state.set_vol_state(VS_TAILING);
-            spawn_housekeeping(state.clone());
+            spawn_housekeeping(state.clone(), HOUSEKEEPING_LOST_WALK);
             pipe::serve(state)
         }
         Cli::Mft(drive) => {
@@ -122,7 +122,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let state = Arc::new(ServiceState::new(idx, root, Mode::Mft));
             state.set_vol_state(VS_TAILING);
             spawn_usn_tail(state.clone(), drive, cursor);
-            spawn_housekeeping(state.clone());
+            spawn_housekeeping(state.clone(), HOUSEKEEPING_LOST_MFT);
             pipe::serve(state)
         }
     }
@@ -221,26 +221,39 @@ fn maybe_compact(state: &ServiceState) {
 /// Step 9's in-place compaction wants the same cadence (its triggers are
 /// fractions of garbage that only a periodic look can notice), so it lands
 /// here rather than on the tail thread.
-fn spawn_housekeeping(state: Arc<ServiceState>) {
+/// What a dead housekeeping thread costs, which is not the same in both modes.
+///
+/// Compaction stops either way: this thread is its only caller. Depth repair
+/// is the half that differs, because the USN tail thread repairs depths after
+/// every batch — so in MFT mode an active volume still recovers, and in walk
+/// mode, where there is no tail thread at all, nothing does. Saying "depth
+/// repair has stopped" in both was simply false in one of them, and a reader
+/// acting on it would go hunting for stale ranking that is in fact
+/// self-correcting.
+const HOUSEKEEPING_LOST_MFT: &str = concat!(
+    "compaction has stopped, so the index will never reclaim the space ",
+    "deleted files left. Depth repair still runs on the tail thread, but only ",
+    "when the journal produces an event, so ranking depth on a quiet volume ",
+    "can now stay stale indefinitely"
+);
+const HOUSEKEEPING_LOST_WALK: &str = concat!(
+    "compaction and depth repair have both stopped, and in walk mode nothing ",
+    "else performs either: ranking depth will drift and the index will never ",
+    "reclaim the space deleted files left"
+);
+
+fn spawn_housekeeping(state: Arc<ServiceState>, lost: &'static str) {
     std::thread::Builder::new()
         .name("housekeeping".into())
         .spawn(move || {
-            supervise(
-                "housekeeping",
-                "compaction has stopped, so the index will never reclaim the \
-                 space deleted files left. Depth repair keeps running on the \
-                 tail thread, but only when the journal produces an event, so \
-                 ranking depth on a quiet volume can now stay stale \
-                 indefinitely",
-                || loop {
-                    std::thread::sleep(HOUSEKEEPING_TICK);
-                    // §3.6 pause suspends index maintenance, not just tailing.
-                    if !state.is_paused() {
-                        repair_depths(&state);
-                        compact_or_die(&state);
-                    }
-                },
-            )
+            supervise("housekeeping", lost, || loop {
+                std::thread::sleep(HOUSEKEEPING_TICK);
+                // §3.6 pause suspends index maintenance, not just tailing.
+                if !state.is_paused() {
+                    repair_depths(&state);
+                    compact_or_die(&state);
+                }
+            })
         })
         .expect("spawning housekeeping thread");
 }
@@ -327,7 +340,10 @@ fn spawn_usn_tail(state: Arc<ServiceState>, drive: String, cursor: UsnCursor) {
         .spawn(move || {
             supervise(
                 "usn-tail",
-                "the index is frozen at this moment: searches keep answering,                  from data that stops here and silently ages",
+                concat!(
+                    "the index is frozen at this moment: searches keep ",
+                    "answering, from data that stops here and silently ages"
+                ),
                 || usn_tail_loop(state, drive, cursor),
             )
         })
@@ -523,6 +539,40 @@ mod tests {
             ran.load(std::sync::atomic::Ordering::SeqCst),
             "the body never ran, so the test proved nothing"
         );
+    }
+
+    /// No epitaph may contain a run of spaces.
+    ///
+    /// A lost `\` line-continuation puts the next line's indentation INSIDE
+    /// the string, and the result reads like corruption in the one log line
+    /// the runbook tells a reader to go and find. It has happened twice: once
+    /// when these strings were written and once when the fix for that was
+    /// applied and silently did not take. Neither rustfmt nor clippy has a
+    /// lint for it, so this is the tripwire. `concat!` is the shape that
+    /// cannot regress.
+    #[test]
+    fn no_epitaph_contains_a_run_of_spaces() {
+        for (name, text) in [
+            ("housekeeping/mft", super::HOUSEKEEPING_LOST_MFT),
+            ("housekeeping/walk", super::HOUSEKEEPING_LOST_WALK),
+        ] {
+            assert!(
+                !text.contains("  "),
+                "{name} consequence has a run of spaces: {text:?}"
+            );
+        }
+        for panicked in [true, false] {
+            for (name, text) in [
+                ("housekeeping", super::HOUSEKEEPING_LOST_MFT),
+                ("housekeeping", super::HOUSEKEEPING_LOST_WALK),
+            ] {
+                let line = super::epitaph(name, panicked, text);
+                assert!(
+                    !line.contains("  "),
+                    "composed epitaph has a run of spaces: {line:?}"
+                );
+            }
+        }
     }
 
     /// A body that RETURNS is as much a failure as one that panics: both of

@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Read the shell and service logs as one timeline.
 
@@ -153,8 +153,15 @@ for ($fi = 0; $fi -lt $files.Count; $fi++) {
             if ($o.ts -is [datetime]) { $ts = $o.ts.ToUniversalTime() }
             elseif ($o.ts) {
                 [datetime]$parsed = [datetime]::MinValue
+                # NOT RoundtripKind: .NET validates the styles argument before
+                # parsing and rejects RoundtripKind combined with any Assume/
+                # Adjust flag, so that pair could only ever throw. This branch
+                # runs on Windows PowerShell 5.1, whose ConvertFrom-Json leaves
+                # `ts` a string - which is to say it could only ever throw on
+                # the default Windows host, while passing every test on pwsh 7,
+                # where the branch is never reached at all.
                 if ([datetime]::TryParse([string]$o.ts, [cultureinfo]::InvariantCulture,
-                        [System.Globalization.DateTimeStyles]::RoundtripKind -bor
+                        [System.Globalization.DateTimeStyles]::AssumeUniversal -bor
                         [System.Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$parsed)) {
                     $ts = $parsed
                 }
@@ -184,8 +191,12 @@ if ($Level) {
 }
 if ($Pattern) {
     $selected = if ($Simple) {
+        # OrdinalIgnoreCase to match what -match does. -Simple exists to
+        # escape regex syntax, not to quietly become case-sensitive as well.
+        $cmp = [System.StringComparison]::OrdinalIgnoreCase
         $selected | Where-Object {
-            ([string]$_.Message).Contains($Pattern) -or ([string]$_.Component).Contains($Pattern)
+            ([string]$_.Message).Contains($Pattern, $cmp) -or
+            ([string]$_.Component).Contains($Pattern, $cmp)
         }
     }
     else {
@@ -206,7 +217,11 @@ function Format-Record($r) {
     # HH:mm:ss makes a line from last Tuesday indistinguishable from one from
     # this morning, with nothing marking the day boundary.
     $t = if ($r.Ts) { $r.Ts.ToString('MM-dd HH:mm:ss.fff') } else { '?? ' + $r.RawTs }
-    $c = ([string]$r.Component) -replace '^yspot[_-]?(shell|indexd)?::?', ''
+    # Any crate prefix, not just two of the seven. yspot_index is the
+    # workspace's busiest logger and was not on the old list, so its
+    # components kept the prefix and then truncated mid-word:
+    # "yspot_index::matching" rendered as "yspot_index::match".
+    $c = ([string]$r.Component) -replace '^yspot_[a-z0-9]+::', ''
     if ($c.Length -gt 18) { $c = $c.Substring(0, 18) }
     # One record stays one line: yspot-log deliberately keeps an embedded
     # newline inside the JSON string, and printing it raw would split the
@@ -241,6 +256,7 @@ if ($unreadable.Count -gt 0 -and -not $Raw) {
 # half simply vanishes with no other sign.
 foreach ($d in $dirs) {
     if (-not $perDir.ContainsKey($d)) {
-        Write-Warning "no log lines came from $d — this timeline is one process only"
+        $note = "no log lines came from ${d}: this timeline is one process only"
+        if ($Raw) { "# $note" } else { Write-Warning $note }
     }
 }

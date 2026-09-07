@@ -7,8 +7,9 @@
 //! because it could not open its log would be a far worse bug than the
 //! missing log, so `init` degrades to stderr and says so.
 //!
-//! Its own process, because `log` accepts one logger per process and the
-//! sibling test installs a working one.
+//! One test per file here, because `log` accepts one logger per process and
+//! `init` returns early on a second call — so a second test sharing this
+//! process would exercise nothing but that early return.
 
 #[test]
 fn an_unopenable_path_degrades_to_stderr_instead_of_panicking() {
@@ -30,15 +31,4 @@ fn an_unopenable_path_degrades_to_stderr_instead_of_panicking() {
     );
 
     let _ = std::fs::remove_file(&blocker);
-}
-
-/// `None` is the honest case for a process that has no log directory at all —
-/// no environment variable to build one from. It must behave the same way.
-#[test]
-fn no_path_at_all_is_not_an_error() {
-    // Runs in the same process as the test above, so this second `init` is a
-    // no-op by design; what it must not do is panic or poison anything.
-    yspot_log::init("shell", env!("CARGO_PKG_VERSION"), None);
-    log::error!("also still logging");
-    log::logger().flush();
 }

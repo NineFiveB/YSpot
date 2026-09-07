@@ -61,12 +61,71 @@ impl Rotating {
         }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok(Rotating {
+        let r = Rotating {
             path,
             file,
             written,
             rotate_at: MAX_BYTES,
-        })
+        };
+        // A rotation that was interrupted left a generation in the pending
+        // file. Claim it before anything else writes here.
+        r.recover_pending();
+        Ok(r)
+    }
+
+    fn stem(&self) -> String {
+        self.path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("log")
+            .to_string()
+    }
+
+    fn dir(&self) -> PathBuf {
+        self.path.parent().unwrap_or(Path::new(".")).to_path_buf()
+    }
+
+    /// The file a rotation parks the live log in between moving it aside and
+    /// filing it under a number.
+    ///
+    /// It ends in `.log` on purpose. The reader globs `*.log`, and a
+    /// generation it cannot see is a generation that does not exist to the
+    /// one person looking for it.
+    fn pending_path(&self) -> PathBuf {
+        self.dir().join(format!("{}.rotating.log", self.stem()))
+    }
+
+    /// Fold an interrupted rotation's parked generation into slot 1.
+    ///
+    /// Without this, the parked file was simply deleted at the start of the
+    /// next rotation — so the newest ten megabytes, the window containing
+    /// whatever the process was doing when it died or when rotation started
+    /// failing, was destroyed by the very routine written to stop destroying
+    /// history. Two ways in: a hard kill between the two renames, or a final
+    /// rename that failed because something holds slot 1 open.
+    fn recover_pending(&self) {
+        let pending = self.pending_path();
+        if !pending.exists() {
+            return;
+        }
+        self.shift_history();
+        // If even this fails, the file stays put under a `*.log` name: the
+        // reader can still see it and the next attempt tries again. Losing
+        // its ordinal is a far smaller thing than losing its contents.
+        let _ = std::fs::rename(&pending, self.nth(1));
+    }
+
+    fn nth(&self, i: usize) -> PathBuf {
+        self.dir().join(format!("{}.{i}.log", self.stem()))
+    }
+
+    /// Drop the oldest generation and move every other one down a slot,
+    /// leaving slot 1 free.
+    fn shift_history(&self) {
+        let _ = std::fs::remove_file(self.nth(MAX_FILES - 1));
+        for i in (1..MAX_FILES - 1).rev() {
+            let _ = std::fs::rename(self.nth(i), self.nth(i + 1));
+        }
     }
 
     /// `shell.log` → `shell.1.log` → … → `shell.4.log`, oldest dropped.
@@ -85,22 +144,16 @@ impl Rotating {
     /// then create its replacement (on failure, move it back), and only then
     /// touch the history.
     fn rotate(&mut self) -> std::io::Result<()> {
-        let stem = self
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("log")
-            .to_string();
-        let dir = self.path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let nth = |i: usize| dir.join(format!("{stem}.{i}.log"));
-
-        // A leftover from a process that died mid-rotation. Removing it can
-        // fail harmlessly; the rename below is the operation that matters.
-        let pending = dir.join(format!("{stem}.rotating"));
-        let _ = std::fs::remove_file(&pending);
+        // Claimed, never deleted. The first version of this fix removed the
+        // pending file to make room, which threw away a whole generation
+        // whenever an earlier rotation had been interrupted — losing exactly
+        // the bytes this routine exists to protect, and the newest ones at
+        // that: the window around whatever went wrong.
+        self.recover_pending();
+        let pending = self.pending_path();
 
         // Fallible step 1. A sharing violation — an editor, a backup agent, a
-        // tail running during the dogfood — lands here and costs nothing.
+        // scanner holding the file — lands here and costs nothing.
         std::fs::rename(&self.path, &pending)?;
 
         // Fallible step 2. If the replacement cannot be created, put the live
@@ -117,13 +170,12 @@ impl Rotating {
             }
         };
 
-        // Past this point every step is destructive and none can fail in a way
-        // that loses the live log, which is now safely aside.
-        let _ = std::fs::remove_file(nth(MAX_FILES - 1));
-        for i in (1..MAX_FILES - 1).rev() {
-            let _ = std::fs::rename(nth(i), nth(i + 1));
-        }
-        let _ = std::fs::rename(&pending, nth(1));
+        // The live log is aside and intact from here on. If filing it under a
+        // number fails — something holds slot 1 open — it stays in the pending
+        // file, which is named `*.log` so the reader can still see it, and is
+        // claimed by the next rotation or the next start rather than deleted.
+        self.shift_history();
+        let _ = std::fs::rename(&pending, self.nth(1));
 
         self.file = replacement;
         self.written = 0;
