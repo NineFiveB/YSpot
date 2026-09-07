@@ -254,8 +254,16 @@ pub(crate) fn show(app: &AppHandle) {
     }
     // §5.2 step 1: record the foreground window before we take focus.
     focus::remember_foreground();
-    // §5.3: recompute placement on every show.
-    match placement::compute_placement() {
+    // §5.3 places the launcher on a SUMMON. Already visible means this is a
+    // raise, not a summon — the tray's "Open YSpot", a second launch, or a
+    // signalled `show` — and re-placing would resize a taller in-place view
+    // back to §5.3's 480 with nothing to put it right: the frontend's height
+    // effect is keyed on the view, which has not changed.
+    let already_visible = window.is_visible().unwrap_or(false);
+    if already_visible {
+        log::debug!("show: already visible; raising without re-placing");
+    }
+    match placement::compute_placement().filter(|_| !already_visible) {
         Some(p) => {
             // Position FIRST, then size. The placement is in the DESTINATION
             // monitor's DPI; applying it as a size while the window still sits
@@ -387,33 +395,46 @@ fn search(
     // hundred names is microseconds and the calculator is a parse of one
     // line, so all of it fits the §2.5 shell-routing share and lands in the
     // same animation frame as the keystroke that asked for it.
-    let mut apps = apps::match_query(&catalog.snapshot(), &text, apps::MAX_APP_RESULTS);
+    let mut apps = apps::match_query(
+        &catalog.snapshot(),
+        &text,
+        apps::MAX_APP_RESULTS * FRECENCY_POOL,
+    );
     for it in &mut apps {
         // §7.1: frecency reorders within a tier and can never lift a lower
         // tier above a higher one — the bonus is bounded under the tier gap.
         it.score += frec.bonus(&it.id);
     }
     apps.sort_by(|a, b| b.score.total_cmp(&a.score));
+    apps.truncate(apps::MAX_APP_RESULTS);
 
-    let mut settings = settings.match_query(&text, settings_catalog::MAX_RESULTS);
+    let mut settings = settings.match_query(&text, settings_catalog::MAX_RESULTS * FRECENCY_POOL);
     for it in &mut settings {
         it.score += frec.bonus(&it.id);
     }
     settings.sort_by(|a, b| b.score.total_cmp(&a.score));
+    settings.truncate(settings_catalog::MAX_RESULTS);
 
-    let mut builtin_hits = commands::match_query(&builtins, &text, commands::MAX_RESULTS);
+    let mut builtin_hits =
+        commands::match_query(&builtins, &text, commands::MAX_RESULTS * FRECENCY_POOL);
     for it in &mut builtin_hits {
         it.score += frec.bonus(&it.id);
     }
     builtin_hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    builtin_hits.truncate(commands::MAX_RESULTS);
 
     // Open windows (§7.5). The enumeration is cached, so the per-keystroke
     // cost is a match over a few dozen titles.
-    let mut window_hits = winman::match_query(&win_cache.snapshot(), &text, winman::MAX_RESULTS);
+    let mut window_hits = winman::match_query(
+        &win_cache.snapshot(),
+        &text,
+        winman::MAX_RESULTS * FRECENCY_POOL,
+    );
     for it in &mut window_hits {
         it.score += frec.bonus(&it.id);
     }
     window_hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    window_hits.truncate(winman::MAX_RESULTS);
 
     let calc = calc::evaluate(&text).map(|r| CalcRow {
         display: r.display,
@@ -890,6 +911,18 @@ struct FallbackResults {
     /// to read as "not searchable", never as an empty result.
     unavailable: Option<String>,
 }
+
+/// How many candidates each catalog source is asked for, as a multiple of what
+/// it will actually show.
+///
+/// §7.1 says app results are frecency-ranked. They were not: every source cut
+/// itself to its display size and only THEN got the bonus, so frecency could
+/// reorder the page but never change who was on it. The matcher's tiers are
+/// flat constants — every prefix hit scores exactly 0.9 — so a one-letter
+/// query is one big tie broken by name length, and "Sublime Text" lost to
+/// "Steam" every time however often it was launched. Widening the pool first
+/// costs a longer truncate on a list already fully sorted.
+const FRECENCY_POOL: usize = 8;
 
 /// Where an unranked Windows Search hit sits against the §5.11 bands. Below
 /// the catalog's own matches (`matcher::SUBSTRING` and up), because the shell
@@ -1506,6 +1539,10 @@ pub fn run() {
     // it goes nowhere — which is every run that is not launched from a
     // terminal, i.e. every real one.
     diagnostics::init();
+    // After the logger, because the hook logs through it: a panic across an
+    // `extern "system"` boundary fast-fails past the exception filter, so
+    // this is the only thing that records it (§8.5).
+    diagnostics::install_panic_hook();
     etw_mark::init();
 
     if autostart::started_hidden() {

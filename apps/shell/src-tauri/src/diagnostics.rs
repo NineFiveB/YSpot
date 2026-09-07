@@ -235,6 +235,10 @@ use windows::Win32::System::Threading::{
 /// atomic and nothing else.
 static CAPTURE_ON: AtomicBool = AtomicBool::new(false);
 
+/// Set once a dump has been written, so a second thread arriving in the
+/// handler (or a panic following a fault) does not truncate the first.
+static DUMP_WRITTEN: AtomicBool = AtomicBool::new(false);
+
 /// The full path this process would write its dump to, NUL-terminated UTF-16,
 /// computed once when capture is first enabled.
 ///
@@ -307,6 +311,52 @@ fn remove_stale_localdumps() {
     }
 }
 
+/// Catch the crash Windows never tells us about.
+///
+/// [`on_unhandled_exception`] only sees SEH-dispatched exceptions, and a Rust
+/// panic that unwinds out of an `extern "system"` boundary is not one: it
+/// reaches `panic_cannot_unwind` and `__fastfail`, which goes straight to WER
+/// past every handler, the top-level filter included. Measured, not assumed —
+/// a probe panicking across such a boundary exits 0xC0000409 with the filter
+/// never entered, while a null dereference in the same probe exits 0xC0000005
+/// with it entered.
+///
+/// That is the crash class this shell actually dies from. Every
+/// `#[tauri::command]` runs on the WebView2 IPC callback, an `extern "system"`
+/// COM vtable entry with no `catch_unwind` between it and our code — which is
+/// exactly how `72°f in c` took the launcher down. So the hook is where a
+/// panic gets recorded, and it runs BEFORE the abort, on the panicking thread,
+/// with the stack intact.
+///
+/// It matters twice over because a release build is `windows_subsystem =
+/// "windows"`: std's own panic message goes to a stderr nobody is connected
+/// to, so without this the log's last line is whatever happened before the
+/// crash and the crash itself leaves no trace at all.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        match info.location() {
+            Some(l) => log::error!(
+                "PANIC at {}:{}:{}: {payload}",
+                l.file(),
+                l.line(),
+                l.column()
+            ),
+            None => log::error!("PANIC at an unknown location: {payload}"),
+        }
+        // No exception record to hand it: this is a panic, not a fault, so the
+        // dump carries the threads and their stacks and nothing else.
+        write_dump(std::ptr::null());
+        previous(info);
+    }));
+}
+
 /// Windows' last call before the process dies. Writes one minidump and lets
 /// the default handler carry on, so WER still sees the crash and
 /// `RegisterApplicationRestart` (§8.5) still relaunches us.
@@ -318,8 +368,31 @@ unsafe extern "system" fn on_unhandled_exception(info: *const EXCEPTION_POINTERS
     if !CAPTURE_ON.load(Ordering::Relaxed) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    write_dump(info);
+    // Not EXCEPTION_EXECUTE_HANDLER: swallowing it would leave the process
+    // limping instead of dying, and WER would never see the crash.
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Write this process's one minidump, if capture is on and a path was fixed.
+///
+/// `info` may be null: a panic has no `EXCEPTION_POINTERS`, and
+/// `MiniDumpWriteDump` accepts the absence.
+///
+/// Deliberately minimal — no allocation, no logging, no locks. On the fault
+/// path the heap may be the reason we are here; on the panic path we are
+/// about to abort either way.
+fn write_dump(info: *const EXCEPTION_POINTERS) {
+    if !CAPTURE_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    // One dump per process run. Two threads faulting at once would otherwise
+    // write over each other and leave a truncated file that opens in nothing.
+    if DUMP_WRITTEN.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let Some(path) = DUMP_PATH.get() else {
-        return EXCEPTION_CONTINUE_SEARCH;
+        return;
     };
     // SAFETY: `path` is a NUL-terminated UTF-16 buffer that outlives the call;
     // the handles come from the current process.
@@ -333,7 +406,7 @@ unsafe extern "system" fn on_unhandled_exception(info: *const EXCEPTION_POINTERS
             FILE_ATTRIBUTE_NORMAL,
             None,
         ) else {
-            return EXCEPTION_CONTINUE_SEARCH;
+            return;
         };
         if file != INVALID_HANDLE_VALUE {
             let exc = MINIDUMP_EXCEPTION_INFORMATION {
@@ -346,16 +419,13 @@ unsafe extern "system" fn on_unhandled_exception(info: *const EXCEPTION_POINTERS
                 GetCurrentProcessId(),
                 file,
                 MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory,
-                Some(&exc),
+                (!info.is_null()).then_some(&exc as *const _),
                 None,
                 None,
             );
             let _ = windows::Win32::Foundation::CloseHandle(HANDLE(file.0));
         }
     }
-    // Not EXCEPTION_EXECUTE_HANDLER: swallowing it would leave the process
-    // limping instead of dying, and WER would never see the crash.
-    EXCEPTION_CONTINUE_SEARCH
 }
 
 /// capture is on; this also cleans up after consent is withdrawn.
