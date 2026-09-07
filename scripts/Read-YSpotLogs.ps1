@@ -77,6 +77,8 @@ if (-not $files) {
 # Parse first, filter second: a malformed line (a half-written record at the
 # moment of a crash, which is exactly when you are reading this) must not take
 # the whole report down with it.
+$skipped = [System.Collections.Generic.List[string]]::new()
+
 $records = foreach ($f in $files) {
     $lineNo = 0
     foreach ($line in [System.IO.File]::ReadLines($f.FullName)) {
@@ -86,7 +88,12 @@ $records = foreach ($f in $files) {
             $o = $line | ConvertFrom-Json
         }
         catch {
-            Write-Verbose "$($f.Name):$lineNo is not JSON, skipped"
+            # Counted, never silent. A diagnostic tool that quietly drops
+            # records is worse than no tool: it shows you a log with a hole in
+            # it and no reason to suspect one, and the dropped record is
+            # disproportionately likely to be the interesting one — the
+            # half-written line a crash left behind is written AT the crash.
+            $skipped.Add("$($f.Name):$lineNo")
             continue
         }
         [pscustomobject]@{
@@ -113,13 +120,19 @@ if ($Tail -gt 0) { $records = $records | Select-Object -Last $Tail }
 
 if ($Raw) {
     $records | ForEach-Object { $_.Raw }
-    return
+}
+else {
+    $records | ForEach-Object {
+        # ConvertFrom-Json turns an ISO-8601 string into a local DateTime, which
+        # then prints without milliseconds — losing the only precision that makes
+        # the merge worth doing. Back to UTC, and keep the fractional part.
+        $t = if ($_.Ts -is [datetime]) { $_.Ts.ToUniversalTime().ToString('HH:mm:ss.fff') } else { [string]$_.Ts }
+        '{0}  {1,-5} {2,-6} {3}' -f $t, $_.Level, $_.Process, $_.Message
+    }
 }
 
-$records | ForEach-Object {
-    # ConvertFrom-Json turns an ISO-8601 string into a local DateTime, which
-    # then prints without milliseconds — losing the only precision that makes
-    # the merge worth doing. Back to UTC, and keep the fractional part.
-    $t = if ($_.Ts -is [datetime]) { $_.Ts.ToUniversalTime().ToString('HH:mm:ss.fff') } else { [string]$_.Ts }
-    '{0}  {1,-5} {2,-6} {3}' -f $t, $_.Level, $_.Process, $_.Message
+if ($skipped.Count -gt 0) {
+    # Last, so it survives being piped or redirected past a long report.
+    $where = if ($skipped.Count -le 5) { ": $($skipped -join ', ')" } else { ", first: $($skipped[0])" }
+    Write-Warning "$($skipped.Count) line(s) were not valid JSON and are missing from the above$where"
 }

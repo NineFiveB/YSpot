@@ -192,10 +192,18 @@ pub const RUN_START: &str = "run-start";
 /// The level comes from `RUST_LOG`, defaulting to §8.5's Info. Calling this
 /// twice is a no-op: `log` accepts one logger per process.
 pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
-    let level = std::env::var("RUST_LOG")
-        .ok()
+    let requested = std::env::var("RUST_LOG").ok();
+    let level = requested
+        .as_deref()
         .and_then(|v| v.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::Info);
+    // A value that did not parse is remembered, not shrugged off. This
+    // logger takes a bare level; `env_logger`, which the service used to
+    // use, also took per-module filters like `yspot_indexd=debug`. Anyone
+    // reaching for that spelling out of habit would otherwise turn debug
+    // logging ON, see none of it, and conclude the problem is not being
+    // logged — the exact wrong conclusion, arrived at silently.
+    let unparsed = requested.filter(|v| v.parse::<LevelFilter>().is_err());
     let mut where_to = None;
     let file = path.and_then(|p| match Rotating::open(p.clone()) {
         Ok(r) => {
@@ -223,6 +231,13 @@ pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
             None => "no log file; stderr only".to_string(),
         }
     );
+    if let Some(v) = unparsed {
+        log::warn!(
+            "RUST_LOG={v:?} is not a level this logger understands, so it was \
+             ignored and the level is {level}. Use one of: error, warn, info, \
+             debug, trace."
+        );
+    }
 }
 
 /// Route panics into the log, so a crash leaves a line in the file.
