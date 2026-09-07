@@ -12,3 +12,8 @@ publish = false
 # crate whose entire job is to install a logger.
 log = { workspace = true, features = ["std"] }
 serde_json = "1"
+
+[dev-dependencies]
+# The integration tests read the lines back and assert on the fields, which
+# means parsing the format this crate writes.
+serde_json = "1"
