@@ -33,8 +33,10 @@ Leave that window open — closing it stops the service. Order does not
 matter: the shell reconnects with backoff when the pipe appears.
 
 It logs to `%ProgramData%\YSpot\logs\indexd.log` as well as the console
-(`RUST_LOG=debug` for more), in the same one-JSON-object-per-line format the
-shell uses. That matters here more than it looks: a console is a buffer that
+(`RUST_LOG=debug` for more — a bare level only, not `env_logger`'s
+`module=level` form, and a value it cannot read is warned about in the log
+rather than ignored), in the same one-JSON-object-per-line format the shell
+uses. That matters here more than it looks: a console is a buffer that
 scrolls away, dies with its window, and is empty by the time you notice
 anything at 09:00. The file is what you actually read after a bad night.
 
