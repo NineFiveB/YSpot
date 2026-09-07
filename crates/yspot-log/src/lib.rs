@@ -201,6 +201,46 @@ pub fn init(process: &'static str, path: Option<PathBuf>) {
     }
 }
 
+/// Route panics into the log, so a crash leaves a line in the file.
+///
+/// std's default hook writes the panic message to stderr and nowhere else.
+/// For a process whose stderr is a console that scrolls away — or, for a GUI
+/// process, is not connected to anything at all — that means the single most
+/// informative line the process ever produces is the one line the log does not
+/// have. The last entry in the file is whatever happened just before, and the
+/// crash itself leaves no trace.
+///
+/// The thread name is included because it is usually the whole diagnosis: a
+/// panic on `usn-tail` and a panic on a session thread have very different
+/// consequences, and only the name distinguishes them.
+///
+/// Chains to the previous hook rather than replacing it, so a caller that has
+/// its own (the shell writes a minidump) keeps it.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string panic payload>");
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>").to_string();
+        match info.location() {
+            Some(l) => log::error!(
+                "PANIC on thread '{name}' at {}:{}:{}: {payload}",
+                l.file(),
+                l.line(),
+                l.column()
+            ),
+            None => log::error!("PANIC on thread '{name}' at an unknown location: {payload}"),
+        }
+        log::logger().flush();
+        previous(info);
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

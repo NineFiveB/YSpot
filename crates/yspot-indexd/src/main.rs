@@ -49,6 +49,8 @@ fn log_path() -> Option<std::path::PathBuf> {
 
 fn main() {
     yspot_log::init("indexd", log_path());
+    // After the logger, so the hook has somewhere to write.
+    yspot_log::install_panic_hook();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = match parse_args(&args) {
@@ -222,21 +224,65 @@ fn maybe_compact(state: &ServiceState) {
 fn spawn_housekeeping(state: Arc<ServiceState>) {
     std::thread::Builder::new()
         .name("housekeeping".into())
-        .spawn(move || loop {
-            std::thread::sleep(HOUSEKEEPING_TICK);
-            // §3.6 pause suspends index maintenance, not just tailing.
-            if !state.is_paused() {
-                repair_depths(&state);
-                maybe_compact(&state);
-            }
+        .spawn(move || {
+            supervise(
+                "housekeeping",
+                "depth repair and compaction have stopped: ranking will drift                  and the index will never reclaim the space deleted files left",
+                || loop {
+                    std::thread::sleep(HOUSEKEEPING_TICK);
+                    // §3.6 pause suspends index maintenance, not just tailing.
+                    if !state.is_paused() {
+                        repair_depths(&state);
+                        maybe_compact(&state);
+                    }
+                },
+            )
         })
         .expect("spawning housekeeping thread");
+}
+
+/// Run a thread body that is supposed to run forever, and say so if it stops.
+///
+/// The two maintenance threads are spawned and never joined, which is right —
+/// nothing has anything to wait for. It also means that if one of them dies,
+/// NOTHING notices. The service keeps accepting connections and keeps
+/// answering searches, from an index that has quietly stopped being
+/// maintained, and the only symptom is results that are subtly wrong in a way
+/// no one can date. That is the worst failure a two-week dogfood can suffer:
+/// it does not look like a failure, so it does not get reported, and the log
+/// is what has to say otherwise.
+///
+/// Deliberately no restart. A panic here means a bug, and a bug that recurs
+/// every tick produces a log full of noise and a service that looks healthy
+/// while spinning. Recording it once, loudly, is the honest answer; deciding
+/// what to do about it needs a person who has read the line.
+fn supervise(name: &'static str, consequence: &'static str, body: impl FnOnce()) {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    // Both arms are failures: these bodies are infinite loops by construction,
+    // so a clean return is as wrong as an unwind, just quieter.
+    log::error!("{}", epitaph(name, outcome.is_err(), consequence));
+    log::logger().flush();
+}
+
+/// The line [`supervise`] writes. Separate so it can be tested without
+/// installing a global logger.
+fn epitaph(name: &str, panicked: bool, consequence: &str) -> String {
+    let how = if panicked { "panicked" } else { "returned" };
+    format!(
+        "the {name} thread {how} and will not run again. {consequence}.          The service is otherwise still up, so this will not look broken:          restart it."
+    )
 }
 
 fn spawn_usn_tail(state: Arc<ServiceState>, drive: String, cursor: UsnCursor) {
     std::thread::Builder::new()
         .name("usn-tail".into())
-        .spawn(move || usn_tail_loop(state, drive, cursor))
+        .spawn(move || {
+            supervise(
+                "usn-tail",
+                "the index is frozen at this moment: searches keep answering,                  from data that stops here and silently ages",
+                || usn_tail_loop(state, drive, cursor),
+            )
+        })
         .expect("spawning usn-tail thread");
 }
 
@@ -409,6 +455,45 @@ fn parse_drive(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A maintenance thread that dies must not take the service with it, and
+    /// must not die quietly either.
+    #[test]
+    fn supervise_catches_a_panic_and_keeps_going() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        // Spawned, because that is how it is used: a panic escaping a spawned
+        // closure aborts nothing but its own thread, so the assertion that
+        // matters is that the JOIN succeeds rather than reporting an unwind.
+        let h = std::thread::spawn(move || {
+            super::supervise("test-thread", "nothing, this is a test", move || {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                panic!("the body blew up");
+            })
+        });
+        assert!(h.join().is_ok(), "the panic escaped supervise");
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the body never ran, so the test proved nothing"
+        );
+    }
+
+    /// A body that RETURNS is as much a failure as one that panics: both of
+    /// these threads are infinite loops, so either way the work has stopped.
+    #[test]
+    fn a_clean_return_is_reported_too() {
+        let quiet = super::epitaph("housekeeping", false, "compaction has stopped");
+        assert!(quiet.contains("returned"), "{quiet}");
+        let loud = super::epitaph("usn-tail", true, "the index is frozen");
+        assert!(loud.contains("panicked"), "{loud}");
+
+        // The consequence is the half a reader acts on, and the line has to
+        // say the service is still up — otherwise "it seems fine" reads as
+        // evidence against the log rather than as the symptom it is.
+        assert!(loud.contains("the index is frozen"), "{loud}");
+        assert!(loud.contains("restart"), "{loud}");
+        assert!(loud.contains("usn-tail"), "{loud}");
+    }
+
     use super::*;
 
     fn v(args: &[&str]) -> Vec<String> {

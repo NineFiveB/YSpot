@@ -94,6 +94,18 @@ service think?", so there is a script for it:
 It merges at millisecond resolution, because a query and its answer are tens
 of milliseconds apart and a coarser sort would put them in the wrong order.
 
+**If file results stop reflecting reality** — a file you just created never
+shows up, but everything else still works — check for a dead maintenance
+thread before assuming a search bug:
+
+```
+.\scripts\Read-YSpotLogs.ps1 -Level error -Pattern 'thread' -Tail 0
+```
+
+A service whose USN tailer has died keeps answering searches perfectly well,
+from an index frozen at the moment it stopped. It looks healthy. The log line
+is the only thing that says otherwise, and it names the restart as the fix.
+
 Attach `-Raw` output and any dump in `crashes\`, and open an issue with the
 exact query or action. "It felt slow"
 is a bug too; say what you typed and roughly how long it took.
