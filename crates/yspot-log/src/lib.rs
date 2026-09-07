@@ -68,8 +68,10 @@ impl Rotating {
             rotate_at: MAX_BYTES,
         };
         // A rotation that was interrupted left a generation in the pending
-        // file. Claim it before anything else writes here.
-        r.recover_pending();
+        // file. Claim it before anything else writes here. If it cannot be
+        // filed, it stays where it is under a `*.log` name — visible to the
+        // reader, and tried again at the next rotation.
+        let _ = r.recover_pending();
         Ok(r)
     }
 
@@ -103,16 +105,23 @@ impl Rotating {
     /// failing, was destroyed by the very routine written to stop destroying
     /// history. Two ways in: a hard kill between the two renames, or a final
     /// rename that failed because something holds slot 1 open.
-    fn recover_pending(&self) {
+    /// Returns whether the pending slot is free afterwards.
+    ///
+    /// The answer is load-bearing, not informational. A caller that files the
+    /// live log into this slot while a generation is still sitting in it does
+    /// not fail — Windows' rename replaces — it silently overwrites the very
+    /// bytes this recovery exists to save.
+    #[must_use]
+    fn recover_pending(&self) -> bool {
         let pending = self.pending_path();
         if !pending.exists() {
-            return;
+            return true;
         }
         self.shift_history();
-        // If even this fails, the file stays put under a `*.log` name: the
-        // reader can still see it and the next attempt tries again. Losing
-        // its ordinal is a far smaller thing than losing its contents.
-        let _ = std::fs::rename(&pending, self.nth(1));
+        // If this fails, the file stays put under a `*.log` name: the reader
+        // can still see it and the next attempt tries again. Losing its
+        // ordinal is a far smaller thing than losing its contents.
+        std::fs::rename(&pending, self.nth(1)).is_ok()
     }
 
     fn nth(&self, i: usize) -> PathBuf {
@@ -149,7 +158,17 @@ impl Rotating {
         // whenever an earlier rotation had been interrupted — losing exactly
         // the bytes this routine exists to protect, and the newest ones at
         // that: the window around whatever went wrong.
-        self.recover_pending();
+        if !self.recover_pending() {
+            // A generation is still parked and could not be filed. Moving the
+            // live log in on top of it would REPLACE it — `rename` on Windows
+            // overwrites — so refuse the whole rotation instead. The caller
+            // keeps writing to an oversized live file and says so, which costs
+            // disk; going ahead would cost the parked ten megabytes, which is
+            // the newest history there is.
+            return Err(std::io::Error::other(
+                "a parked log generation could not be filed; not overwriting it",
+            ));
+        }
         let pending = self.pending_path();
 
         // Fallible step 1. A sharing violation — an editor, a backup agent, a

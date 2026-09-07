@@ -190,18 +190,15 @@ if ($Level) {
     $selected = $selected | Where-Object { $wanted -contains $_.Level }
 }
 if ($Pattern) {
-    $selected = if ($Simple) {
-        # OrdinalIgnoreCase to match what -match does. -Simple exists to
-        # escape regex syntax, not to quietly become case-sensitive as well.
-        $cmp = [System.StringComparison]::OrdinalIgnoreCase
-        $selected | Where-Object {
-            ([string]$_.Message).Contains($Pattern, $cmp) -or
-            ([string]$_.Component).Contains($Pattern, $cmp)
-        }
-    }
-    else {
-        $selected | Where-Object { $_.Message -match $Pattern -or $_.Component -match $Pattern }
-    }
+    # -Simple escapes the pattern and then takes the SAME path as -Pattern.
+    # Two things fall out of that. Case-insensitivity matches, where an
+    # ordinal Contains had quietly made -Simple case-sensitive. And it runs on
+    # Windows PowerShell 5.1, where the two-argument String.Contains does not
+    # exist at all: that overload arrived with .NET Core, so the previous fix
+    # threw "Cannot find an overload for Contains and the argument count: 2"
+    # on the default Windows host while passing every test on pwsh 7.
+    $expr = if ($Simple) { [regex]::Escape($Pattern) } else { $Pattern }
+    $selected = $selected | Where-Object { $_.Message -match $expr -or $_.Component -match $expr }
 }
 
 # FileIdx and LineNo are the tiebreakers Sort-Object does not provide. Without
