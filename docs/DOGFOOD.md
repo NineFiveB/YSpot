@@ -106,6 +106,17 @@ A service whose USN tailer has died keeps answering searches perfectly well,
 from an index frozen at the moment it stopped. It looks healthy. The log line
 is the only thing that says otherwise, and it names the restart as the fix.
 
+**To find where a run began**, which over two weeks of logons and restarts is
+the first thing you need:
+
+```
+.\scripts\Read-YSpotLogs.ps1 -Pattern run-start -Tail 0
+```
+
+Each process writes one such line as it starts, carrying its version, its pid
+and the log file it resolved. That last part answers "am I even reading the
+right file" without leaving the log.
+
 Attach `-Raw` output and any dump in `crashes\`, and open an issue with the
 exact query or action. "It felt slow"
 is a bug too; say what you typed and roughly how long it took.

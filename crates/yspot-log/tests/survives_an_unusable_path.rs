@@ -18,7 +18,7 @@ fn an_unopenable_path_degrades_to_stderr_instead_of_panicking() {
     std::fs::write(&blocker, b"not a directory").unwrap();
     let path = blocker.join("logs").join("shell.log");
 
-    yspot_log::init("shell", Some(path.clone()));
+    yspot_log::init("shell", env!("CARGO_PKG_VERSION"), Some(path.clone()));
 
     // The point: these do not panic, and the process is still here after.
     log::error!("still logging");
@@ -38,7 +38,7 @@ fn an_unopenable_path_degrades_to_stderr_instead_of_panicking() {
 fn no_path_at_all_is_not_an_error() {
     // Runs in the same process as the test above, so this second `init` is a
     // no-op by design; what it must not do is panic or poison anything.
-    yspot_log::init("shell", None);
+    yspot_log::init("shell", env!("CARGO_PKG_VERSION"), None);
     log::error!("also still logging");
     log::logger().flush();
 }

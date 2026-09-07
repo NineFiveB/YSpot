@@ -43,7 +43,11 @@ pub fn crashes_dir() -> Option<PathBuf> {
 /// processes write §8.5's one format — the `process` field below is what
 /// tells them apart when the two logs are read together.
 pub fn init() {
-    yspot_log::init("shell", logs_dir().map(|d| d.join("shell.log")));
+    yspot_log::init(
+        "shell",
+        env!("CARGO_PKG_VERSION"),
+        logs_dir().map(|d| d.join("shell.log")),
+    );
 }
 
 // ---------------------------------------------------------------------------

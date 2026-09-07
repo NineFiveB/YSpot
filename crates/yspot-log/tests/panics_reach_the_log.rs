@@ -21,7 +21,7 @@ fn scratch() -> PathBuf {
 fn a_panic_is_written_to_the_log_file() {
     let dir = scratch();
     let path = dir.join("indexd.log");
-    yspot_log::init("indexd", Some(path.clone()));
+    yspot_log::init("indexd", env!("CARGO_PKG_VERSION"), Some(path.clone()));
     yspot_log::install_panic_hook();
 
     // `catch_unwind` still runs the hook, which is what lets this be a test

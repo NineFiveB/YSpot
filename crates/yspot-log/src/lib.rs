@@ -170,22 +170,38 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Install this process's logger.
+/// The token that marks the first line of a run. Stable, because splitting a
+/// fortnight of log into runs is the thing a reader does before anything else.
+pub const RUN_START: &str = "run-start";
+
+/// Install this process's logger, and write the line that opens the run.
 ///
 /// `process` is §8.5's `process` field — the name a reader greps for when the
 /// two logs are read side by side. `path` is the full path of the live log
 /// file; `None`, or a path that cannot be opened, falls back to stderr alone,
 /// because losing logs is bad and refusing to start is worse.
 ///
+/// The banner is written here rather than left to callers so that no process
+/// can forget it. Without one, a log spanning two weeks of logons, crashes and
+/// rebuilds is a single undifferentiated stream: nothing says where one run
+/// ended and the next began, and §8.5's own crash-free-SESSION metric — one
+/// shell process lifetime — cannot be counted from it at all. It carries the
+/// resolved path too, which answers "where are my logs" from inside the log,
+/// and says so plainly when there is no file and stderr is all there is.
+///
 /// The level comes from `RUST_LOG`, defaulting to §8.5's Info. Calling this
 /// twice is a no-op: `log` accepts one logger per process.
-pub fn init(process: &'static str, path: Option<PathBuf>) {
+pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
     let level = std::env::var("RUST_LOG")
         .ok()
         .and_then(|v| v.parse::<LevelFilter>().ok())
         .unwrap_or(LevelFilter::Info);
+    let mut where_to = None;
     let file = path.and_then(|p| match Rotating::open(p.clone()) {
-        Ok(r) => Some(r),
+        Ok(r) => {
+            where_to = Some(p);
+            Some(r)
+        }
         Err(e) => {
             eprintln!("log: cannot open {} ({e}); stderr only", p.display());
             None
@@ -199,6 +215,14 @@ pub fn init(process: &'static str, path: Option<PathBuf>) {
     if log::set_boxed_logger(logger).is_ok() {
         log::set_max_level(level);
     }
+    log::info!(
+        "{RUN_START}: {process} {version}, pid {}, {}",
+        std::process::id(),
+        match &where_to {
+            Some(p) => format!("log {}", p.display()),
+            None => "no log file; stderr only".to_string(),
+        }
+    );
 }
 
 /// Route panics into the log, so a crash leaves a line in the file.

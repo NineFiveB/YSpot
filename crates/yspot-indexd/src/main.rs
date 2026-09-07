@@ -48,7 +48,7 @@ fn log_path() -> Option<std::path::PathBuf> {
 }
 
 fn main() {
-    yspot_log::init("indexd", log_path());
+    yspot_log::init("indexd", env!("CARGO_PKG_VERSION"), log_path());
     // After the logger, so the hook has somewhere to write.
     yspot_log::install_panic_hook();
 
