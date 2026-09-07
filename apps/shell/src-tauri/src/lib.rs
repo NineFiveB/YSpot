@@ -257,11 +257,18 @@ pub(crate) fn show(app: &AppHandle) {
     // §5.3: recompute placement on every show.
     match placement::compute_placement() {
         Some(p) => {
-            if let Err(e) = window.set_size(tauri::PhysicalSize::new(p.width, p.height)) {
-                log::warn!("set_size failed: {e}");
-            }
+            // Position FIRST, then size. The placement is in the DESTINATION
+            // monitor's DPI; applying it as a size while the window still sits
+            // on the previous monitor means the move that follows raises
+            // WM_DPICHANGED, and Windows' suggested rect scales that size
+            // again by new/old — a 150% laptop to a 100% external halved the
+            // launcher, and the reverse overflowed it. Moving first puts the
+            // DPI change before the size that is already expressed in it.
             if let Err(e) = window.set_position(tauri::PhysicalPosition::new(p.x, p.y)) {
                 log::warn!("set_position failed: {e}");
+            }
+            if let Err(e) = window.set_size(tauri::PhysicalSize::new(p.width, p.height)) {
+                log::warn!("set_size failed: {e}");
             }
         }
         None => log::warn!("placement computation failed; keeping last position"),
@@ -1400,15 +1407,21 @@ fn set_launcher_height(app: AppHandle, logical_height: u32) -> Result<(), String
         return Ok(());
     };
     let logical = logical_height.clamp(120, 2000) as i32;
-    let Some(p) = placement::compute_placement_of_height(logical) else {
+    // The monitor the launcher is ON, not the one the pointer wandered to:
+    // this is a resize of a window already on screen, and §5.3's cursor rule
+    // is for summoning. Falls back to the cursor only if the handle is gone.
+    let hwnd = window.hwnd().map(|h| h.0 as isize).unwrap_or(0);
+    let Some(p) = placement::compute_placement_for_window(hwnd, logical)
+        .or_else(|| placement::compute_placement_of_height(logical))
+    else {
         return Err("placement computation failed".to_string());
     };
     window
-        .set_size(tauri::PhysicalSize::new(p.width, p.height))
-        .map_err(|e| format!("set_size: {e}"))?;
-    window
         .set_position(tauri::PhysicalPosition::new(p.x, p.y))
-        .map_err(|e| format!("set_position: {e}"))
+        .map_err(|e| format!("set_position: {e}"))?;
+    window
+        .set_size(tauri::PhysicalSize::new(p.width, p.height))
+        .map_err(|e| format!("set_size: {e}"))
 }
 
 /// §5.4 autostart state, for the Settings UI (§5.9) and the tray toggle.

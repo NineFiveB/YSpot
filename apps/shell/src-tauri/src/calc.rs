@@ -538,7 +538,17 @@ fn conversion(q: &str) -> Option<CalcResult> {
     // The source unit is the trailing word of the left side; everything
     // before it is the value expression, so `2*3 kg in lb` works.
     let lhs = lhs.trim();
-    let split = lhs.rfind(|c: char| !c.is_ascii_alphabetic())? + 1;
+    // The END of the last non-letter, not its start plus one. `rfind` with a
+    // char predicate returns where the char BEGINS, so `+ 1` lands inside it
+    // whenever it is multi-byte and `split_at` panics on the boundary — and
+    // this runs on every keystroke, in-process, with nothing catching it.
+    // "72°f in c" is the query that finds it; so is "100 kg in lb" pasted
+    // from a web page, where the space is U+00A0.
+    let split = lhs
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !c.is_ascii_alphabetic())
+        .map(|(i, c)| i + c.len_utf8())?;
     let (value_src, from_name) = lhs.split_at(split);
     let (from_dim, from_factor) = unit(from_name.trim())?;
     if from_dim != to_dim {
@@ -705,6 +715,32 @@ fn today_civil() -> Option<(i64, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    /// Non-ASCII input must not panic. Every one of these crashed the shell
+    /// before the split below took the char's end instead of its start + 1,
+    /// and the launcher runs this synchronously on every keystroke.
+    #[test]
+    fn non_ascii_conversions_do_not_panic() {
+        for q in [
+            "72\u{b0}f in c",
+            "10\u{b0} in c",
+            "0\u{b0}c to f",
+            "5\u{e9} in m",
+            "1\u{bd} in cm",
+            "100 \u{43c} in km",
+            "3\u{b5} in m",
+            "20\u{20ac} to g",
+            // A non-breaking space, which is what a pasted "100 kg in lb"
+            // off a web page actually contains.
+            "100\u{a0}kg in lb",
+            "72\u{2009}kg in lb",
+        ] {
+            let _ = super::evaluate(q);
+        }
+        // And the ASCII forms still answer.
+        assert!(super::evaluate("12 mi in km").is_some());
+        assert!(super::evaluate("1 in in cm").is_some());
+    }
+
     use super::*;
 
     fn v(q: &str) -> String {

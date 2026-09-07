@@ -3,9 +3,10 @@
 //! logical px scaled by the monitor's effective DPI, width clamped to 90%
 //! of the work-area width. Recomputed on every show — no persistent state.
 
-use windows_sys::Win32::Foundation::POINT;
+use windows_sys::Win32::Foundation::{HWND, POINT};
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
@@ -32,15 +33,40 @@ pub fn compute_placement() -> Option<Placement> {
 /// to fit an in-place view such as Settings, keeping its top edge where the
 /// user is already looking.
 pub fn compute_placement_of_height(logical_height: i32) -> Option<Placement> {
-    // SAFETY: plain out-parameter Win32 calls; POINT/MONITORINFO are POD and
-    // valid zero-initialized; cbSize is set before GetMonitorInfoW.
-    unsafe {
+    // SAFETY: plain out-parameter Win32 call; POINT is POD and valid
+    // zero-initialized.
+    let monitor = unsafe {
         let mut pt: POINT = std::mem::zeroed();
         if GetCursorPos(&mut pt) == 0 {
             return None;
         }
         // MONITOR_DEFAULTTONEAREST never returns null.
-        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST)
+    };
+    on_monitor(monitor, logical_height)
+}
+
+/// The placement for a window that is ALREADY on screen, on the monitor it is
+/// already on.
+///
+/// §5.3 puts the launcher on the CURSOR's monitor, which is right when it is
+/// being summoned. It is wrong for a resize: growing to fit an in-place view
+/// re-ran the cursor lookup, so moving the mouse to another screen and then
+/// opening Settings teleported the launcher after it, mid-interaction, and
+/// re-scaled it for the wrong DPI on the way.
+pub fn compute_placement_for_window(hwnd: isize, logical_height: i32) -> Option<Placement> {
+    if hwnd == 0 {
+        return None;
+    }
+    // SAFETY: MONITOR_DEFAULTTONEAREST never returns null for a live window.
+    let monitor = unsafe { MonitorFromWindow(hwnd as HWND, MONITOR_DEFAULTTONEAREST) };
+    on_monitor(monitor, logical_height)
+}
+
+fn on_monitor(monitor: HMONITOR, logical_height: i32) -> Option<Placement> {
+    // SAFETY: plain out-parameter Win32 calls; MONITORINFO is POD and valid
+    // zero-initialized; cbSize is set before GetMonitorInfoW.
+    unsafe {
         let mut mi: MONITORINFO = std::mem::zeroed();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(monitor, &mut mi) == 0 {

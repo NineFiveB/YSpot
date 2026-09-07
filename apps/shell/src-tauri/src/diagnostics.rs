@@ -215,105 +215,149 @@ pub fn init() {
 // ---------------------------------------------------------------------------
 // Crash capture (§8.5)
 
-use windows::core::w;
-use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-    KEY_SET_VALUE, REG_DWORD, REG_EXPAND_SZ, REG_OPTION_NON_VOLATILE,
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Storage::FileSystem::{
+    CreateFileW, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_NONE,
+};
+use windows::Win32::System::Diagnostics::Debug::{
+    MiniDumpWithIndirectlyReferencedMemory, MiniDumpWithThreadInfo, MiniDumpWriteDump,
+    SetUnhandledExceptionFilter, EXCEPTION_POINTERS, MINIDUMP_EXCEPTION_INFORMATION,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
 };
 
-/// WER LocalDumps for this executable, under the per-user hive.
-///
-/// `HKCU\Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\
-/// yspot-shell.exe`, with `DumpFolder` and a full dump type. Per-user
-/// because the shell is a per-user executable (§8.5 puts the service's
-/// equivalent in HKLM, written by its MSI).
-const LOCALDUMPS_KEY: windows::core::PCWSTR =
-    w!("Software\\Microsoft\\Windows\\Windows Error Reporting\\LocalDumps\\yspot-shell.exe");
+/// Whether consent is currently given. Read by the crash handler, so it is an
+/// atomic and nothing else.
+static CAPTURE_ON: AtomicBool = AtomicBool::new(false);
 
-/// Turn crash capture on or off. With consent off the registry value is
-/// removed, so Windows writes no dump at all — §8.5's "no consent ⇒ dumps
-/// stay local" becomes "there is nothing to keep".
+/// The full path this process would write its dump to, NUL-terminated UTF-16,
+/// computed once when capture is first enabled.
+///
+/// Precomputed on purpose: the handler runs after the process has already gone
+/// wrong, possibly with a corrupt heap or on a thread with almost no stack
+/// left, and formatting a path there would be the second bug. One dump per
+/// process run is all a crash produces anyway.
+static DUMP_PATH: OnceLock<Vec<u16>> = OnceLock::new();
+
+/// §8.5's crash capture, as the in-process minidump handler that section
+/// offers as the alternative to WER LocalDumps.
+///
+/// It has to be in-process. LocalDumps is only ever read from **HKLM**
+/// (`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps`),
+/// which needs administrator rights, and §2 pins the shell to the interactive
+/// user at medium integrity, unelevated — so it cannot write that key, and the
+/// per-user hive Windows never consults. An earlier version wrote HKCU and
+/// reported success: consent was accepted, the setting showed enabled, and no
+/// dump was ever produced by anything. §8.5's service equivalent still goes in
+/// HKLM, written by the service MSI, which runs elevated.
 pub fn set_crash_capture(enabled: bool) -> Result<(), String> {
+    // Tidy away the key the HKCU version left behind. Ignoring the result on
+    // purpose: absent is the state we want, and it is not worth a failure.
+    remove_stale_localdumps();
+
     if !enabled {
-        // SAFETY: static key path under the user's own hive.
-        let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, LOCALDUMPS_KEY) };
-        // Absent is the state we wanted.
-        if rc.is_err() && rc.0 != windows::Win32::Foundation::ERROR_FILE_NOT_FOUND.0 {
-            return Err(format!("remove LocalDumps: {rc:?}"));
-        }
+        CAPTURE_ON.store(false, Ordering::SeqCst);
         log::info!("crash capture disabled (§8.5)");
         return Ok(());
     }
+
     let dir = crashes_dir().ok_or_else(|| "LOCALAPPDATA unset".to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
 
-    let mut key = HKEY::default();
-    // SAFETY: static path; `key` is a valid out-slot, closed below.
-    let rc = unsafe {
-        RegCreateKeyExW(
-            HKEY_CURRENT_USER,
-            LOCALDUMPS_KEY,
-            None,
-            None,
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE,
-            None,
-            &mut key,
-            None,
-        )
-    };
-    if rc.is_err() {
-        return Err(format!("create LocalDumps key: {rc:?}"));
+    // SAFETY: a documented process-wide filter; the handler below is a plain
+    // `extern "system"` fn with the required signature.
+    let path = DUMP_PATH.get_or_init(|| {
+        // SAFETY: reading our own ids.
+        let pid = unsafe { GetCurrentProcessId() };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let file = dir.join(format!("yspot-shell-{pid}-{stamp}.dmp"));
+        file.to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+    let _ = path;
+    if !CAPTURE_ON.swap(true, Ordering::SeqCst) {
+        // SAFETY: installing a process-wide unhandled-exception filter.
+        unsafe { SetUnhandledExceptionFilter(Some(on_unhandled_exception)) };
     }
-    let result = write_values(key, &dir);
-    // SAFETY: opened above, closed exactly once.
-    unsafe {
-        let _ = RegCloseKey(key);
-    }
-    result?;
     log::info!("crash capture enabled; dumps land in {}", dir.display());
     Ok(())
 }
 
-fn write_values(key: HKEY, dir: &Path) -> Result<(), String> {
-    let folder: Vec<u16> = dir
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    // SAFETY: `folder` is a NUL-terminated UTF-16 string of exactly this
-    // many bytes, which is the REG_EXPAND_SZ contract.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            folder.as_ptr() as *const u8,
-            std::mem::size_of_val(&folder[..]),
-        )
-    };
-    // SAFETY: valid key and static value names.
+/// Remove the HKCU LocalDumps key an earlier build wrote, which Windows never
+/// read. Best effort: it is housekeeping, not a feature.
+fn remove_stale_localdumps() {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+    // SAFETY: static key path under the user's own hive.
     unsafe {
-        let rc = RegSetValueExW(key, w!("DumpFolder"), None, REG_EXPAND_SZ, Some(bytes));
-        if rc.is_err() {
-            return Err(format!("DumpFolder: {rc:?}"));
-        }
-        let count = (MAX_DUMPS as u32).to_le_bytes();
-        let rc = RegSetValueExW(key, w!("DumpCount"), None, REG_DWORD, Some(&count));
-        if rc.is_err() {
-            return Err(format!("DumpCount: {rc:?}"));
-        }
-        // 1 = mini, 2 = full. A mini dump is enough to symbolize a stack and
-        // is orders of magnitude smaller, which matters for something that
-        // sits on a user's disk until they consent to send it.
-        let kind = 1u32.to_le_bytes();
-        let rc = RegSetValueExW(key, w!("DumpType"), None, REG_DWORD, Some(&kind));
-        if rc.is_err() {
-            return Err(format!("DumpType: {rc:?}"));
-        }
+        let _ = RegDeleteTreeW(
+            HKEY_CURRENT_USER,
+            w!(r"Software\Microsoft\Windows\Windows Error Reporting\LocalDumps\yspot-shell.exe"),
+        );
     }
-    Ok(())
 }
 
-/// Keep the newest [`MAX_DUMPS`] dumps and delete the rest — §8.5's "dumps
-/// are rotated away". Windows' own `DumpCount` does this too, but only while
+/// Windows' last call before the process dies. Writes one minidump and lets
+/// the default handler carry on, so WER still sees the crash and
+/// `RegisterApplicationRestart` (§8.5) still relaunches us.
+///
+/// Everything here is deliberately minimal: no allocation, no logging, no
+/// locks. The heap may be the reason we are here.
+unsafe extern "system" fn on_unhandled_exception(info: *const EXCEPTION_POINTERS) -> i32 {
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    if !CAPTURE_ON.load(Ordering::Relaxed) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let Some(path) = DUMP_PATH.get() else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    // SAFETY: `path` is a NUL-terminated UTF-16 buffer that outlives the call;
+    // the handles come from the current process.
+    unsafe {
+        let Ok(file) = CreateFileW(
+            PCWSTR(path.as_ptr()),
+            FILE_GENERIC_WRITE.0,
+            FILE_SHARE_NONE,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        ) else {
+            return EXCEPTION_CONTINUE_SEARCH;
+        };
+        if file != INVALID_HANDLE_VALUE {
+            let exc = MINIDUMP_EXCEPTION_INFORMATION {
+                ThreadId: GetCurrentThreadId(),
+                ExceptionPointers: info as *mut _,
+                ClientPointers: false.into(),
+            };
+            let _ = MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                file,
+                MiniDumpWithThreadInfo | MiniDumpWithIndirectlyReferencedMemory,
+                Some(&exc),
+                None,
+                None,
+            );
+            let _ = windows::Win32::Foundation::CloseHandle(HANDLE(file.0));
+        }
+    }
+    // Not EXCEPTION_EXECUTE_HANDLER: swallowing it would leave the process
+    // limping instead of dying, and WER would never see the crash.
+    EXCEPTION_CONTINUE_SEARCH
+}
+
 /// capture is on; this also cleans up after consent is withdrawn.
 pub fn rotate_dumps() {
     let Some(dir) = crashes_dir() else { return };
