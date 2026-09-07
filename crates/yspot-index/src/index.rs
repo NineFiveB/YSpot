@@ -2840,11 +2840,16 @@ mod tests {
 
         let index = Arc::new(RwLock::new(v));
         let stop = Arc::new(AtomicBool::new(false));
+        // Published as they go, not only at the join. The writer waits on this
+        // before stopping, so the test's own vacuity guard cannot fire just
+        // because the reader threads were starved.
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let readers: Vec<_> = (0..READERS)
             .map(|r| {
                 let index = Arc::clone(&index);
                 let stop = Arc::clone(&stop);
+                let hits = Arc::clone(&hits);
                 std::thread::spawn(move || {
                     let queries = ["report", "draft", "rd", "eport-1", "zzqxj"];
                     let mut seen = 0usize;
@@ -2861,6 +2866,7 @@ mod tests {
                                 );
                                 assert!(guard.path_of(hit.frn).is_some());
                                 seen += 1;
+                                hits.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -2890,6 +2896,30 @@ mod tests {
             std::thread::yield_now();
         }
 
+        // Do not stop until the readers have actually raced the writer. The
+        // 200 rounds above take milliseconds, and under a loaded machine — a
+        // full `cargo test --workspace`, which is how this was caught — all
+        // four reader threads can still be waiting for their first scheduling
+        // slice when the writer finishes. The test then failed on its own
+        // vacuity guard, reporting a concurrency defect where there was only
+        // contention for cores. Keep churning until a hit is observed, with a
+        // deadline so a genuinely broken reader still fails rather than hangs.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut round = 200u64;
+        while hits.load(Ordering::Relaxed) == 0 && std::time::Instant::now() < deadline {
+            {
+                let mut guard = index.write().unwrap_or_else(|p| p.into_inner());
+                guard.apply(crate::UsnEvent::Create {
+                    frn: 2_000_000 + round,
+                    parent_frn: ABSENT_PARENT,
+                    name: format!("report-extra-{round}.txt"),
+                    flags: 0,
+                });
+            }
+            round += 1;
+            std::thread::yield_now();
+        }
+
         stop.store(true, Ordering::Relaxed);
         let total: usize = readers
             .into_iter()
@@ -2897,7 +2927,7 @@ mod tests {
             .sum();
         assert!(
             total > 0,
-            "readers never observed a hit, so nothing was proven"
+            "readers never observed a hit in 30 s, so nothing was proven"
         );
 
         let guard = index.read().unwrap_or_else(|p| p.into_inner());

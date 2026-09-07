@@ -182,23 +182,15 @@ fn remove_stale_localdumps() {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        match info.location() {
-            Some(l) => log::error!(
-                "PANIC at {}:{}:{}: {payload}",
-                l.file(),
-                l.line(),
-                l.column()
-            ),
-            None => log::error!("PANIC at an unknown location: {payload}"),
-        }
+        // The shared formatter, not a second copy of it. The two processes'
+        // panic lines had already drifted — this one carried no thread name,
+        // which §8.5's shared format exists to prevent and which is usually
+        // the whole diagnosis.
+        log::error!("{}", yspot_log::panic_line(info));
         // No exception record to hand it: this is a panic, not a fault, so the
-        // dump carries the threads and their stacks and nothing else.
+        // dump carries the threads and their stacks and nothing else. After
+        // the log line, deliberately: the line is what survives if writing the
+        // dump is what kills us.
         write_dump(std::ptr::null());
         previous(info);
     }));

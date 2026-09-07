@@ -435,26 +435,41 @@ fn emit(level: Level, message: &str) {
 pub fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
-        let thread = std::thread::current();
-        let name = thread.name().unwrap_or("<unnamed>").to_string();
-        match info.location() {
-            Some(l) => log::error!(
-                "PANIC on thread '{name}' at {}:{}:{}: {payload}",
-                l.file(),
-                l.line(),
-                l.column()
-            ),
-            None => log::error!("PANIC on thread '{name}' at an unknown location: {payload}"),
-        }
+        log::error!("{}", panic_line(info));
         log::logger().flush();
         previous(info);
     }));
+}
+
+/// The one line a panic produces, wherever it is logged from.
+///
+/// Public because the shell cannot use [`install_panic_hook`] as-is: it has to
+/// write a minidump between logging the panic and chaining onward, and the
+/// order matters — the log line is the thing that survives if the dump fails.
+/// Sharing the formatter rather than the hook is what keeps the two processes'
+/// panic lines identical, which is the entire reason this crate exists. They
+/// had already drifted: the shell's line carried no thread name.
+///
+/// The thread name is usually the whole diagnosis. A panic on `usn-tail`
+/// freezes the index; a panic on a session thread costs one query.
+pub fn panic_line(info: &std::panic::PanicHookInfo<'_>) -> String {
+    let payload = info
+        .payload()
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<non-string panic payload>");
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("<unnamed>").to_string();
+    match info.location() {
+        Some(l) => format!(
+            "PANIC on thread '{name}' at {}:{}:{}: {payload}",
+            l.file(),
+            l.line(),
+            l.column()
+        ),
+        None => format!("PANIC on thread '{name}' at an unknown location: {payload}"),
+    }
 }
 
 #[cfg(test)]
