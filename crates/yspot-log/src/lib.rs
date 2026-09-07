@@ -220,9 +220,16 @@ pub fn init(process: &'static str, version: &str, path: Option<PathBuf>) {
         file: Mutex::new(file),
         stderr: true,
     });
-    if log::set_boxed_logger(logger).is_ok() {
-        log::set_max_level(level);
+    // Only announce a run we actually took charge of. A second call cannot
+    // install anything — `log` allows one logger per process — so its banner
+    // would go to the FIRST logger and describe a file and a level that call
+    // never put in force. A line saying a run started, in the log of a run
+    // that did not, is precisely the kind of confident wrong statement the
+    // rest of this crate exists to avoid.
+    if log::set_boxed_logger(logger).is_err() {
+        return;
     }
+    log::set_max_level(level);
     log::info!(
         "{RUN_START}: {process} {version}, pid {}, {}",
         std::process::id(),

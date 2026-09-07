@@ -30,6 +30,12 @@ fn a_logged_line_lands_in_the_file_at_the_given_path() {
 
     yspot_log::init("indexd", "9.9.9-test", Some(path.clone()));
 
+    // A second call cannot install a logger — `log` allows one per process —
+    // so it must not announce a run either. Its banner would otherwise land in
+    // the FIRST logger's file, naming a version and a path that this call
+    // never put in force: a run-start line for a run that did not start.
+    yspot_log::init("shell", "0.0.0-should-not-appear", None);
+
     log::info!("hello from the test");
     log::warn!(target: "yspot_indexd::pipe", "and a warning");
     // Below the default level, so it must NOT appear: this is what proves the
@@ -60,6 +66,10 @@ fn a_logged_line_lands_in_the_file_at_the_given_path() {
     assert!(
         b.contains("indexd.log"),
         "the resolved path is missing, and it is what answers where the logs are: {b}"
+    );
+    assert!(
+        !text.contains("0.0.0-should-not-appear"),
+        "a second init announced a run it did not start:\n{text}"
     );
 
     let first: serde_json::Value = serde_json::from_str(lines[1]).expect("line 2 is not JSON");
