@@ -329,32 +329,52 @@ mod tests {
     /// The Settings HOME moved into `commands.rs` (§7.2 amendment). While it
     /// lived here too, typing "settings" produced two rows opening the same
     /// destination — one from this catalog and one from the AppsFolder.
-    /// Every Control Panel canonical name in the catalog must be one this
-    /// machine actually registers.
+    /// Canonical names that real Windows installations may legitimately not
+    /// register, so their absence is not a typo.
     ///
-    /// `control.exe /name <canonical>` is the launch contract, so a name
-    /// Windows does not know is a row that opens nothing — and it fails
-    /// silently, because the launch is a fire-and-forget shell execute. The
-    /// catalog shipped `Microsoft.TaskbarAndStartMenu`, which does not exist;
-    /// the registered name is `Microsoft.Taskbar`.
+    /// The catalog is deliberately a superset: it gates on build number and
+    /// hardware, not on SKU, and a row whose item is missing resolves to no
+    /// icon and keeps its glyph. This list exists so that absence has to be
+    /// *claimed* rather than assumed — adding a name here is a deliberate act
+    /// with a reason attached, which is what keeps the check below able to
+    /// catch a misspelling.
+    const SKU_OPTIONAL: &[&str] = &[
+        // Backup and Restore is a consumer feature; absent on Windows Server,
+        // which is what GitHub's windows-latest runner is. Present on the
+        // desktop builds YSpot targets.
+        "Microsoft.BackupAndRestore",
+    ];
+
+    /// A Control Panel canonical name must be one Windows actually knows.
     ///
-    /// This reads the live registry, so it is machine-dependent by design:
-    /// a name absent on a future Windows should fail here rather than in a
-    /// user's hands.
+    /// `control.exe /name <canonical>` is the launch contract, so a name that
+    /// exists nowhere is a row that opens nothing — and it fails silently,
+    /// because the launch is a fire-and-forget shell execute. The catalog
+    /// shipped `Microsoft.TaskbarAndStartMenu`, which is not a real name; the
+    /// registered one is `Microsoft.Taskbar`.
+    ///
+    /// This reads the live registry, so it is machine-dependent on purpose.
+    /// The first version of it asserted that EVERY name resolves here, which
+    /// was wrong in a way worth recording: it passed on the author's desktop
+    /// and failed in CI on `Microsoft.BackupAndRestore`, a consumer feature
+    /// the Server runner does not have. Absence is legitimate; a name that is
+    /// absent *and* unclaimed is the bug.
     #[test]
-    fn every_control_panel_canonical_name_is_registered_on_this_machine() {
+    fn every_control_panel_canonical_name_is_real() {
         let c = catalog();
         let mut missing = Vec::new();
         for e in &c.entries {
             if let Launch::ControlPanel(canonical) = &e.launch {
-                if crate::control_panel::clsid(canonical).is_none() {
+                if crate::control_panel::clsid(canonical).is_none()
+                    && !SKU_OPTIONAL.contains(&canonical.as_str())
+                {
                     missing.push(format!("{} ({canonical})", e.id));
                 }
             }
         }
         assert!(
             missing.is_empty(),
-            "these rows name a Control Panel item Windows does not register,              so they open nothing: {missing:?}"
+            "these rows name a Control Panel item this Windows does not              register, so they open nothing. If the name is right and this              SKU simply lacks the feature, add it to SKU_OPTIONAL with a              reason: {missing:?}"
         );
     }
 
