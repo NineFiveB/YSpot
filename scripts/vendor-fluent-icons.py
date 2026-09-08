@@ -5,7 +5,8 @@ the mapping tables in the spec, fetches each icon at a PINNED upstream commit,
 asserts the file is the shape the renderer assumes, and emits
 `apps/shell/src/lib/fluentGlyphs.ts`.
 
-Why fetch rather than transcribe: 99 path strings copied by hand is 99 chances
+Why fetch rather than transcribe: a hundred path strings copied by hand is a
+hundred chances
 to corrupt one silently, and a corrupted path renders as a plausible-looking
 wrong drawing rather than an error. The assertions in `extract` are the other
 half of that — an icon whose upstream shape changes announces itself here
@@ -104,7 +105,11 @@ def keys_from_spec(spec: str):
     for row in re.findall(r"^\|.*\|$", spec, re.M):
         cells = [c.strip() for c in row.strip("|").split("|")]
         for c in cells:
-            m = re.fullmatch(r"`([a-z0-9_]+)`", c)
+            # Bold is allowed around the cell: the spec emphasises a few keys,
+            # and requiring a bare `key` silently dropped `cloud_arrow_up`
+            # from the first vendoring run. A parser that quietly returns
+            # fewer rows than the source names is the worst kind.
+            m = re.fullmatch(r"\*{0,2}`([a-z0-9_]+)`\*{0,2}", c)
             if m and not m.group(1).startswith("ms_"):
                 found.append(m.group(1))
     # Preserve first-seen order for a stable diff, then sort at emit time.
@@ -139,6 +144,8 @@ def main() -> int:
         return 2
     spec = io.open(sys.argv[1], encoding="utf-8").read()
     keys = keys_from_spec(spec)
+    # Row-kind names appear in the same tables and are not icon keys.
+    keys = [k for k in keys if k not in {"app", "calc", "command", "file", "setting", "icon"}]
     print(f"{len(keys)} distinct icon keys named in the spec")
 
     glyphs, failed = {}, []

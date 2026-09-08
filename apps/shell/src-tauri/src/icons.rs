@@ -325,6 +325,73 @@ mod tests {
         );
     }
 
+    /// Diagnostic: which installed apps have no extractable icon?
+    ///
+    /// Ignored because it walks the whole AppsFolder and takes seconds, and
+    /// because the answer is a property of the machine rather than the code.
+    /// Run it when a row shows the fallback mark and you want to know whether
+    /// that is this code or that app:
+    ///
+    ///     cargo test -p yspot-shell --lib missing_app_icons -- --ignored --nocapture
+    #[test]
+    #[ignore = "diagnostic: walks every installed app; run explicitly"]
+    fn missing_app_icons() {
+        let _sta = Apartment::sta();
+        let cat = crate::apps::AppCatalog::new();
+        cat.refresh_async();
+        let mut apps = Vec::new();
+        for _ in 0..150 {
+            std::thread::sleep(Duration::from_millis(100));
+            apps = cat.snapshot().as_ref().clone();
+            if !apps.is_empty() {
+                break;
+            }
+        }
+        assert!(!apps.is_empty(), "the app catalog never populated");
+
+        let mut failed = Vec::new();
+        let mut by_bitmap: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for a in &apps {
+            let name = format!("shell:AppsFolder\\{}", a.aumid);
+            match extract_png(&name, 32) {
+                Err(e) => failed.push((a.name.clone(), a.aumid.clone(), e)),
+                // An icon can come back GENERIC rather than absent, with no
+                // error at all — that is how the blank-page bitmap slipped
+                // past the Control Panel lookup. Two apps sharing a bitmap
+                // means at least one is wearing a stand-in.
+                Ok(png) => by_bitmap
+                    .entry(fnv1a(&png))
+                    .or_default()
+                    .push(a.name.clone()),
+            }
+        }
+
+        println!("
+{} apps, {} without an extractable icon
+", apps.len(), failed.len());
+        for (name, aumid, err) in &failed {
+            println!("  {name}");
+            println!("      aumid: {aumid}");
+            println!("      why:   {err}");
+        }
+        if failed.is_empty() {
+            println!("  (none)");
+        }
+
+        let mut shared: Vec<_> = by_bitmap.values().filter(|v| v.len() > 1).collect();
+        shared.sort_by_key(|v| std::cmp::Reverse(v.len()));
+        println!("
+{} groups of apps sharing one bitmap:
+", shared.len());
+        for group in &shared {
+            println!("  {} apps: {}", group.len(), group.join(", "));
+        }
+        if shared.is_empty() {
+            println!("  (none — every app has its own icon)");
+        }
+    }
+
     #[test]
     fn extracts_an_icon_for_a_real_app() {
         let _sta = Apartment::sta();
