@@ -24,7 +24,7 @@ import { LIST_HEIGHT, ROW_HEIGHT, ResultsList } from "./components/ResultsList";
 import { actionsFor, primaryAction, shortcutAction } from "./lib/actions";
 import * as ipc from "./lib/ipc";
 import { announceText } from "./lib/announce";
-import { mergeRows, selectionIndex } from "./lib/merge";
+import { collapseSameName, mergeRows, selectionIndex } from "./lib/merge";
 import {
   markApplied,
   markKeydown,
@@ -38,7 +38,7 @@ const PAGE_ROWS = Math.max(1, Math.floor(LIST_HEIGHT / ROW_HEIGHT));
 /** Logical window heights per view (§5.3 scales these by the monitor's DPI). */
 const SEARCH_HEIGHT = 480;
 const SETTINGS_HEIGHT = 620;
-/** §7.3's inline cap on file rows in the root list (default 5). */
+/** §7.3's inline file candidates for the root list; KIND_CAPS.file displays 3. */
 const INLINE_FILE_CAP = 5;
 const CLIPBOARD_HEIGHT = 600;
 const ONBOARDING_HEIGHT = 520;
@@ -122,13 +122,11 @@ export default function App(): ReactElement {
 
   /** Recompute the display list and selection from the generation state. */
   const commit = useCallback((st: GenState) => {
-    // §7.3: inline file hits are capped so the root list stays scannable;
-    // the File Search command holds the full list. Top of the ranking, not
-    // first to arrive — batches land in score order within themselves only.
-    if (st.files.length > INLINE_FILE_CAP) {
-      st.files.sort((a, b) => b.score - a.score);
-      st.files.length = INLINE_FILE_CAP;
-    }
+    // §7.3: same-named hits collapse to the best one and the rest are capped,
+    // so the root list stays scannable; the File Search command holds the full
+    // list. Top of the ranking, not first to arrive — batches land in score
+    // order within themselves only.
+    st.files = collapseSameName(st.files, INLINE_FILE_CAP);
     const merged = mergeRows(st);
     mergedRef.current = merged;
     setRows(merged);

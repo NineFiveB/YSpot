@@ -841,6 +841,11 @@ fn execute_action(
         }
         "command" => match id.as_str() {
             "yspot.settings" => show_settings(&app).map(|()| false),
+            // §7.2: the Settings home, opened exactly as the catalog opened it
+            // before it moved into this list. Deliberately absent from
+            // `stays_open` above — it hands the user to another application,
+            // so the launcher gets out of the way first.
+            "windows.settings" => shell_open("ms-settings:").map(|()| true),
             "yspot.clipboard" => show_view(&app, "view:clipboard").map(|()| false),
             "yspot.files" => show_view(&app, "view:files").map(|()| false),
             "yspot.quit" => {

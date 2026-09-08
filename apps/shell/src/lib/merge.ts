@@ -41,6 +41,85 @@ export interface MergeInput {
   files: Row[];
   /** The order currently on screen, if the user has moved the selection. */
   frozen: Row[] | null;
+  /** The row the selection is stuck to, if any — never trimmed by a cap. */
+  selectedKey?: string | null;
+}
+
+/**
+ * Root-list display budget, per kind (§5.11 r4).
+ *
+ * Every source contributes its quota unconditionally — one calculator answer,
+ * eight apps, four settings pages, three commands, five windows and five files
+ * — twenty-six rows into a viewport that shows between eight and nine. So a
+ * query that legitimately matches five kinds pushed the answer the user
+ * actually typed for off the visible page.
+ *
+ * The per-source caps upstream are unchanged and are now candidate pools.
+ * This is the display budget, applied AFTER the global sort, so the survivors
+ * are the best of each kind and the relative order is untouched.
+ *
+ * The numbers: `calc` one, because there is only ever one answer. `command`
+ * two, because there are five built-ins and no query reaches three of them
+ * meaningfully. `setting` and `app` three, because a fourth was never the
+ * answer when the first three were not. `window` two, because a matching
+ * window is a shortcut rather than a search result. `file` three, tightening
+ * §7.3's cap, with the File Search view holding the full list. Fourteen rows
+ * worst case, down from twenty-six.
+ */
+export const KIND_CAPS: Record<Row["kind"], number> = {
+  calc: 1,
+  command: 2,
+  setting: 3,
+  app: 3,
+  window: 2,
+  file: 3,
+};
+
+/**
+ * Trim to the budget, keeping input order.
+ *
+ * Exempt rows are always kept and still COUNT against their kind, so the
+ * budget stays a real bound. Nothing a cap does may evict the row the user is
+ * standing on: if it did, `selectionIndex` would silently fall back to row 0
+ * and Enter would run something the user never selected (§5.11 r2).
+ */
+function capByKind(rows: Row[], exempt: ReadonlySet<string>): Row[] {
+  const used = new Map<Row["kind"], number>();
+  const out: Row[] = [];
+  for (const r of rows) {
+    const n = (used.get(r.kind) ?? 0) + 1;
+    used.set(r.kind, n);
+    if (n > KIND_CAPS[r.kind] && !exempt.has(r.key)) continue;
+    out.push(r);
+  }
+  return out;
+}
+
+function exemptSet(frozen: Row[] | null, selectedKey: string | null): ReadonlySet<string> {
+  const s = new Set<string>(frozen ? frozen.map((r) => r.key) : []);
+  if (selectedKey !== null) s.add(selectedKey);
+  return s;
+}
+
+/**
+ * Collapse same-named file rows to the best-scoring one (§7.3).
+ *
+ * The root list is for scanning. On the author's machine 101 directories
+ * under one user profile are named exactly `Settings`; they are one answer,
+ * not five rows.
+ *
+ * Root list ONLY. The File Search view must never call this: five files named
+ * `main.rs` in five projects are five different answers, and that view is
+ * where the full list lives.
+ */
+export function collapseSameName(files: Row[], cap: number): Row[] {
+  const best = new Map<string, Row>();
+  for (const f of files) {
+    const k = f.name.toLowerCase();
+    const cur = best.get(k);
+    if (!cur || f.score > cur.score) best.set(k, f);
+  }
+  return [...best.values()].sort(byScore).slice(0, cap);
 }
 
 /**
@@ -50,9 +129,11 @@ export interface MergeInput {
  * rows keep their positions and anything new is appended in score order
  * (§5.11 rule 3).
  */
-export function mergeRows({ apps, files, frozen }: MergeInput): Row[] {
+export function mergeRows({ apps, files, frozen, selectedKey = null }: MergeInput): Row[] {
   const all = [...apps, ...files].sort(byScore);
-  if (!frozen || frozen.length === 0) return all;
+  if (!frozen || frozen.length === 0) {
+    return capByKind(all, exemptSet(null, selectedKey));
+  }
   const seen = new Set(frozen.map((r) => r.key));
   const kept: Row[] = [];
   const byKey = new Map(all.map((r) => [r.key, r]));
@@ -64,7 +145,7 @@ export function mergeRows({ apps, files, frozen }: MergeInput): Row[] {
   for (const row of all) {
     if (!seen.has(row.key)) kept.push(row);
   }
-  return kept;
+  return capByKind(kept, exemptSet(frozen, selectedKey));
 }
 
 /**

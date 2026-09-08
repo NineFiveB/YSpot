@@ -91,6 +91,26 @@ pub struct AppMatch {
 /// Match `query` against the catalog: best `max` entries by score, ties by
 /// name. Pure and allocation-light — it runs inside the `search` command on
 /// every keystroke (§5.11: catalog sources answer in ~1 ms).
+/// `AppsFolder` rows that duplicate a built-in command's destination (§7.6).
+///
+/// The Settings app's AUMID opens exactly what the `windows.settings` command
+/// opens, and two rows both named "Settings" doing the same thing is the
+/// clutter this list exists to remove.
+///
+/// Suppression is by AUMID and never by name: an app the user installed that
+/// happens to be called "Settings" is a different thing and stays. If
+/// Microsoft ever changes this AUMID the filter silently stops matching and
+/// the duplicate row comes back — failing OPEN, which is the right direction
+/// for a filter the user cannot see.
+const SUPPRESSED_AUMIDS: &[&str] =
+    &["windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"];
+
+fn is_suppressed(aumid: &str) -> bool {
+    SUPPRESSED_AUMIDS
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(aumid))
+}
+
 pub fn match_query(entries: &[AppEntry], query: &str, max: usize) -> Vec<AppMatch> {
     let q = matcher::fold_query(query);
     if q.is_empty() || max == 0 {
@@ -98,6 +118,7 @@ pub fn match_query(entries: &[AppEntry], query: &str, max: usize) -> Vec<AppMatc
     }
     let mut hits: Vec<(f32, &AppEntry, Ranges)> = entries
         .iter()
+        .filter(|e| !is_suppressed(&e.aumid))
         .filter_map(|e| matcher::score(&e.target, &q).map(|(s, r)| (s, e, r)))
         .collect();
     hits.sort_by(|a, b| {
@@ -364,6 +385,36 @@ mod tests {
 
     fn entry(name: &str) -> AppEntry {
         AppEntry::new(format!("aumid:{name}"), name.to_string(), AppKind::Win32)
+    }
+
+    /// The Settings app's AUMID opens exactly what the `windows.settings`
+    /// command opens. Two rows named "Settings" doing the same thing is the
+    /// duplication this filter removes — but an app the USER installed that
+    /// happens to be called Settings is a different thing and must survive,
+    /// which is why the filter keys on the AUMID and never on the name.
+    #[test]
+    fn the_windows_settings_app_row_is_suppressed_as_a_duplicate() {
+        let entries = vec![
+            AppEntry::new(
+                SUPPRESSED_AUMIDS[0].to_string(),
+                "Settings".to_string(),
+                AppKind::Packaged,
+            ),
+            AppEntry::new(
+                "Contoso.Settings!App".to_string(),
+                "Settings".to_string(),
+                AppKind::Win32,
+            ),
+        ];
+        let hits = match_query(&entries, "settings", MAX_APP_RESULTS);
+        assert!(
+            hits.iter().all(|h| h.id != SUPPRESSED_AUMIDS[0]),
+            "the duplicate Settings row was not suppressed"
+        );
+        assert!(
+            hits.iter().any(|h| h.id == "Contoso.Settings!App"),
+            "suppression is by AUMID, never by name — a third-party app called              Settings must still be findable"
+        );
     }
 
     #[test]

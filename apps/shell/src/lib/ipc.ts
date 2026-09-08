@@ -80,6 +80,8 @@ export function onSearchFallback(
 export interface CommandItem {
   id: string;
   name: string;
+  /** "YSpot", or the destination for a command that opens another app. */
+  subtitle: string;
   score: number;
   matchRanges: [number, number][];
 }
@@ -221,7 +223,7 @@ export function commandRow(item: CommandItem): Row {
     key: `command:${item.id}`,
     id: item.id,
     name: item.name,
-    subtitle: "YSpot",
+    subtitle: item.subtitle,
     score: item.score,
     matchRanges: item.matchRanges,
   };

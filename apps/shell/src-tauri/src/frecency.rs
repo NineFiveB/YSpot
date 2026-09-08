@@ -22,7 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HALF_LIFE_DAYS: f64 = 7.0;
 /// Strictly below the 0.1 tier gap of §3.4's score scale.
-const MAX_BONUS: f32 = 0.09;
+pub const MAX_BONUS: f32 = 0.09;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Stat {

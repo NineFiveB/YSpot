@@ -12,7 +12,6 @@
     "launching a URI that silently lands on the Settings home page."
   ],
   "settings": [
-    { "id": "ms-settings:", "name": "Settings", "uri": "ms-settings:", "synonyms": ["windows settings", "control"] },
     { "id": "ms-settings:display", "name": "Display", "uri": "ms-settings:display", "synonyms": ["resolution", "scaling", "monitor", "brightness", "night light"] },
     { "id": "ms-settings:nightlight", "name": "Night light", "uri": "ms-settings:nightlight", "synonyms": ["blue light", "warm"] },
     { "id": "ms-settings:sound", "name": "Sound", "uri": "ms-settings:sound", "synonyms": ["audio", "volume", "speakers", "microphone", "output device"] },

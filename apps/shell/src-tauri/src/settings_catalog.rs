@@ -326,6 +326,18 @@ mod tests {
         SettingsCatalog::load(None, caps())
     }
 
+    /// The Settings HOME moved into `commands.rs` (§7.2 amendment). While it
+    /// lived here too, typing "settings" produced two rows opening the same
+    /// destination — one from this catalog and one from the AppsFolder.
+    #[test]
+    fn the_settings_home_is_not_in_the_data_catalog() {
+        let c = catalog();
+        assert!(
+            c.find("ms-settings:").is_none(),
+            "the Settings home is a built-in command now; a catalog entry for              it is a duplicate row"
+        );
+    }
+
     #[test]
     fn the_embedded_catalog_parses_and_is_substantial() {
         let c = SettingsCatalog::load(

@@ -5,7 +5,7 @@
 
 import { describe, expect, it } from "vitest";
 import type { Row } from "./ipc";
-import { byScore, mergeRows, selectionIndex } from "./merge";
+import { KIND_CAPS, byScore, collapseSameName, mergeRows, selectionIndex } from "./merge";
 
 const app = (name: string, score: number): Row => ({
   kind: "app",
@@ -143,5 +143,136 @@ describe("byScore", () => {
     expect(byScore(app("A", 0.5), file("b", 0.5))).toBeLessThan(0);
     expect(byScore(app("A", 0.5), app("B", 0.5))).toBeLessThan(0);
     expect(byScore(app("A", 0.5), app("A", 0.5))).toBe(0);
+  });
+});
+
+const command = (name: string, score: number): Row => ({
+  kind: "command",
+  key: `command:${name}`,
+  id: name,
+  name,
+  subtitle: "YSpot",
+  score,
+  matchRanges: [],
+});
+
+const setting = (name: string, score: number): Row => ({
+  kind: "setting",
+  key: `setting:${name}`,
+  id: name,
+  name,
+  subtitle: "Settings",
+  score,
+  matchRanges: [],
+});
+
+const win = (name: string, score: number): Row => ({
+  kind: "window",
+  key: `window:${name}`,
+  id: name,
+  name,
+  subtitle: "Window",
+  score,
+  matchRanges: [],
+});
+
+describe("KIND_CAPS", () => {
+  // Twenty-six rows could reach a viewport that shows between eight and nine,
+  // so a query matching five kinds pushed the answer the user typed for off
+  // the visible page. The caps are a display budget applied after the sort.
+  it("trims after the score sort, keeping the best of each kind", () => {
+    const files = Array.from({ length: 12 }, (_, i) => file(`f${i}.txt`, 0.99 - i * 0.01));
+    const rows = mergeRows({ apps: [], files, frozen: null });
+    expect(rows).toHaveLength(KIND_CAPS.file);
+    expect(rows.map((r) => r.score)).toEqual([0.99, 0.98, 0.97]);
+  });
+
+  it("never reorders what survives", () => {
+    const input = {
+      apps: [
+        command("Windows Settings", 1.3),
+        command("YSpot Settings", 1.3),
+        command("File Search", 1.3),
+        app("Settings Sync", 0.95),
+        app("SettingsGuru", 0.94),
+        app("Setup", 0.93),
+        app("Settle", 0.92),
+        setting("Display", 0.9),
+        setting("Bluetooth", 0.89),
+        setting("Network", 0.88),
+        setting("Storage", 0.87),
+        win("Settings — Chrome", 0.86),
+        win("Settings — Code", 0.85),
+        win("Settings — Slack", 0.84),
+      ],
+      files: Array.from({ length: 6 }, (_, i) => file(`s${i}.txt`, 0.8 - i * 0.01)),
+      frozen: null,
+    };
+    const capped = mergeRows(input);
+    const uncapped = [...input.apps, ...input.files].sort(byScore);
+    // Every surviving row appears in the uncapped order, in the same relative
+    // order: a subsequence walk, which a cap that reordered would fail.
+    let j = 0;
+    for (const r of capped) {
+      while (j < uncapped.length && uncapped[j].key !== r.key) j += 1;
+      expect(j, `${r.name} is out of order or missing`).toBeLessThan(uncapped.length);
+      j += 1;
+    }
+  });
+
+  // The sharp edge of the whole change. If a cap evicts the selected row,
+  // selectionIndex silently returns 0 and Enter runs something the user
+  // never chose — invisible in a build, a type check and a screenshot.
+  it("never drops the selected row (§5.11 r2)", () => {
+    const files = Array.from({ length: 12 }, (_, i) => file(`f${i}.txt`, 0.99 - i * 0.01));
+    const sel = files[7].key;
+    const rows = mergeRows({ apps: [], files, frozen: null, selectedKey: sel });
+    expect(rows.some((r) => r.key === sel)).toBe(true);
+    // The exempt row is kept AND counts, so the budget stays a real bound:
+    // three under the cap plus the one being stood on.
+    expect(rows).toHaveLength(KIND_CAPS.file + 1);
+    expect(selectionIndex(rows, sel)).toBe(KIND_CAPS.file);
+  });
+
+  it("keeps every frozen row, and counts them against the budget", () => {
+    const frozen = Array.from({ length: 5 }, (_, i) => file(`frozen${i}.txt`, 0.9 - i * 0.01));
+    const arriving = Array.from({ length: 5 }, (_, i) => file(`new${i}.txt`, 0.99 - i * 0.01));
+    const rows = mergeRows({ apps: [], files: [...frozen, ...arriving], frozen });
+    expect(rows.map((r) => r.key)).toEqual(frozen.map((r) => r.key));
+  });
+});
+
+describe("collapseSameName", () => {
+  // 101 directories under one user profile are named exactly "Settings".
+  // They are one answer, not five rows.
+  it("collapses same-named rows to the best-scoring one", () => {
+    const rows = collapseSameName(
+      [
+        { ...file("Settings", 0.8929), key: "file:0:a", subtitle: "C:\a\Settings" },
+        { ...file("Settings", 0.9091), key: "file:0:b", subtitle: "C:\b\Settings" },
+        { ...file("Settings", 0.8929), key: "file:0:c", subtitle: "C:\c\Settings" },
+        { ...file("Settings", 0.8929), key: "file:0:d", subtitle: "C:\d\Settings" },
+        file("settings.json", 0.8491),
+      ],
+      5,
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows[0].subtitle).toBe("C:\b\Settings");
+    expect(rows[1].name).toBe("settings.json");
+  });
+
+  it("keeps distinct names, in score order", () => {
+    const rows = collapseSameName(
+      [file("e.rs", 0.5), file("a.rs", 0.9), file("c.rs", 0.7), file("b.rs", 0.8), file("d.rs", 0.6)],
+      5,
+    );
+    expect(rows.map((r) => r.name)).toEqual(["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"]);
+  });
+
+  // Case-insensitive, because the filesystem is.
+  it("treats names as case-insensitive", () => {
+    const rows = collapseSameName([file("Settings", 0.9), { ...file("SETTINGS", 0.8), key: "file:0:z" }], 5);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].score).toBe(0.9);
   });
 });

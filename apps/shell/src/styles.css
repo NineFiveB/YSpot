@@ -126,8 +126,14 @@ body {
   content: "";
 }
 
-.row-icon-file {
-  display: none;
+/* Every kind now draws something in the box, so the name column lines up
+   down the whole list. The mark is quieter than the text it labels. */
+.row-icon svg {
+  color: var(--muted);
+}
+
+.row-selected .row-icon svg {
+  color: var(--fg);
 }
 
 .row-text {

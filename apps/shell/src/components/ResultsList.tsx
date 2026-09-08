@@ -89,6 +89,33 @@ function renderHighlighted(
   return out;
 }
 
+/**
+ * One monochrome mark per row kind.
+ *
+ * Apps keep their real extracted icon (§7.1); every other kind gets a 16 px
+ * stroke drawing in the same 32 px box. Two things this fixes at once: file
+ * rows had `display: none` on their icon box, so their names started 42 px to
+ * the left of every other row's, and seven rows all reading "Settings" were
+ * visually identical with nothing but subtitle text to tell an app from a
+ * folder from a command.
+ *
+ * Stroke-only and `currentColor`, so both themes and `forced-colors: active`
+ * (§5.12) are correct with no palette of its own, and no state is conveyed by
+ * colour. Static markup: no measurement and no layout read (§5.10).
+ */
+const KIND_GLYPH: Record<Exclude<Row["kind"], "app">, string> = {
+  // A page with a folded corner.
+  file: "M4.5 2.5h4l3 3v8h-7z M8.5 2.5v3h3",
+  // Two sliders.
+  setting: "M3 5h10 M3 11h10 M5 3.5h2v3h-2z M9 9.5h2v3h-2z",
+  // A shell prompt: chevron and a line.
+  command: "M3.5 4.5l3 3-3 3 M8.5 11.5h4",
+  // A titled window.
+  window: "M2.5 3.5h11v9h-11z M2.5 6.5h11",
+  // An equals sign.
+  calc: "M4 6.5h8 M4 9.5h8",
+};
+
 interface RowProps {
   item: Row;
   index: number;
@@ -115,7 +142,22 @@ const ResultRow = memo(function ResultRow({
       onClick={() => onActivate(index)}
     >
       <div className={`row-icon row-icon-${item.kind}`} aria-hidden="true">
-        {icon ? <img src={icon} alt="" width={ICON_LOGICAL_PX} height={ICON_LOGICAL_PX} /> : null}
+        {icon ? (
+          <img src={icon} alt="" width={ICON_LOGICAL_PX} height={ICON_LOGICAL_PX} />
+        ) : item.kind === "app" ? null : (
+          <svg
+            viewBox="0 0 16 16"
+            width="16"
+            height="16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.25"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <path d={KIND_GLYPH[item.kind]} />
+          </svg>
+        )}
       </div>
       <div className="row-text">
         <div className="row-name">{renderHighlighted(item.name, item.matchRanges)}</div>
