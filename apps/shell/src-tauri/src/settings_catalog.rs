@@ -329,6 +329,35 @@ mod tests {
     /// The Settings HOME moved into `commands.rs` (§7.2 amendment). While it
     /// lived here too, typing "settings" produced two rows opening the same
     /// destination — one from this catalog and one from the AppsFolder.
+    /// Every Control Panel canonical name in the catalog must be one this
+    /// machine actually registers.
+    ///
+    /// `control.exe /name <canonical>` is the launch contract, so a name
+    /// Windows does not know is a row that opens nothing — and it fails
+    /// silently, because the launch is a fire-and-forget shell execute. The
+    /// catalog shipped `Microsoft.TaskbarAndStartMenu`, which does not exist;
+    /// the registered name is `Microsoft.Taskbar`.
+    ///
+    /// This reads the live registry, so it is machine-dependent by design:
+    /// a name absent on a future Windows should fail here rather than in a
+    /// user's hands.
+    #[test]
+    fn every_control_panel_canonical_name_is_registered_on_this_machine() {
+        let c = catalog();
+        let mut missing = Vec::new();
+        for e in &c.entries {
+            if let Launch::ControlPanel(canonical) = &e.launch {
+                if crate::control_panel::clsid(canonical).is_none() {
+                    missing.push(format!("{} ({canonical})", e.id));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these rows name a Control Panel item Windows does not register,              so they open nothing: {missing:?}"
+        );
+    }
+
     #[test]
     fn the_settings_home_is_not_in_the_data_catalog() {
         let c = catalog();
