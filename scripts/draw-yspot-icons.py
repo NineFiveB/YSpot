@@ -12,22 +12,29 @@ to look the same visual size as its neighbours. Drawing an original shape to a
 published grid is what a published grid is for. Nothing is copied from that
 file -- these drawings are YSpot's, under YSpot's licence.
 
-The output is a single filled path per icon, wound so that holes are holes
-under the default nonzero fill rule: no fill-rule attribute, no strokes,
-because that is exactly what the renderer applies and what
-vendor-fluent-icons.py asserts about every other glyph in the set.
+The set we vendor is the Regular style: outlines at a 1px stroke, shipped as a
+single filled path because the stroke has been outlined before export. So
+these are drawn the same way -- a centreline, offset half a stroke either side,
+emitted as a ring. The first version of both icons was a solid silhouette
+instead, which is a different family: side by side with the vendored icons at
+32px it read markedly heavier, which is the whole thing the grid exists to
+prevent. `--compare` puts them next to their neighbours so that is checkable
+rather than remembered.
 
 Usage:
     python scripts/draw-yspot-icons.py                   check and report
     python scripts/draw-yspot-icons.py --emit            write the TS module
     python scripts/draw-yspot-icons.py --preview p.html  a sheet to look at
+    python scripts/draw-yspot-icons.py --compare c.html  beside the vendored set
 """
 
 import io
 import math
+import re
 import sys
 
 OUT = "apps/shell/src/lib/yspotGlyphs.ts"
+VENDORED = "apps/shell/src/lib/fluentGlyphs.ts"
 
 # --- path building -------------------------------------------------------
 #
@@ -96,6 +103,15 @@ def corner(p0, p3, centre):
     and the inside corner of an L.
     """
     r = math.hypot(p0[0] - centre[0], p0[1] - centre[1])
+    r3 = math.hypot(p3[0] - centre[0], p3[1] - centre[1])
+    # Both ends must be the same distance from the centre or this is not an
+    # arc, and what comes out is a lopsided curve that still offsets to a
+    # clean 1px stroke -- so the stroke check cannot see it. The shield's
+    # top-left corner was built this way, 1.5 across and 2.5 down, and the
+    # only symptom was that the two shoulders did not match.
+    if abs(r - r3) > 1e-6:
+        raise ValueError("corner %s -> %s about %s is not an arc: radii %.4f "
+                         "and %.4f" % (p0, p3, centre, r, r3))
     a0 = math.atan2(p0[1] - centre[1], p0[0] - centre[0])
     a1 = math.atan2(p3[1] - centre[1], p3[0] - centre[0])
     while a1 - a0 > math.pi:
@@ -155,6 +171,170 @@ def bracket(x0, y0, x1, y1, t, r_out, r_in, r_cap):
     ]
 
 
+# --- turning a centreline into an outline --------------------------------
+#
+# The Regular style is a 1px stroke, and the renderer only fills, so a stroke
+# has to be emitted as the ring between two offset copies of its centreline.
+# For a rounded rectangle the offset is exact -- inset the box by the stroke
+# and the radius with it -- so outlined_rect does that directly. For the
+# shield it is Tiller-Hanson: offset each leg of a segment's control polygon
+# along that leg's own normal and intersect neighbours for the new handles.
+# That is an approximation, so check_stroke_width measures the result rather
+# than trusting it.
+
+def _at(p0, c1, c2, p3, t):
+    u = 1.0 - t
+    return u * u * u * p0 + 3 * u * u * t * c1 + 3 * u * t * t * c2 + t * t * t * p3
+
+
+def _point(seg, t):
+    p0, c1, c2, p3 = seg
+    if c1 is None:
+        return (p0[0] + (p3[0] - p0[0]) * t, p0[1] + (p3[1] - p0[1]) * t)
+    return (_at(p0[0], c1[0], c2[0], p3[0], t),
+            _at(p0[1], c1[1], c2[1], p3[1], t))
+
+
+def _sample(segs, steps):
+    return [_point(s, i / float(steps)) for s in segs for i in range(steps)]
+
+
+def _unit(a, b):
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    n = math.hypot(dx, dy)
+    return None if n < 1e-12 else (dx / n, dy / n)
+
+
+def _normal(u):
+    return (u[1], -u[0])
+
+
+def _shift(p, n, d):
+    return (p[0] + n[0] * d, p[1] + n[1] * d)
+
+
+def _meet(a0, a1, b0, b1, fallback):
+    """Where line a0-a1 meets b0-b1, or fallback if they are parallel."""
+    d1 = (a1[0] - a0[0], a1[1] - a0[1])
+    d2 = (b1[0] - b0[0], b1[1] - b0[1])
+    den = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(den) < 1e-9:
+        return fallback
+    t = ((b0[0] - a0[0]) * d2[1] - (b0[1] - a0[1]) * d2[0]) / den
+    return (a0[0] + d1[0] * t, a0[1] + d1[1] * t)
+
+
+def _as_cubic(seg):
+    p0, c1, c2, p3 = seg
+    if c1 is not None:
+        return seg
+    third = ((p3[0] - p0[0]) / 3.0, (p3[1] - p0[1]) / 3.0)
+    return (p0, (p0[0] + third[0], p0[1] + third[1]),
+            (p3[0] - third[0], p3[1] - third[1]), p3)
+
+
+def _split(seg):
+    """de Casteljau at the midpoint. Lines split as lines."""
+    p0, c1, c2, p3 = seg
+    if c1 is None:
+        mid = ((p0[0] + p3[0]) / 2.0, (p0[1] + p3[1]) / 2.0)
+        return [line(p0, mid), line(mid, p3)]
+    mid2 = lambda a, b: ((a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0)
+    a, b, c = mid2(p0, c1), mid2(c1, c2), mid2(c2, p3)
+    d, e = mid2(a, b), mid2(b, c)
+    m = mid2(d, e)
+    return [(p0, a, d, m), (m, e, c, p3)]
+
+
+def _offset_one(seg, d):
+    """Tiller-Hanson on a single segment."""
+    p0, c1, c2, p3 = seg
+    if c1 is None:
+        u = _unit(p0, p3)
+        if u is None:
+            return None
+        n = _normal(u)
+        return line(_shift(p0, n, d), _shift(p3, n, d))
+    # Collapse a degenerate leg onto its neighbour so the normal exists.
+    u1 = _unit(p0, c1) or _unit(p0, c2) or _unit(p0, p3)
+    u3 = _unit(c2, p3) or _unit(c1, p3) or _unit(p0, p3)
+    if u1 is None or u3 is None:
+        return None
+    u2 = _unit(c1, c2) or u1
+    n1, n2, n3 = _normal(u1), _normal(u2), _normal(u3)
+    a0, a1 = _shift(p0, n1, d), _shift(c1, n1, d)
+    b0, b1 = _shift(c1, n2, d), _shift(c2, n2, d)
+    e0, e1 = _shift(c2, n3, d), _shift(p3, n3, d)
+    return (a0, _meet(a0, a1, b0, b1, a1), _meet(b0, b1, e0, e1, e0), e1)
+
+
+def _offset_error(seg, off, d):
+    """Worst gap between a segment and its offset, against |d|."""
+    dense = [_point(off, i / 24.0) for i in range(25)]
+    worst = 0.0
+    for i in range(1, 12):
+        q = _point(seg, i / 12.0)
+        near = min(math.hypot(q[0] - r[0], q[1] - r[1]) for r in dense)
+        worst = max(worst, abs(near - abs(d)))
+    return worst
+
+
+def offset_segs(segs, d, tol=0.01, depth=5):
+    """Offset a path by d, positive to the side _normal points.
+
+    Tiller-Hanson is exact only for a straight leg, and on the shield's long
+    bottom curves one segment came out 0.135 wide of a 1px stroke. So each
+    segment is halved until its own offset measures right, which costs a few
+    extra cubics on the curves and nothing at all on the straights.
+    """
+    out = []
+    for seg in segs:
+        pieces = [seg]
+        for _ in range(depth):
+            offs = [_offset_one(p, d) for p in pieces]
+            if any(o is None for o in offs):
+                break
+            if max(_offset_error(p, o, d) for p, o in zip(pieces, offs)) <= tol:
+                break
+            pieces = [q for p in pieces for q in _split(p)]
+        for p in pieces:
+            o = _offset_one(p, d)
+            if o is not None:
+                out.append(o)
+    return out
+
+
+def signed_area(segs, steps=24):
+    pts = _sample(segs, steps)
+    a = 0.0
+    for i in range(len(pts)):
+        x0, y0 = pts[i]
+        x1, y1 = pts[(i + 1) % len(pts)]
+        a += x0 * y1 - x1 * y0
+    return a / 2.0
+
+
+def outlined(segs, w):
+    """A closed centreline as the ring between its two offsets.
+
+    Returns (outer, inner-reversed). Which offset is outside depends on the
+    winding, so it is decided by area rather than by a sign convention that
+    would be one more thing to get backwards.
+    """
+    a = offset_segs(segs, w / 2.0)
+    b = offset_segs(segs, -w / 2.0)
+    if abs(signed_area(a)) < abs(signed_area(b)):
+        a, b = b, a
+    return a, reverse(b)
+
+
+def outlined_rect(x, y, w, h, r, t):
+    """An outlined rounded rectangle. Exact: the inset of a rounded rect is
+    a rounded rect, with the radius inset too."""
+    return (rounded_rect(x, y, w, h, r),
+            reverse(rounded_rect(x + t, y + t, w - 2 * t, h - 2 * t, r - t)))
+
+
 def fmt(v):
     s = ("%.3f" % v).rstrip("0").rstrip(".")
     return "0" if s in ("", "-0") else s
@@ -179,13 +359,15 @@ def emit(subpaths):
 #
 # A subpath wound against the outline is a hole ONLY where it overlaps one.
 # Outside, its winding is -1, which is still non-zero, which still fills. So
-# "cut this shape but not that one" cannot be said in a single path: the first
+# "cut this shape but not that one" cannot be said in a single path: an early
 # draft of the backup icon subtracted a rounded rect meant for the plate
 # behind, and it ate the plate in front and inverted the arrow. At 16 and 32px
 # that looked plausible. It only became obvious at 240px.
 #
 # Hence the hole check below, and hence a plate behind drawn as a bracket that
 # never enters the one in front, rather than a full plate cut down to size.
+
+STROKE = 1.0  # the Regular weight at 20, from the stroke chart
 
 
 def solid(segs):
@@ -196,55 +378,72 @@ def hole(segs):
     return (reverse(segs), True)
 
 
-def shield_outline():
-    """Portrait keyline: 12 wide by 16 tall at 4,2. Clockwise."""
+def ring(pair):
+    outer, inner = pair
+    return [solid(outer), (inner, True)]
+
+
+def shield_centreline():
+    """Portrait keyline: the stroke's centreline, 11 x 15 at 4.5, 2.5.
+
+    Tangent-continuous at every joint, including the nose, because a kink
+    would open a hairline gap where the two offsets meet.
+    """
+    # The nose tangent, and the handle lengths that meet it.
+    tx, ty = -0.9439, 0.3304
+    reach, nose = 3.1, 0.18
+    right = (10.0 - tx * reach, 17.44 - ty * reach)   # handle into the nose
+    left = (10.0 + tx * reach, 17.44 - ty * reach)    # its mirror
     return [
-        line((5.5, 2), (14.5, 2)),
-        ((14.5, 2), (15.33, 2), (16, 2.67), (16, 3.5)),
-        line((16, 3.5), (16, 9.8)),
-        ((16, 9.8), (16, 13.6), (13.4, 16.85), (10.3, 17.95)),
-        ((10.3, 17.95), (10.1, 18.02), (9.9, 18.02), (9.7, 17.95)),
-        ((9.7, 17.95), (6.6, 16.85), (4, 13.6), (4, 9.8)),
-        line((4, 9.8), (4, 3.5)),
-        ((4, 3.5), (4, 2.67), (4.67, 2), (5.5, 2)),
+        line((7.0, 2.5), (13.0, 2.5)),
+        corner((13.0, 2.5), (15.5, 5.0), (13.0, 5.0)),
+        line((15.5, 5.0), (15.5, 9.6)),
+        ((15.5, 9.6), (15.5, 13.0), (right[0], right[1]), (10.28, 17.44)),
+        ((10.28, 17.44), (10.28 + tx * nose, 17.44 + ty * nose),
+         (9.72 - tx * nose, 17.44 + ty * nose), (9.72, 17.44)),
+        ((9.72, 17.44), (left[0], left[1]), (4.5, 13.0), (4.5, 9.6)),
+        line((4.5, 9.6), (4.5, 5.0)),
+        corner((4.5, 5.0), (7.0, 2.5), (7.0, 5.0)),
     ]
 
 
 def window_panes(x, y, side, gutter, r):
-    """Two by two, knocked out. side must stay at or above the 1.5 minimum."""
+    """Two by two, filled, inside an outlined shape. side stays at or above
+    the 1.5 minimum feature."""
     step = side + gutter
-    return [hole(rounded_rect(x + dx * step, y + dy * step, side, side, r))
+    return [solid(rounded_rect(x + dx * step, y + dy * step, side, side, r))
             for dy in (0, 1) for dx in (0, 1)]
 
 
 SHAPES = {}
 
-# Windows Security: a shield on the portrait keyline carrying the four-pane
-# window. The set already has shield, shield_checkmark, shield_keyhole,
-# lock_shield and globe_shield, all spoken for by other rows, so a plain
-# shield would have swapped one duplicate for another. The panes are what make
-# this one Windows Security rather than security in general.
+# Windows Security: an outlined shield carrying the four-pane window, the way
+# shield_keyhole carries a filled keyhole. The set already has shield,
+# shield_checkmark, shield_keyhole, lock_shield and globe_shield, all spoken
+# for by other rows, so a plain shield would have swapped one duplicate for
+# another. The panes are what make this one Windows Security rather than
+# security in general.
 SHAPES["yspot_windows_shield"] = (
-    [solid(shield_outline())] + window_panes(6.5, 4.5, 2.75, 1.5, 0.5))
+    ring(outlined(shield_centreline(), STROKE))
+    + window_panes(7.0, 5.75, 2.0, 1.5, 0.4))
 
-# Windows Backup: a plate with a clockwise arrow knocked out of it, the
-# restore, and a bracket behind it, the copy it restores from. The arrowhead
-# is the widest point of the knockout and leaves 1.55 of plate outside it; the
-# bracket is 2 thick and clears the plate by 1.5. Both are above the minimum.
+# Windows Backup: an outlined plate with a clockwise arrow inside it, the
+# restore, and the top and right edges of a second plate behind it, the copy
+# it restores from. The plate behind is offset 3.5, so a 1 stroke leaves a
+# 2.5 gap on both sides.
 #
 # Four other drawings were tried and thrown away, which is worth recording so
 # the next person does not retry them. A box with a down arrow reads as
 # "download". An arrow ring around the four panes, and a stack with the arrow
-# demoted to a corner modifier badge, both turned to mush below 32px. A plain
-# rounded plate with the arrow and nothing behind it is clean, but says
-# "refresh", and its silhouette is the same rounded square a dozen icons in the
-# set already have -- the bracket is what gives this one a shape of its own at
-# a glance, which is what separates two rows in a list.
-SHAPES["yspot_backup_restore"] = [
-    solid(bracket(5.5, 2, 18, 14.5, 2, 3, 1, 1)),
-    solid(rounded_rect(2, 5.5, 12.5, 12.5, 3)),
-    hole(clockwise_arrow(8.25, 11.75, 3.0, 1.7, 258, 338, 1.7, 2.8)),
-]
+# demoted to a corner modifier badge, both turned to mush below 32px. A plate
+# with the arrow and nothing behind it is clean, but says "refresh", and its
+# silhouette is the same rounded square a dozen icons in the set already have
+# -- the sheet behind is what gives this one a shape of its own at a glance,
+# which is what separates two rows in a list.
+SHAPES["yspot_backup_restore"] = (
+    [solid(bracket(5.5, 2, 18, 14.5, STROKE, 3, 2, 0.5))]
+    + ring(outlined_rect(2, 5.5, 12.5, 12.5, 3, STROKE))
+    + [solid(clockwise_arrow(8.25, 11.75, 2.9, STROKE, 258, 338, 1.35, 2.3))])
 
 
 # --- checks --------------------------------------------------------------
@@ -253,9 +452,8 @@ def _cubic_extrema(p0, c1, c2, p3):
     """Parameters in (0,1) where a cubic turns, on one axis.
 
     The hull of the four control points would be simpler and is a valid outer
-    bound, but it is not tight: the shield's tip has handles 0.02 past the live
-    edge while the curve itself stops 0.0025 short of it. A check that fails on
-    a shape that is fine gets switched off, so this solves the derivative.
+    bound, but it is not tight, and a check that fails on a shape that is fine
+    gets switched off. So this solves the derivative.
     """
     ts = []
     a = -p0 + 3 * c1 - 3 * c2 + p3
@@ -272,11 +470,6 @@ def _cubic_extrema(p0, c1, c2, p3):
     return [t for t in ts if 0.0 < t < 1.0]
 
 
-def _cubic_at(p0, c1, c2, p3, t):
-    u = 1.0 - t
-    return u * u * u * p0 + 3 * u * u * t * c1 + 3 * u * t * t * c2 + t * t * t * p3
-
-
 def bbox(segs):
     """Exact bounding box of one subpath."""
     xs, ys = [], []
@@ -288,7 +481,7 @@ def bbox(segs):
         for i, acc in ((0, xs), (1, ys)):
             a, b, c, d = p0[i], c1[i], c2[i], p3[i]
             for t in _cubic_extrema(a, b, c, d):
-                acc.append(_cubic_at(a, b, c, d, t))
+                acc.append(_at(a, b, c, d, t))
     return min(xs), min(ys), max(xs), max(ys)
 
 
@@ -302,9 +495,61 @@ LIVE = (2.0, 2.0, 18.0, 18.0)
 SLACK = 0.01
 
 
-def inside(inner, outer):
-    return (inner[0] >= outer[0] - SLACK and inner[1] >= outer[1] - SLACK
-            and inner[2] <= outer[2] + SLACK and inner[3] <= outer[3] + SLACK)
+def inside(inner, outer, slack=SLACK):
+    return (inner[0] >= outer[0] - slack and inner[1] >= outer[1] - slack
+            and inner[2] <= outer[2] + slack and inner[3] <= outer[3] + slack)
+
+
+def _dist_to_polyline(p, pts):
+    """Distance to the polyline through pts, treated as a closed loop.
+
+    Measuring to the nearest sampled POINT instead of the nearest segment
+    reports the sampling chord as if it were error: on a 7-long straight edge
+    at 12 samples that alone read 0.078, which is most of a tolerance.
+    """
+    best = float("inf")
+    n = len(pts)
+    for i in range(n):
+        a, b = pts[i], pts[(i + 1) % n]
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = dx * dx + dy * dy
+        if L < 1e-18:
+            t = 0.0
+        else:
+            t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+        qx, qy = a[0] + dx * t, a[1] + dy * t
+        best = min(best, math.hypot(p[0] - qx, p[1] - qy))
+    return best
+
+
+def check_stroke_width(centreline, outer, inner, want, tol=0.02):
+    """How far the offset drifted from the stroke it is meant to be.
+
+    Tiller-Hanson is an approximation. Measuring it costs nothing and turns
+    "this should be about 1px" into a number that can go red.
+    """
+    outs, ins = _sample(outer, 10), _sample(inner, 10)
+    worst = 0.0
+    for p in _sample(centreline, 10):
+        d = min(_dist_to_polyline(p, outs), _dist_to_polyline(p, ins))
+        worst = max(worst, abs(d - want / 2.0))
+    return worst if worst > tol else 0.0
+
+
+def check_symmetry(segs, axis=10.0, tol=0.01):
+    """Worst distance from the shape to its own mirror image.
+
+    The corner assertion catches a corner that is not an arc. This catches
+    the rest: a shape meant to be symmetric that is quietly lopsided reads as
+    "slightly off" and is very hard to see at 20px.
+    """
+    pts = _sample(segs, 12)
+    mirror = [(2 * axis - x, y) for x, y in pts]
+    worst = 0.0
+    for p in mirror:
+        worst = max(worst, _dist_to_polyline(p, pts))
+    return worst if worst > tol else 0.0
 
 
 def check():
@@ -331,6 +576,16 @@ def check():
                 bad.append("%s: hole %s sits outside every solid, so it fills "
                            "instead of cutting"
                            % (name, tuple(round(v, 3) for v in h)))
+    shield = shield_centreline()
+    lop = check_symmetry(shield)
+    if lop:
+        bad.append("yspot_windows_shield: the shield is %.3f off symmetric "
+                   "about x=10" % lop)
+    o, i = outlined(shield, STROKE)
+    drift = check_stroke_width(shield, o, reverse(i), STROKE)
+    if drift:
+        bad.append("yspot_windows_shield: the offset drifts %.3f from a %s "
+                   "stroke" % (drift, STROKE))
     return bad
 
 
@@ -350,8 +605,8 @@ HEADER = '''// YSpot's own icons -- drawn, not vendored.
 // Copyright (c) the YSpot authors, under YSpot's own licence. These are
 // original drawings. What they take from Microsoft's Fluent iconography is
 // its published grid -- a 20 box, a 2 margin, a 16 live area, the keylines
-// and the stroke chart, all recorded in docs/icon-grid.md -- so that they sit
-// beside the vendored set without looking like guests. A grid is a
+// and the 1px Regular stroke, all recorded in docs/icon-grid.md -- so that
+// they sit beside the vendored set without looking like guests. A grid is a
 // measurement, not artwork.
 //
 // GENERATED by scripts/draw-yspot-icons.py -- do not edit by hand.
@@ -369,41 +624,67 @@ def write_ts(path):
     io.open(path, "w", encoding="utf-8", newline="\n").write(HEADER + body + "};\n")
 
 
-PREVIEW = """<!doctype html>
-<meta charset="utf-8"><title>YSpot drawn icons</title>
+PAGE = """<!doctype html>
+<meta charset="utf-8"><title>{title}</title>
 <style>
- body{margin:0;font:13px system-ui;background:#f4f5f7;color:#1b1d21}
- .strip{padding:12px 16px}
- .strip.dark{background:#1c1e22;color:#e7e9ec}
- .row{display:flex;align-items:center;gap:26px;height:64px}
- .row b{width:190px;font-weight:600;font-size:12px}
- svg{display:block}
- .live{fill:none;stroke:#d33;stroke-width:.15;opacity:.55}
+ body{{margin:0;font:13px system-ui;background:#f4f5f7;color:#1b1d21}}
+ .strip{{padding:12px 16px}}
+ .strip.dark{{background:#1c1e22;color:#e7e9ec}}
+ .row{{display:flex;align-items:center;gap:26px;height:64px}}
+ .row b{{width:190px;font-weight:600;font-size:12px}}
+ .wrap{{display:flex;flex-wrap:wrap;gap:16px;width:660px}}
+ .cell{{text-align:center;width:76px}}
+ .cell span{{display:block;font-size:10px;opacity:.6;word-break:break-all}}
+ svg{{display:block;margin:0 auto}}
+ .live{{fill:none;stroke:#d33;stroke-width:.15;opacity:.55}}
 </style>
 {body}
 """
+
+
+def _svg(d, px, live=False):
+    guide = '<rect class="live" x="2" y="2" width="16" height="16"/>' if live else ""
+    return ('<svg width="%d" height="%d" viewBox="0 0 20 20" fill="currentColor">'
+            '%s<path d="%s"/></svg>' % (px, px, guide, d))
 
 
 def preview(path):
     def strip(dark, live):
         rows = []
         for name in sorted(ICONS):
-            cells = []
-            for px in (16, 20, 32, 48, 96):
-                guide = ('<rect class="live" x="2" y="2" width="16" height="16"/>'
-                         if live else "")
-                cells.append(
-                    '<svg width="%d" height="%d" viewBox="0 0 20 20" '
-                    'fill="currentColor">%s<path d="%s"/></svg>'
-                    % (px, px, guide, ICONS[name]))
-            rows.append('<div class="row"><b>%s</b>%s</div>'
-                        % (name, "".join(cells)))
+            cells = "".join(_svg(ICONS[name], px, live)
+                            for px in (16, 20, 32, 48, 96))
+            rows.append('<div class="row"><b>%s</b>%s</div>' % (name, cells))
         return '<div class="strip%s">%s</div>' % (" dark" if dark else "",
                                                   "".join(rows))
 
     io.open(path, "w", encoding="utf-8").write(
-        PREVIEW.replace("{body}",
-                        strip(False, False) + strip(True, False) + strip(False, True)))
+        PAGE.format(title="YSpot drawn icons",
+                    body=strip(False, False) + strip(True, False)
+                    + strip(False, True)))
+
+
+# Nearest neighbours in the vendored set: the shields these two must not be
+# mistaken for, and the icons whose weight they have to match.
+NEIGHBOURS = ["shield", "shield_checkmark", "shield_keyhole", "lock_shield",
+              "settings", "hard_drive", "archive", "arrow_sync", "history",
+              "folder"]
+
+
+def compare(path):
+    src = io.open(VENDORED, encoding="utf-8").read()
+    vendored = dict(re.findall(r'^  ([a-z0-9_]+): "([^"]+)",$', src, re.M))
+    rows = [(k, vendored[k]) for k in NEIGHBOURS if k in vendored]
+    rows += sorted(ICONS.items())
+
+    def strip(dark):
+        cells = "".join('<div class="cell">%s<span>%s</span></div>'
+                        % (_svg(d, 32), k) for k, d in rows)
+        return ('<div class="strip%s"><div class="wrap">%s</div></div>'
+                % (" dark" if dark else "", cells))
+
+    io.open(path, "w", encoding="utf-8").write(
+        PAGE.format(title="drawn beside vendored", body=strip(False) + strip(True)))
 
 
 def main():
@@ -418,6 +699,10 @@ def main():
         out = sys.argv[sys.argv.index("--preview") + 1]
         preview(out)
         print("preview -> " + out)
+    if "--compare" in sys.argv:
+        out = sys.argv[sys.argv.index("--compare") + 1]
+        compare(out)
+        print("compare -> " + out)
     if "--emit" in sys.argv:
         write_ts(OUT)
         print("wrote " + OUT)

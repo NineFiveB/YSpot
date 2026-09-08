@@ -49,11 +49,21 @@ crossbar. Going under it is how a shape turns to mush at 16px.
 | 32 | 2 | 2.5 |
 | 48 | 2.5 | 3 |
 
-The vendored files are named `_20_regular` and *are* the Regular style — but
-they ship as a single filled path, because upstream outlines the 1px stroke
-before export. YSpot's renderer applies `fill`, never `stroke`, and
-`vendor-fluent-icons.py` asserts no path carries a stroke. So an original icon
-is drawn with a 1px stroke and then flattened the same way.
+The vendored files are named `_20_regular` and *are* the Regular style: every
+one of them is a single filled path with no `stroke` attribute, which
+`vendor-fluent-icons.py` asserts, so the outline has been flattened before it
+reaches us. YSpot's renderer applies `fill` and nothing else, so an original
+icon has to be flattened the same way — a centreline, offset half a stroke
+each side, emitted as the ring between the two.
+
+**The style is not optional.** The first drawing of both YSpot icons was a
+solid silhouette rather than an outline, and it passed every check: on the
+grid, inside the live area, legible at 16px. Beside the vendored icons at 32px
+it read markedly heavier and plainly belonged to a different set — which is
+the one thing the grid exists to prevent, and the one thing no check on a
+single icon can see. `python scripts/draw-yspot-icons.py --compare out.html`
+puts the drawn icons next to their nearest vendored neighbours, which is where
+that is visible.
 
 ## Keylines
 
@@ -103,6 +113,19 @@ plausible at 16, 20, 32 and 48px, and was obviously broken at 240. The script
 now refuses to emit a hole whose bounding box escapes every solid, which is a
 coarse check — a hole that passes it can still be wrong — but the one that
 failed was certainly wrong.
+
+Turning a centreline into a 1px ring is exact for a rounded rectangle: inset
+the box by the stroke and the radius with it. For anything curved it is
+Tiller-Hanson, which is an approximation, so the script measures what it
+produced — worst distance from the centreline to either offset, against half a
+stroke — and halves a segment until that is under 0.02. On the shield's long
+bottom curves one undivided segment came out 0.135 wide.
+
+Two things that check got wrong before it was right, both worth knowing if you
+touch it: measuring to the nearest *sampled point* rather than to the curve
+reports the sampling chord as error (0.078 on a straight edge, most of a
+tolerance), and a tolerance loose enough to hide that is loose enough to hide
+the real thing.
 
 ## Checking the result
 
