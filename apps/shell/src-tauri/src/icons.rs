@@ -367,9 +367,12 @@ mod tests {
             }
         }
 
-        println!("
-{} apps, {} without an extractable icon
-", apps.len(), failed.len());
+        println!();
+        println!(
+            "{} apps, {} without an extractable icon\n",
+            apps.len(),
+            failed.len()
+        );
         for (name, aumid, err) in &failed {
             println!("  {name}");
             println!("      aumid: {aumid}");
@@ -381,9 +384,8 @@ mod tests {
 
         let mut shared: Vec<_> = by_bitmap.values().filter(|v| v.len() > 1).collect();
         shared.sort_by_key(|v| std::cmp::Reverse(v.len()));
-        println!("
-{} groups of apps sharing one bitmap:
-", shared.len());
+        println!();
+        println!("{} groups of apps sharing one bitmap:\n", shared.len());
         for group in &shared {
             println!("  {} apps: {}", group.len(), group.join(", "));
         }
