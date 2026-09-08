@@ -278,6 +278,54 @@ export function fallbackFileRow(item: FallbackItem): Row {
   };
 }
 
+/**
+ * Paths whose contents are never a destination, matched case-insensitively
+ * against the start of a file's path.
+ *
+ * `WinSxS` is the component store. Every file in it is a hardlinked duplicate
+ * of one that also exists somewhere usable — that is what the store is FOR —
+ * so a hit there is always a worse copy of a hit available elsewhere. It is
+ * also 145,427 files on this machine, 13% of a 1.09M-entry index, and it
+ * carries only the Archive attribute, so §3.4's hidden/system penalty never
+ * touches it.
+ *
+ * Measured, which is why this exists: the query `password` put three WinSxS
+ * files above the iCloud Passwords app. A prefix hit at depth 3 scores
+ * 0.9 x 0.943 = 0.849; the app matches at word-start for a flat 0.800.
+ */
+const DEPRIORITIZED_PREFIXES: readonly string[] = [
+  "/windows/winsxs/",
+  "/windows/servicing/",
+  "/windows/assembly/",
+  "/$recycle.bin/",
+  "/system volume information/",
+];
+
+/**
+ * How far a deprioritized path is pushed down.
+ *
+ * Enough that a prefix hit inside the component store loses to a word-start
+ * hit outside it — 0.849 x 0.6 = 0.509 against the app's 0.800 — and small
+ * enough that the file is still findable when nothing else matches, which
+ * §7.3's "every file on every NTFS volume" promise requires. This demotes;
+ * it never excludes.
+ */
+export const DEPRIORITIZED_FACTOR = 0.6;
+
+/**
+ * The demotion factor for a path, or 1 when it is an ordinary location.
+ *
+ * Separators are normalised and the drive letter is ignored, so the same rule
+ * covers `C:` and a second volume with its own Windows directory. Matched
+ * with a leading separator so a folder merely NAMED `winsxs` somewhere in the
+ * user's own tree is untouched — only the real one under a Windows root.
+ */
+export function pathWeight(path: string): number {
+  const p = path.toLowerCase().split("\\").join("/");
+  const rooted = p.slice(p.indexOf("/"));
+  return DEPRIORITIZED_PREFIXES.some((d) => rooted.startsWith(d)) ? DEPRIORITIZED_FACTOR : 1;
+}
+
 export function fileRow(item: ResultItem): Row {
   const id = rowKey(item.id);
   return {
@@ -286,7 +334,7 @@ export function fileRow(item: ResultItem): Row {
     id,
     name: item.name,
     subtitle: item.path,
-    score: item.score,
+    score: item.score * pathWeight(item.path),
     matchRanges: item.matchRanges,
     path: item.path,
   };
