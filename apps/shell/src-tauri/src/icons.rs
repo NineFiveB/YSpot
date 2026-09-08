@@ -57,18 +57,26 @@ impl IconCache {
         })
     }
 
-    /// The icon for an `AppsFolder` item as a PNG `data:` URI, at `px`
-    /// physical pixels square. Blocking: call from the blocking pool.
-    pub fn app_icon(&self, aumid: &str, px: i32) -> Result<Arc<str>, String> {
+    /// The icon for a shell item, given its **fully-formed parsing name**, as
+    /// a PNG `data:` URI at `px` physical pixels square. Blocking: call from
+    /// the blocking pool.
+    ///
+    /// The caller builds the parsing name — see [`crate::row_icons`] — and
+    /// this function never concatenates one, because any string reaching
+    /// `SHCreateItemFromParsingName` can activate a shell extension.
+    pub fn icon(&self, parsing_name: &str, px: i32) -> Result<Arc<str>, String> {
         let px = px.clamp(8, MAX_PX);
-        let key = format!("{}-{px}", fnv1a(aumid.as_bytes()));
+        // Keyed by the parsing name rather than the AUMID (SPEC §7.2's note
+        // says AUMID; amended, because the cache now holds more than apps and
+        // two kinds could otherwise collide on one id).
+        let key = format!("{}-{px}", fnv1a(parsing_name.as_bytes()));
         if let Some(hit) = self.mem.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
             return Ok(hit.clone());
         }
         let png = match self.read_disk(&key) {
             Some(bytes) => bytes,
             None => {
-                let bytes = extract_png(aumid, px)?;
+                let bytes = extract_png(parsing_name, px)?;
                 self.write_disk(&key, &bytes);
                 bytes
             }
@@ -120,12 +128,12 @@ fn fnv1a(bytes: &[u8]) -> String {
 }
 
 /// Extract the icon as straight-alpha RGBA and encode it as PNG.
-fn extract_png(aumid: &str, px: i32) -> Result<Vec<u8>, String> {
+fn extract_png(parsing_name: &str, px: i32) -> Result<Vec<u8>, String> {
     let _sta = Apartment::sta();
-    let path = wide(&format!("shell:AppsFolder\\{aumid}"));
+    let path = wide(parsing_name);
     // SAFETY: NUL-terminated parsing path; no bind context.
     let item: IShellItem = unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None) }
-        .map_err(|e| format!("AppsFolder item {aumid}: {e}"))?;
+        .map_err(|e| format!("shell item {parsing_name}: {e}"))?;
     let factory: IShellItemImageFactory =
         windows::core::Interface::cast(&item).map_err(|e| format!("image factory: {e}"))?;
     // SAFETY: valid factory; returns an owned HBITMAP freed with DeleteObject.
@@ -135,7 +143,7 @@ fn extract_png(aumid: &str, px: i32) -> Result<Vec<u8>, String> {
             SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
         )
     }
-    .map_err(|e| format!("GetImage for {aumid}: {e}"))?;
+    .map_err(|e| format!("GetImage for {parsing_name}: {e}"))?;
     let result = bitmap_to_rgba(hbm);
     // SAFETY: the HBITMAP is ours to free, exactly once.
     unsafe {
@@ -284,6 +292,39 @@ mod tests {
     }
 
     /// Real extraction against the first app on this machine.
+    /// The first four bytes of any PNG. Written as bytes so no escape can be
+    /// mangled by whatever wrote this file.
+    const PNG_MAGIC: &[u8] = &[0x89, b'P', b'N', b'G'];
+
+    /// The two parsing-name shapes this change added, against the real shell.
+    ///
+    /// Both are load-bearing claims: that the Settings package resolves from
+    /// its URI, and that a Control Panel item resolves from the CLSID the
+    /// registry gave us. Neither is provable without a desktop session, which
+    /// is why this sits beside the app test rather than in `row_icons`.
+    #[test]
+    fn extracts_icons_for_the_new_windows_sources() {
+        let _sta = Apartment::sta();
+
+        let settings = extract_png(crate::row_icons::SETTINGS_HOME, 32)
+            .expect("the Settings package has no icon");
+        assert_eq!(&settings[..4], PNG_MAGIC);
+
+        let clsid = crate::control_panel::clsid("Microsoft.System")
+            .expect("Microsoft.System is not registered on this machine");
+        let system = extract_png(&format!("shell:::{clsid}"), 32)
+            .expect("the System Control Panel item has no icon");
+        assert_eq!(&system[..4], PNG_MAGIC);
+
+        // Different destinations must not hand back the same bitmap. If they
+        // did, the CLSID route would be resolving to something generic and
+        // every Control Panel row would quietly wear one icon.
+        assert_ne!(
+            settings, system,
+            "the Settings and System icons are byte-identical, so one of \n             these parsing names is not resolving what it claims"
+        );
+    }
+
     #[test]
     fn extracts_an_icon_for_a_real_app() {
         let _sta = Apartment::sta();
@@ -301,7 +342,8 @@ mod tests {
             }
         }
         assert!(!apps.is_empty(), "no apps to extract an icon for");
-        let png = extract_png(&apps[0].aumid, 48).expect("icon extraction");
+        let name = format!("shell:AppsFolder\\{}", apps[0].aumid);
+        let png = extract_png(&name, 48).expect("icon extraction");
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }
 }

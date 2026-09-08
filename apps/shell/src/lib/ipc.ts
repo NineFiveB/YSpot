@@ -342,8 +342,16 @@ export function executeAction(row: Row, action = "open"): Promise<unknown> {
 }
 
 /** §7.1 icon for an app row, as a PNG data URI. Off the query path (§5.10). */
-export function appIcon(id: string, px: number): Promise<string> {
-  return invoke<string>("app_icon", { id, px });
+/**
+ * The Windows icon for a row, or `null` when the row legitimately has none
+ * and should keep its stroke glyph.
+ *
+ * Takes `(kind, id)` and never a parsing name: the shell derives the shell
+ * item from its own catalogs, because any string reaching
+ * `SHCreateItemFromParsingName` can activate a shell extension.
+ */
+export function rowIcon(kind: string, id: string, px: number): Promise<string | null> {
+  return invoke<string | null>("row_icon", { kind, id, px });
 }
 
 // ---------------------------------------------------------------------------

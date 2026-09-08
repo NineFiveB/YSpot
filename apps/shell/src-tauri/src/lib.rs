@@ -13,6 +13,7 @@ mod calc;
 mod clipboard;
 mod com;
 mod commands;
+mod control_panel;
 mod diagnostics;
 mod etw_mark;
 mod file_actions;
@@ -23,6 +24,7 @@ mod icons;
 mod matcher;
 mod pipe_client;
 mod placement;
+mod row_icons;
 mod search_fallback;
 mod settings;
 mod settings_catalog;
@@ -650,19 +652,33 @@ fn files_search(
     Ok(Accepted { accepted: true })
 }
 
-/// §7.1 icon extraction, off the query path: the frontend asks per visible
-/// row and renders a placeholder until this resolves (§5.10).
+/// §7.1/§7.2 icon extraction, off the query path: the frontend asks per
+/// visible row and renders its glyph until this resolves (§5.10).
+///
+/// Takes `(kind, id)` — the same pair `execute_action` takes — and never a
+/// parsing name. The webview cannot name a shell item to activate; the shell
+/// derives one from its own catalogs, or returns `None` and the row keeps its
+/// glyph. See [`row_icons`] for why that boundary is where it is.
 #[tauri::command]
-async fn app_icon(
+async fn row_icon(
     cache: tauri::State<'_, Arc<IconCache>>,
+    apps: tauri::State<'_, Arc<AppCatalog>>,
+    settings: tauri::State<'_, Arc<SettingsCatalog>>,
+    kind: String,
     id: String,
     px: i32,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let cache = cache.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || cache.app_icon(&id, px))
-        .await
-        .map_err(|e| format!("icon task: {e}"))?
-        .map(|uri| uri.to_string())
+    let apps = apps.inner().clone();
+    let settings = settings.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(name) = row_icons::resolve(&kind, &id, &apps, &settings)? else {
+            return Ok(None);
+        };
+        cache.icon(&name, px).map(|uri| Some(uri.to_string()))
+    })
+    .await
+    .map_err(|e| format!("icon task: {e}"))?
 }
 
 #[tauri::command]
@@ -1616,7 +1632,7 @@ pub fn run() {
             hide_window,
             frontend_ready,
             execute_action,
-            app_icon,
+            row_icon,
             get_settings,
             save_settings,
             open_settings,

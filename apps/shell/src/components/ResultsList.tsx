@@ -11,7 +11,7 @@ import {
   type ReactElement,
   type ReactNode,
 } from "react";
-import { appIcon, type Row } from "../lib/ipc";
+import { rowIcon, type Row } from "../lib/ipc";
 
 export const ROW_HEIGHT = 48;
 /** 480 logical-px window minus the 64 px query bar — a constant, never a DOM read (§5.10). */
@@ -21,27 +21,37 @@ const OVERSCAN = 5;
 const ICON_LOGICAL_PX = 32;
 
 /**
- * Process-wide icon cache: app id → data URI, or null once extraction has
- * failed (so a broken icon is asked for once, not once per mount). Icons are
- * immutable for the life of the process, which is what makes a plain Map the
- * right cache here (§5.10: off the critical path, placeholder until loaded).
+ * Process-wide icon cache: `kind:id` → data URI, or null once extraction has
+ * failed or the row legitimately has no Windows icon (so a glyph row is asked
+ * for once, not once per mount). Icons are immutable for the life of the
+ * process, which is what makes a plain Map the right cache here (§5.10: off
+ * the critical path, glyph until loaded).
+ *
+ * Keyed by kind AND id because ids are only unique within a kind — a command
+ * and a settings page could otherwise collide and wear each other's icon.
  */
 const iconCache = new Map<string, string | null>();
 const iconWaiters = new Map<string, Set<(uri: string | null) => void>>();
 
-function requestIcon(id: string, px: number, cb: (uri: string | null) => void): () => void {
-  const cached = iconCache.get(id);
+function requestIcon(
+  key: string,
+  kind: string,
+  id: string,
+  px: number,
+  cb: (uri: string | null) => void,
+): () => void {
+  const cached = iconCache.get(key);
   if (cached !== undefined) {
     cb(cached);
     return () => undefined;
   }
-  let waiters = iconWaiters.get(id);
+  let waiters = iconWaiters.get(key);
   if (!waiters) {
     waiters = new Set();
-    iconWaiters.set(id, waiters);
-    void appIcon(id, px)
-      .then((uri) => finishIcon(id, uri))
-      .catch(() => finishIcon(id, null));
+    iconWaiters.set(key, waiters);
+    void rowIcon(kind, id, px)
+      .then((uri) => finishIcon(key, uri))
+      .catch(() => finishIcon(key, null));
   }
   waiters.add(cb);
   return () => {
@@ -56,16 +66,20 @@ function finishIcon(id: string, uri: string | null): void {
   if (waiters) for (const w of waiters) w(uri);
 }
 
+/** Kinds whose rows can carry a real Windows icon; the rest keep a glyph. */
+const ICONIC_KINDS = new Set<Row["kind"]>(["app", "command", "setting"]);
+
 function useIcon(row: Row): string | null {
-  const id = row.kind === "app" ? row.id : null;
+  const key = ICONIC_KINDS.has(row.kind) ? `${row.kind}:${row.id}` : null;
   const [uri, setUri] = useState<string | null>(() =>
-    id ? (iconCache.get(id) ?? null) : null,
+    key ? (iconCache.get(key) ?? null) : null,
   );
+  const { kind, id } = row;
   useEffect(() => {
-    if (!id) return;
+    if (!key) return;
     const px = Math.round(ICON_LOGICAL_PX * (window.devicePixelRatio || 1));
-    return requestIcon(id, px, setUri);
-  }, [id]);
+    return requestIcon(key, kind, id, px, setUri);
+  }, [key, kind, id]);
   return uri;
 }
 
@@ -103,7 +117,10 @@ function renderHighlighted(
  * (§5.12) are correct with no palette of its own, and no state is conveyed by
  * colour. Static markup: no measurement and no layout read (§5.10).
  */
-const KIND_GLYPH: Record<Exclude<Row["kind"], "app">, string> = {
+const KIND_GLYPH: Record<Row["kind"], string> = {
+  // An app whose real icon could not be extracted still needs a mark, or the
+  // row's name jumps 42 px left of every other row's.
+  app: "M2.5 2.5h5v5h-5z M8.5 2.5h5v5h-5z M2.5 8.5h5v5h-5z M8.5 8.5h5v5h-5z",
   // A page with a folded corner.
   file: "M4.5 2.5h4l3 3v8h-7z M8.5 2.5v3h3",
   // Two sliders.
@@ -144,7 +161,7 @@ const ResultRow = memo(function ResultRow({
       <div className={`row-icon row-icon-${item.kind}`} aria-hidden="true">
         {icon ? (
           <img src={icon} alt="" width={ICON_LOGICAL_PX} height={ICON_LOGICAL_PX} />
-        ) : item.kind === "app" ? null : (
+        ) : (
           <svg
             viewBox="0 0 16 16"
             width="16"
@@ -155,7 +172,7 @@ const ResultRow = memo(function ResultRow({
             strokeLinecap="round"
             strokeLinejoin="round"
           >
-            <path d={KIND_GLYPH[item.kind]} />
+            <path d={KIND_GLYPH[item.kind] ?? KIND_GLYPH.command} />
           </svg>
         )}
       </div>
