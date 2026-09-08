@@ -45,6 +45,15 @@ jobs:
         working-directory: apps/shell
         run: npm test
 
+      # yspotGlyphs.ts is drawn by a script, and a drawing that has drifted
+      # from the script that made it fails as a wrong picture rather than as
+      # an error. Re-drawing here also re-runs the script's own geometry
+      # checks, which is what caught a knockout that filled instead of cut.
+      - name: Drawn icons match the script that draws them
+        run: |
+          python scripts/draw-yspot-icons.py --emit
+          git diff --exit-code -- apps/shell/src/lib/yspotGlyphs.ts
+
       - name: Formatting
         run: cargo fmt --all --check
 
