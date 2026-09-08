@@ -1,9 +1,10 @@
 """Draw YSpot's own icons on the Fluent 20px grid.
 
-Two apps have no icon of their own: Windows Security and Windows Backup both
+Some rows have no icon of their own. Windows Security and Windows Backup both
 fall back to the Windows Settings glyph, so three rows in the launcher look
-identical. Fluent's MIT set has no icon for either, and Microsoft's shipped
-artwork is not ours to copy. So these are drawn.
+identical; YSuite Settings would make a fourth. Fluent's MIT set has no icon
+for any of them, and Microsoft's shipped artwork is not ours to copy. So these
+are drawn.
 
 Every number here comes from docs/icon-grid.md, which was read out of the
 Fluent iconography community file itself: a 20 box, a 2 margin, a 16 live area,
@@ -15,7 +16,7 @@ file -- these drawings are YSpot's, under YSpot's licence.
 The set we vendor is the Regular style: outlines at a 1px stroke, shipped as a
 single filled path because the stroke has been outlined before export. So
 these are drawn the same way -- a centreline, offset half a stroke either side,
-emitted as a ring. The first version of both icons was a solid silhouette
+emitted as a ring. The first version of the first two was a solid silhouette
 instead, which is a different family: side by side with the vendored icons at
 32px it read markedly heavier, which is the whole thing the grid exists to
 prevent. `--compare` puts them next to their neighbours so that is checkable
@@ -146,6 +147,58 @@ def clockwise_arrow(cx, cy, rc, w, gap_from, gap_to, head_half, head_len):
     segs += arc(cx, cy, ri, end, gap_to)
     segs.append(line(segs[-1][3], segs[0][0]))
     return segs
+
+
+def hexagon(cx, cy, r, fillet):
+    """Pointy-top regular hexagon centreline, clockwise, corners filleted.
+
+    Returns (segments, vertices). The vertices come back because the shapes
+    drawn inside a hexagon are usually aimed at them.
+
+    Filleted rather than mitred: a 120 degree corner throws a long spike
+    through `offset_segs`, and Fluent rounds its corners anyway. The fillet
+    pulls the extreme points in a little, so the hexagon that fits the live
+    area is slightly smaller than the bare circumradius suggests -- which is
+    why `check` measures the result instead of trusting the radius.
+    """
+    vs = [(cx + r * math.cos(math.radians(a)), cy + r * math.sin(math.radians(a)))
+          for a in (-90, -30, 30, 90, 150, 210)]      # T, UR, LR, B, LL, UL
+    n = len(vs)
+    joints = []
+    for i, v in enumerate(vs):
+        a, b = vs[(i - 1) % n], vs[(i + 1) % n]
+        ua, ub = _unit(v, a), _unit(v, b)
+        half = math.acos(max(-1.0, min(1.0, ua[0] * ub[0] + ua[1] * ub[1]))) / 2.0
+        d = fillet / math.tan(half)
+        bis = _unit((0.0, 0.0), (ua[0] + ub[0], ua[1] + ub[1]))
+        reach = fillet / math.sin(half)
+        joints.append((
+            (v[0] + ua[0] * d, v[1] + ua[1] * d),
+            (v[0] + ub[0] * d, v[1] + ub[1] * d),
+            (v[0] + bis[0] * reach, v[1] + bis[1] * reach),
+        ))
+    segs = []
+    for i in range(n):
+        t_in, t_out, c = joints[i]
+        segs.append(corner(t_in, t_out, c))
+        segs.append(line(t_out, joints[(i + 1) % n][0]))
+    return segs, vs
+
+
+def spoke(p0, p1, w):
+    """A w-wide bar from p0 to p1, wound clockwise so it unions with a ring.
+
+    Under the nonzero rule a bar laid across a ring's hole raises the winding
+    there from 0 to 1, which fills it -- no boolean needed, and none possible
+    (see the note above SHAPES). Winding is decided by measurement rather than
+    by argument order, so a caller cannot get it backwards.
+    """
+    u = _unit(p0, p1)
+    nx, ny, h = u[1], -u[0], w / 2.0
+    q = [(p0[0] + nx * h, p0[1] + ny * h), (p1[0] + nx * h, p1[1] + ny * h),
+         (p1[0] - nx * h, p1[1] - ny * h), (p0[0] - nx * h, p0[1] - ny * h)]
+    segs = [line(q[i], q[(i + 1) % 4]) for i in range(4)]
+    return segs if signed_area(segs) > 0 else reverse(segs)
 
 
 def bracket(x0, y0, x1, y1, t, r_out, r_in, r_cap):
@@ -446,6 +499,53 @@ SHAPES["yspot_backup_restore"] = (
     + [solid(clockwise_arrow(8.25, 11.75, 2.9, STROKE, 258, 338, 1.35, 2.3))])
 
 
+def suite_cube(r=7.5, fillet=1.0):
+    """An isometric cube: three faces of one object, seamed in a Y.
+
+    A cube in isometric projection IS a hexagon, and the three visible faces
+    meet at the near corner, which projects to the centre. Seen from above the
+    near corner points down, so the seam runs stem-down, arms-up: an upright
+    Y. Seen from below it inverts and the mark reads as a flat pinwheel rather
+    than a solid -- the depth cue is entirely in which way the Y points, so
+    this is not a detail to take on trust. `view` is not a parameter because
+    only one of the two is a cube.
+    """
+    ring_segs, vs = hexagon(10, 10, r, fillet)
+    outer, inner = outlined(ring_segs, STROKE)
+    if signed_area(outer) < 0:
+        outer, inner = reverse(outer), reverse(inner)
+    _, upper_right, _, bottom, _, upper_left = vs
+    return ([solid(outer), (inner, True)]
+            + [solid(spoke((10, 10), tip, STROKE))
+               for tip in (bottom, upper_left, upper_right)])
+
+
+# YSuite Settings: the hub that configures YKeys, YTile and YBar.
+#
+# Three rows say "Settings" at once -- YSpot's, Windows', and this -- so a
+# third gear would have recreated the duplicate-icon problem this whole effort
+# started from. The label already carries "settings"; what has to differ is
+# the identity, so this mark depicts the suite, not the act of configuring it.
+#
+# A cube because the three faces are three apps in one object, and because the
+# hexagon is a silhouette nothing else in the set owns: every neighbour is a
+# rounded rectangle (window, grid, archive, hard_drive) or a circle (the two
+# gears), so it separates on outline alone at any size. The Y seam is the
+# suite's initial arriving as geometry rather than as a letter, which is the
+# only form of it that survives forced-colors and translation.
+#
+# Rejected, and why, so they are not retried: three tiled panels read well but
+# depict TILING, and YTile is one of the three apps this hub configures -- the
+# parent would have collided with its own child. Three offset layers are
+# `window_multiple`. Three stacked bars are a text-align control. A bar over
+# two panels is a titled window. Radial arrangements read as `arrow_sync`.
+#
+# The cube's honest cost: it is also the universal package/module mark, so it
+# borrows a meaning. If YSpot ever grows a plugins row, that row wants this
+# icon and this one should move.
+SHAPES["yspot_suite_cube"] = suite_cube()
+
+
 # --- checks --------------------------------------------------------------
 
 def _cubic_extrema(p0, c1, c2, p3):
@@ -576,16 +676,19 @@ def check():
                 bad.append("%s: hole %s sits outside every solid, so it fills "
                            "instead of cutting"
                            % (name, tuple(round(v, 3) for v in h)))
-    shield = shield_centreline()
-    lop = check_symmetry(shield)
-    if lop:
-        bad.append("yspot_windows_shield: the shield is %.3f off symmetric "
-                   "about x=10" % lop)
-    o, i = outlined(shield, STROKE)
-    drift = check_stroke_width(shield, o, reverse(i), STROKE)
-    if drift:
-        bad.append("yspot_windows_shield: the offset drifts %.3f from a %s "
-                   "stroke" % (drift, STROKE))
+    # Every curved centreline that gets offset into a stroke, checked for the
+    # two things the drawing cannot show you: that the offset really is the
+    # weight it claims, and that a shape meant to be symmetric is.
+    for icon, centreline in (("yspot_windows_shield", shield_centreline()),
+                             ("yspot_suite_cube", hexagon(10, 10, 7.5, 1.0)[0])):
+        lop = check_symmetry(centreline)
+        if lop:
+            bad.append("%s: %.3f off symmetric about x=10" % (icon, lop))
+        o, i = outlined(centreline, STROKE)
+        drift = check_stroke_width(centreline, o, reverse(i), STROKE)
+        if drift:
+            bad.append("%s: the offset drifts %.3f from a %s stroke"
+                       % (icon, drift, STROKE))
     return bad
 
 
@@ -668,7 +771,8 @@ def preview(path):
 # mistaken for, and the icons whose weight they have to match.
 NEIGHBOURS = ["shield", "shield_checkmark", "shield_keyhole", "lock_shield",
               "settings", "hard_drive", "archive", "arrow_sync", "history",
-              "folder"]
+              "folder", "apps_settings", "grid", "window_multiple",
+              "puzzle_piece", "options", "app_generic"]
 
 
 def compare(path):

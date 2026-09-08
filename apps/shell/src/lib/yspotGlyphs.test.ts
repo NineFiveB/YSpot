@@ -15,9 +15,10 @@ import { YSPOT_20, YSPOT_VIEWBOX } from "./yspotGlyphs";
 const DRAWN = Object.entries(YSPOT_20);
 
 describe("YSpot's drawn glyphs", () => {
-  it("has the two the launcher is missing", () => {
+  it("has the ones the launcher is missing", () => {
     expect(Object.keys(YSPOT_20).sort()).toEqual([
       "yspot_backup_restore",
+      "yspot_suite_cube",
       "yspot_windows_shield",
     ]);
   });

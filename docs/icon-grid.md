@@ -95,7 +95,7 @@ has to earn that.
 
 ## Drawing to it
 
-`scripts/draw-yspot-icons.py` holds the two icons YSpot draws itself, and
+`scripts/draw-yspot-icons.py` holds the icons YSpot draws itself, and
 `--emit` regenerates `apps/shell/src/lib/yspotGlyphs.ts` from them. CI re-runs
 it and fails on a diff, because a drawing that has drifted from the script
 that made it fails as a wrong picture, not as an error.
@@ -126,6 +126,34 @@ touch it: measuring to the nearest *sampled point* rather than to the curve
 reports the sampling chord as error (0.078 on a straight edge, most of a
 tolerance), and a tolerance loose enough to hide that is loose enough to hide
 the real thing.
+
+## Which icon a row should get
+
+The launcher shows three rows that all say "Settings" — YSpot's, Windows', and
+YSuite's. The temptation is to give each of them a gear with something added,
+which is how the duplicate-icon problem started.
+
+**Differentiate on what differs.** The label already carries the shared word.
+The mark's job is the part that is not shared: the identity. So YSuite's icon
+depicts the suite, not the act of configuring it, and carries no gear at all.
+
+Two collision tests, and both matter:
+
+- *Against the vendored set.* `--compare` renders a drawn icon beside its
+  nearest neighbours. A mark that is "a rounded rectangle with something in it"
+  fails this — most of the set is already that shape.
+- *Against rows that do not exist yet.* Three tiled panels were the first
+  YSuite candidate and read well, but they depict tiling, and YTile is one of
+  the three apps the hub configures. The parent would have collided with its
+  own child. Ask what the neighbouring rows will be, not only what they are.
+
+## A hole is not the only way to draw inside a shape
+
+Under the nonzero rule a subpath laid across a ring's hole raises the winding
+there from 0 to 1, which *fills* it. So the cube's three seams are plain bars
+wound the same way as the outline, unioned rather than subtracted — the same
+rule that makes the reversed-subpath trap above works in your favour here. It
+is worth reaching for: it needs no boolean, and there is no boolean available.
 
 ## Checking the result
 
