@@ -13,6 +13,7 @@ mod calc;
 mod clipboard;
 mod com;
 mod commands;
+mod control_panel;
 mod diagnostics;
 mod etw_mark;
 mod file_actions;
@@ -23,6 +24,7 @@ mod icons;
 mod matcher;
 mod pipe_client;
 mod placement;
+mod row_icons;
 mod search_fallback;
 mod settings;
 mod settings_catalog;
@@ -415,8 +417,20 @@ fn search(
     settings.sort_by(|a, b| b.score.total_cmp(&a.score));
     settings.truncate(settings_catalog::MAX_RESULTS);
 
-    let mut builtin_hits =
-        commands::match_query(&builtins, &text, commands::MAX_RESULTS * FRECENCY_POOL);
+    // A built-in that opens an app is offered only while that app is in the
+    // catalog — the same snapshot the app rows above were matched against,
+    // so the two can never disagree about what this machine has.
+    let installed = catalog.snapshot();
+    let mut builtin_hits = commands::match_query(
+        &builtins,
+        &text,
+        commands::MAX_RESULTS * FRECENCY_POOL,
+        |aumid| {
+            installed
+                .iter()
+                .any(|e| e.aumid.eq_ignore_ascii_case(aumid))
+        },
+    );
     for it in &mut builtin_hits {
         it.score += frec.bonus(&it.id);
     }
@@ -650,19 +664,33 @@ fn files_search(
     Ok(Accepted { accepted: true })
 }
 
-/// §7.1 icon extraction, off the query path: the frontend asks per visible
-/// row and renders a placeholder until this resolves (§5.10).
+/// §7.1/§7.2 icon extraction, off the query path: the frontend asks per
+/// visible row and renders its glyph until this resolves (§5.10).
+///
+/// Takes `(kind, id)` — the same pair `execute_action` takes — and never a
+/// parsing name. The webview cannot name a shell item to activate; the shell
+/// derives one from its own catalogs, or returns `None` and the row keeps its
+/// glyph. See [`row_icons`] for why that boundary is where it is.
 #[tauri::command]
-async fn app_icon(
+async fn row_icon(
     cache: tauri::State<'_, Arc<IconCache>>,
+    apps: tauri::State<'_, Arc<AppCatalog>>,
+    settings: tauri::State<'_, Arc<SettingsCatalog>>,
+    kind: String,
     id: String,
     px: i32,
-) -> Result<String, String> {
+) -> Result<Option<String>, String> {
     let cache = cache.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || cache.app_icon(&id, px))
-        .await
-        .map_err(|e| format!("icon task: {e}"))?
-        .map(|uri| uri.to_string())
+    let apps = apps.inner().clone();
+    let settings = settings.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(name) = row_icons::resolve(&kind, &id, &apps, &settings)? else {
+            return Ok(None);
+        };
+        cache.icon(&name, px).map(|uri| Some(uri.to_string()))
+    })
+    .await
+    .map_err(|e| format!("icon task: {e}"))?
 }
 
 #[tauri::command]
@@ -846,6 +874,14 @@ fn execute_action(
             // `stays_open` above — it hands the user to another application,
             // so the launcher gets out of the way first.
             "windows.settings" => shell_open("ms-settings:").map(|()| true),
+            // §7.6: the Windows Backup app, opened exactly as its AppsFolder
+            // row would have opened it — that row is suppressed as this
+            // command's duplicate. Hands the user to another application, so
+            // like the Settings home it is absent from `stays_open`.
+            "windows.backup" => {
+                apps::launch(apps::WINDOWS_BACKUP_AUMID, apps::AppKind::Packaged, false)
+                    .map(|()| true)
+            }
             "yspot.clipboard" => show_view(&app, "view:clipboard").map(|()| false),
             "yspot.files" => show_view(&app, "view:files").map(|()| false),
             "yspot.quit" => {
@@ -1616,7 +1652,7 @@ pub fn run() {
             hide_window,
             frontend_ready,
             execute_action,
-            app_icon,
+            row_icon,
             get_settings,
             save_settings,
             open_settings,

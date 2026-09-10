@@ -4,7 +4,7 @@
 // in a build or a type check, so it gets tests.
 
 import { describe, expect, it } from "vitest";
-import type { Row } from "./ipc";
+import { fileRow, type Row } from "./ipc";
 import { KIND_CAPS, byScore, collapseSameName, mergeRows, selectionIndex } from "./merge";
 
 const app = (name: string, score: number): Row => ({
@@ -137,16 +137,40 @@ describe("byScore with shell-side rows", () => {
 });
 
 describe("byScore", () => {
-  it("is a total order: score, then app-before-file, then name", () => {
+  it("is a total order: score, then kind rank, then name", () => {
     expect(byScore(app("A", 1), file("b", 0.5))).toBeLessThan(0);
     expect(byScore(file("b", 0.5), app("A", 1))).toBeGreaterThan(0);
     expect(byScore(app("A", 0.5), file("b", 0.5))).toBeLessThan(0);
     expect(byScore(app("A", 0.5), app("B", 0.5))).toBeLessThan(0);
     expect(byScore(app("A", 0.5), app("A", 0.5))).toBe(0);
   });
+
+  // Ranking settings pages over apps on a tie was tried for `windows` and
+  // reviewed out: it put Taskbar above Task Manager, Notifications above
+  // Notepad and Camera privacy above the Camera app on a fresh profile —
+  // the most common launcher queries there are. These pin the old rule so
+  // it cannot come back quietly: on a tie between an app and a page, the
+  // name decides, and the app the user was typing towards wins.
+  it.each([
+    ["task", "Task Manager", "Taskbar"],
+    ["not", "Notepad", "Notifications"],
+    ["cam", "Camera", "Camera privacy"],
+  ])("%s: keeps the app above the same-scored settings page", (_q, appName, pageName) => {
+    const page: Row = {
+      kind: "setting",
+      key: `setting:${pageName}`,
+      id: pageName,
+      name: pageName,
+      subtitle: "Settings",
+      score: 0.9,
+      matchRanges: [],
+    };
+    const rows = mergeRows({ apps: [page, app(appName, 0.9)], files: [], frozen: null });
+    expect(rows.map((r) => r.name)).toEqual([appName, pageName]);
+  });
 });
 
-const command = (name: string, score: number): Row => ({
+const command = (name: string, score: number, order = 0): Row => ({
   kind: "command",
   key: `command:${name}`,
   id: name,
@@ -154,6 +178,7 @@ const command = (name: string, score: number): Row => ({
   subtitle: "YSpot",
   score,
   matchRanges: [],
+  order,
 });
 
 const setting = (name: string, score: number): Row => ({
@@ -274,5 +299,102 @@ describe("collapseSameName", () => {
     const rows = collapseSameName([file("Settings", 0.9), { ...file("SETTINGS", 0.8), key: "file:0:z" }], 5);
     expect(rows).toHaveLength(1);
     expect(rows[0].score).toBe(0.9);
+  });
+});
+
+// The query `windows`, as the sources actually score it on the author's
+// machine — every number below is the real one, not a stand-in.
+//
+// The Windows directory is an index entry like any other: EXACT at depth 1
+// is 1.0 / (1 + 0.02) = 0.980, above every app and page that merely start
+// with the word. Twelve apps and four catalog pages tie at the 0.9 prefix
+// score, where the frontend's only remaining order is the name — and
+// "Windows App Cert Kit" sorts before "Windows backup". So Windows Backup was
+// at rows 4 AND 5, once as the page and once as the app, under a folder and
+// a dev kit, and nothing on the shared scale could move it.
+//
+// What did: it is a built-in now, in the band with Windows Settings, and the
+// two are declared in the order they should show. Its app row is suppressed
+// as the command's duplicate; the `ms-settings:sync` page stays, on the
+// shared scale, where it was.
+describe("the query `windows`", () => {
+  const BS = String.fromCharCode(92);
+  const folder = fileRow({
+    // FRNs travel as decimal strings: a u64 exceeds the JS safe-integer range.
+    id: { volumeIdx: 0, frn: "5" },
+    path: `C:${BS}Windows`,
+    name: "Windows",
+    score: 1 / 1.02,
+    matchRanges: [[0, 7]],
+  });
+  const pages = ["Windows Update", "Windows backup", "Windows Security", "Windows Defender Firewall"];
+  // What AppsFolder returns on this machine, less the suppressed Backup row,
+  // in the shell's own length-then-name order and cut to its pool of eight.
+  const apps8 = [
+    "Windows Tools",
+    "Windows Security",
+    "Windows PowerShell",
+    "Windows App Cert Kit",
+    "Windows PowerShell ISE",
+    "Windows PowerShell (x86)",
+    "Windows Memory Diagnostic",
+    "Windows Media Player Legacy",
+  ];
+  const generation = () =>
+    mergeRows({
+      apps: [
+        // Both prefix-match at 0.9 and take the band: an exact tie at 1.4.
+        command("Windows Settings", 0.9 + 0.5, 1),
+        command("Windows Backup", 0.9 + 0.5, 2),
+        ...pages.map((n) => setting(n, 0.9)),
+        ...apps8.map((n) => app(n, 0.9)),
+      ],
+      files: [folder],
+      frozen: null,
+    });
+
+  it("puts Windows Backup directly under Windows Settings", () => {
+    const rows = generation();
+    expect(rows.slice(0, 2).map((r) => [r.name, r.kind])).toEqual([
+      ["Windows Settings", "command"],
+      ["Windows Backup", "command"],
+    ]);
+  });
+
+  it("breaks that tie by declaration, not by the alphabet", () => {
+    // By name, "Windows Backup" leads "Windows Settings" on the strength of
+    // a B. The order field is what says otherwise.
+    expect(byScore(command("Windows Settings", 1.4, 1), command("Windows Backup", 1.4, 2))).toBeLessThan(0);
+    expect(byScore(command("Windows Backup", 1.4, 2), command("Windows Settings", 1.4, 1))).toBeGreaterThan(0);
+    // And only a tie: a better score still wins outright, whatever the order.
+    expect(byScore(command("Windows Backup", 1.5, 2), command("Windows Settings", 1.4, 1))).toBeLessThan(0);
+  });
+
+  it("leaves the directory and the shared scale exactly where they were", () => {
+    const rows = generation();
+    // The folder is not demoted: demoting one directory named Windows only
+    // promotes the next one, and there are several under any profile.
+    expect(rows[2]).toEqual(folder);
+    expect(rows[2].score).toBeCloseTo(0.98, 3);
+    // Below it, the 0.9 tier in the old name order — app before page only
+    // when the alphabet says so, never by kind.
+    expect(rows[3].name).toBe("Windows App Cert Kit");
+  });
+
+  it("shows Windows Backup once as the command; the page keeps its own row", () => {
+    const rows = generation();
+    const backups = rows.filter((r) => r.name.toLowerCase() === "windows backup");
+    expect(backups.map((r) => r.kind)).toEqual(["command", "setting"]);
+  });
+
+  it("puts YSpot Settings first for `settings`, as asked, by the same rule", () => {
+    // Both are WORD_START 0.8 plus the band. YSpot Settings is declared
+    // first; a name sort had Windows first on the strength of a W.
+    const rows = mergeRows({
+      apps: [command("Windows Settings", 1.3, 1), command("YSpot Settings", 1.3, 0)],
+      files: [],
+      frozen: null,
+    });
+    expect(rows.map((r) => r.name)).toEqual(["YSpot Settings", "Windows Settings"]);
   });
 });

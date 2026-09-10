@@ -27,9 +27,19 @@ import type { Row } from "./ipc";
  * Global-score order. On an exact tie a shell-side row (calculator, app,
  * settings page) leads a file: the shell knows what those rows ARE, while a
  * file that merely scores the same is a weaker claim on the top slot.
+ *
+ * Two built-ins that tie are ordered as the built-in list declares them —
+ * `windows` reaches Windows Settings and Windows Backup at the same prefix
+ * score plus the band, and the list is written in the order they should
+ * show. That is the ONLY kind-aware tie-break here, on purpose: ranking
+ * settings pages over apps on ties was tried and put Taskbar above Task
+ * Manager, Notifications above Notepad and Camera privacy above Camera.
  */
 export function byScore(a: Row, b: Row): number {
   if (b.score !== a.score) return b.score - a.score;
+  if (a.kind === "command" && b.kind === "command" && a.order !== b.order) {
+    return a.order - b.order;
+  }
   const shellSide = (r: Row): number => (r.kind === "file" ? 1 : 0);
   if (shellSide(a) !== shellSide(b)) return shellSide(a) - shellSide(b);
   return a.name.localeCompare(b.name);
@@ -59,8 +69,8 @@ export interface MergeInput {
  * are the best of each kind and the relative order is untouched.
  *
  * The numbers: `calc` one, because there is only ever one answer. `command`
- * two, because there are five built-ins and no query reaches three of them
- * meaningfully. `setting` and `app` three, because a fourth was never the
+ * two, because there are six built-ins and no query reaches three of them
+ * meaningfully — `windows` and `settings` each reach exactly two. `setting` and `app` three, because a fourth was never the
  * answer when the first three were not. `window` two, because a matching
  * window is a shortcut rather than a search result. `file` three, tightening
  * §7.3's cap, with the File Search view holding the full list. Fourteen rows
