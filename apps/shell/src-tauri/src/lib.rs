@@ -417,8 +417,20 @@ fn search(
     settings.sort_by(|a, b| b.score.total_cmp(&a.score));
     settings.truncate(settings_catalog::MAX_RESULTS);
 
-    let mut builtin_hits =
-        commands::match_query(&builtins, &text, commands::MAX_RESULTS * FRECENCY_POOL);
+    // A built-in that opens an app is offered only while that app is in the
+    // catalog — the same snapshot the app rows above were matched against,
+    // so the two can never disagree about what this machine has.
+    let installed = catalog.snapshot();
+    let mut builtin_hits = commands::match_query(
+        &builtins,
+        &text,
+        commands::MAX_RESULTS * FRECENCY_POOL,
+        |aumid| {
+            installed
+                .iter()
+                .any(|e| e.aumid.eq_ignore_ascii_case(aumid))
+        },
+    );
     for it in &mut builtin_hits {
         it.score += frec.bonus(&it.id);
     }
@@ -862,6 +874,14 @@ fn execute_action(
             // `stays_open` above — it hands the user to another application,
             // so the launcher gets out of the way first.
             "windows.settings" => shell_open("ms-settings:").map(|()| true),
+            // §7.6: the Windows Backup app, opened exactly as its AppsFolder
+            // row would have opened it — that row is suppressed as this
+            // command's duplicate. Hands the user to another application, so
+            // like the Settings home it is absent from `stays_open`.
+            "windows.backup" => {
+                apps::launch(apps::WINDOWS_BACKUP_AUMID, apps::AppKind::Packaged, false)
+                    .map(|()| true)
+            }
             "yspot.clipboard" => show_view(&app, "view:clipboard").map(|()| false),
             "yspot.files" => show_view(&app, "view:files").map(|()| false),
             "yspot.quit" => {

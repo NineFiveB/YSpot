@@ -84,6 +84,13 @@ export interface CommandItem {
   subtitle: string;
   score: number;
   matchRanges: [number, number][];
+  /**
+   * Declaration position in the built-in list. Two built-ins can tie
+   * exactly — `windows` reaches Windows Settings and Windows Backup at the
+   * same prefix score plus the band — and the list is written in the order
+   * they should show, so that one tie is broken here rather than by name.
+   */
+  order: number;
 }
 
 /** One open window (§7.5). */
@@ -156,6 +163,8 @@ export type Row =
       subtitle: string;
       score: number;
       matchRanges: [number, number][];
+      /** Declaration position; breaks an exact tie between two built-ins. */
+      order: number;
     }
   | {
       kind: "setting";
@@ -226,6 +235,7 @@ export function commandRow(item: CommandItem): Row {
     subtitle: item.subtitle,
     score: item.score,
     matchRanges: item.matchRanges,
+    order: item.order,
   };
 }
 

@@ -52,7 +52,7 @@ pub fn resolve(
             .then(|| format!("shell:AppsFolder\\{id}"))
             .map(Some)
             .ok_or_else(|| format!("unknown app {id}")),
-        "command" => Ok(command_parsing_name(id)?.map(str::to_string)),
+        "command" => command_parsing_name(id),
         "setting" => {
             let e = settings
                 .find(id)
@@ -64,9 +64,16 @@ pub fn resolve(
 }
 
 /// The command half. Pure, so it can be checked against `commands::all()`.
-pub fn command_parsing_name(id: &str) -> Result<Option<&'static str>, String> {
+pub fn command_parsing_name(id: &str) -> Result<Option<String>, String> {
     match id {
-        "windows.settings" => Ok(Some(SETTINGS_HOME)),
+        "windows.settings" => Ok(Some(SETTINGS_HOME.to_string())),
+        // The command opens this AUMID, so it wears what the app's own row
+        // wore. Built here from the same constant the launch uses — never
+        // from anything the webview sent — so the two cannot drift.
+        "windows.backup" => Ok(Some(format!(
+            "shell:AppsFolder\\{}",
+            crate::apps::WINDOWS_BACKUP_AUMID
+        ))),
         // §7.6 rows that are YSpot itself. There is no Windows icon for
         // "Quit YSpot", and borrowing one would be a claim the code cannot
         // back — these keep their glyph deliberately.
@@ -109,13 +116,22 @@ mod tests {
         }
     }
 
-    /// The one command that is a Windows destination gets the Windows icon;
-    /// the four that are YSpot itself deliberately get none.
+    /// The two commands that are Windows destinations get Windows icons —
+    /// the Settings home its own, Windows Backup the one its suppressed app
+    /// row wore, built from the same AUMID the launch uses; the four that
+    /// are YSpot itself deliberately get none.
     #[test]
-    fn only_the_windows_destination_borrows_a_windows_icon() {
+    fn only_the_windows_destinations_borrow_windows_icons() {
         assert_eq!(
             command_parsing_name("windows.settings"),
-            Ok(Some(SETTINGS_HOME))
+            Ok(Some(SETTINGS_HOME.to_string()))
+        );
+        assert_eq!(
+            command_parsing_name("windows.backup"),
+            Ok(Some(format!(
+                "shell:AppsFolder\\{}",
+                crate::apps::WINDOWS_BACKUP_AUMID
+            )))
         );
         for id in [
             "yspot.settings",
