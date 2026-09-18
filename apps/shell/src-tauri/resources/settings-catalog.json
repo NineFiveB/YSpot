@@ -116,6 +116,6 @@
     { "id": "cpl:troubleshooting", "name": "Troubleshooting", "canonical": "Microsoft.Troubleshooting", "synonyms": ["fix problems control panel"] },
     { "id": "cpl:indexing", "name": "Indexing Options", "canonical": "Microsoft.IndexingOptions", "synonyms": ["windows search index"] },
     { "id": "cpl:autoplay", "name": "AutoPlay Control Panel", "canonical": "Microsoft.AutoPlay", "synonyms": ["removable media defaults"] },
-    { "id": "cpl:taskbarnav", "name": "Taskbar and Navigation", "canonical": "Microsoft.TaskbarAndStartMenu", "synonyms": ["taskbar control panel"] }
+    { "id": "cpl:taskbarnav", "name": "Taskbar and Navigation", "canonical": "Microsoft.Taskbar", "synonyms": ["taskbar control panel"] }
   ]
 }

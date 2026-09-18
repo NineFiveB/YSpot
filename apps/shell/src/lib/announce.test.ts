@@ -100,6 +100,7 @@ describe("describeRow", () => {
         subtitle: "YSpot",
         score: 1,
         matchRanges: [],
+        order: 0,
       }),
     ).toBe("YSpot Settings, YSpot command");
   });
@@ -110,7 +111,7 @@ describe("describeRow", () => {
       file("b", "C:\\b"),
       { kind: "calc", key: "c", id: "c", name: "1", subtitle: "", score: 2, matchRanges: [], value: "1" },
       { kind: "setting", key: "s", id: "s", name: "S", subtitle: "Settings", score: 1, matchRanges: [] },
-      { kind: "command", key: "m", id: "m", name: "M", subtitle: "YSpot", score: 1, matchRanges: [] },
+      { kind: "command", key: "m", id: "m", name: "M", subtitle: "YSpot", score: 1, matchRanges: [], order: 0 },
       { kind: "window", key: "w", id: "w", name: "W", subtitle: "Window", score: 1, matchRanges: [] },
     ];
     for (const r of rows) {

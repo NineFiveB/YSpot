@@ -102,8 +102,18 @@ pub struct AppMatch {
 /// Microsoft ever changes this AUMID the filter silently stops matching and
 /// the duplicate row comes back — failing OPEN, which is the right direction
 /// for a filter the user cannot see.
-const SUPPRESSED_AUMIDS: &[&str] =
-    &["windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"];
+/// The Windows Backup app, as `AppsFolder` names it. Launched by the
+/// `windows.backup` built-in (§7.6), which is why its own row is suppressed
+/// below: the command opens exactly this, the way `windows.settings` opens
+/// exactly what the Settings app's row did.
+pub const WINDOWS_BACKUP_AUMID: &str = "MicrosoftWindows.Client.CBS_cw5n1h2txyewy!WindowsBackup";
+
+const SUPPRESSED_AUMIDS: &[&str] = &[
+    "windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel",
+    // Same rule, second instance: the `windows.backup` built-in opens this
+    // AUMID, so the app row would be the command's destination listed twice.
+    WINDOWS_BACKUP_AUMID,
+];
 
 fn is_suppressed(aumid: &str) -> bool {
     SUPPRESSED_AUMIDS
@@ -414,6 +424,40 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.id == "Contoso.Settings!App"),
             "suppression is by AUMID, never by name — a third-party app called              Settings must still be findable"
+        );
+    }
+
+    /// The `windows.backup` built-in launches this AUMID, so the app row is
+    /// the command's destination listed a second time — the same duplication
+    /// the Settings filter above removes. As above, by AUMID and never by
+    /// name: a backup tool the user installed and called "Windows Backup" is
+    /// not Microsoft's and must survive.
+    #[test]
+    fn the_windows_backup_app_row_is_suppressed_as_a_duplicate() {
+        let entries = vec![
+            AppEntry::new(
+                // Case differs from the constant on purpose: the constant is
+                // the mixed-case AUMID as AppsFolder reports it, and the
+                // filter must not depend on that casing surviving.
+                WINDOWS_BACKUP_AUMID.to_ascii_lowercase(),
+                "Windows Backup".to_string(),
+                AppKind::Packaged,
+            ),
+            AppEntry::new(
+                "Contoso.Backup!App".to_string(),
+                "Windows Backup".to_string(),
+                AppKind::Win32,
+            ),
+        ];
+        let hits = match_query(&entries, "windows", MAX_APP_RESULTS);
+        assert!(
+            hits.iter()
+                .all(|h| !h.id.eq_ignore_ascii_case(SUPPRESSED_AUMIDS[1])),
+            "the duplicate Windows Backup row was not suppressed"
+        );
+        assert!(
+            hits.iter().any(|h| h.id == "Contoso.Backup!App"),
+            "a third-party app that happens to share the name must still be findable"
         );
     }
 

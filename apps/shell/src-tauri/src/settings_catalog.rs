@@ -329,6 +329,55 @@ mod tests {
     /// The Settings HOME moved into `commands.rs` (§7.2 amendment). While it
     /// lived here too, typing "settings" produced two rows opening the same
     /// destination — one from this catalog and one from the AppsFolder.
+    /// Canonical names that real Windows installations may legitimately not
+    /// register, so their absence is not a typo.
+    ///
+    /// The catalog is deliberately a superset: it gates on build number and
+    /// hardware, not on SKU, and a row whose item is missing resolves to no
+    /// icon and keeps its glyph. This list exists so that absence has to be
+    /// *claimed* rather than assumed — adding a name here is a deliberate act
+    /// with a reason attached, which is what keeps the check below able to
+    /// catch a misspelling.
+    const SKU_OPTIONAL: &[&str] = &[
+        // Backup and Restore is a consumer feature; absent on Windows Server,
+        // which is what GitHub's windows-latest runner is. Present on the
+        // desktop builds YSpot targets.
+        "Microsoft.BackupAndRestore",
+    ];
+
+    /// A Control Panel canonical name must be one Windows actually knows.
+    ///
+    /// `control.exe /name <canonical>` is the launch contract, so a name that
+    /// exists nowhere is a row that opens nothing — and it fails silently,
+    /// because the launch is a fire-and-forget shell execute. The catalog
+    /// shipped `Microsoft.TaskbarAndStartMenu`, which is not a real name; the
+    /// registered one is `Microsoft.Taskbar`.
+    ///
+    /// This reads the live registry, so it is machine-dependent on purpose.
+    /// The first version of it asserted that EVERY name resolves here, which
+    /// was wrong in a way worth recording: it passed on the author's desktop
+    /// and failed in CI on `Microsoft.BackupAndRestore`, a consumer feature
+    /// the Server runner does not have. Absence is legitimate; a name that is
+    /// absent *and* unclaimed is the bug.
+    #[test]
+    fn every_control_panel_canonical_name_is_real() {
+        let c = catalog();
+        let mut missing = Vec::new();
+        for e in &c.entries {
+            if let Launch::ControlPanel(canonical) = &e.launch {
+                if crate::control_panel::clsid(canonical).is_none()
+                    && !SKU_OPTIONAL.contains(&canonical.as_str())
+                {
+                    missing.push(format!("{} ({canonical})", e.id));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these rows name a Control Panel item this Windows does not              register, so they open nothing. If the name is right and this              SKU simply lacks the feature, add it to SKU_OPTIONAL with a              reason: {missing:?}"
+        );
+    }
+
     #[test]
     fn the_settings_home_is_not_in_the_data_catalog() {
         let c = catalog();

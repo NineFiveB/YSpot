@@ -27,9 +27,19 @@ import type { Row } from "./ipc";
  * Global-score order. On an exact tie a shell-side row (calculator, app,
  * settings page) leads a file: the shell knows what those rows ARE, while a
  * file that merely scores the same is a weaker claim on the top slot.
+ *
+ * Two built-ins that tie are ordered as the built-in list declares them —
+ * `windows` reaches Windows Settings and Windows Backup at the same prefix
+ * score plus the band, and the list is written in the order they should
+ * show. That is the ONLY kind-aware tie-break here, on purpose: ranking
+ * settings pages over apps on ties was tried and put Taskbar above Task
+ * Manager, Notifications above Notepad and Camera privacy above Camera.
  */
 export function byScore(a: Row, b: Row): number {
   if (b.score !== a.score) return b.score - a.score;
+  if (a.kind === "command" && b.kind === "command" && a.order !== b.order) {
+    return a.order - b.order;
+  }
   const shellSide = (r: Row): number => (r.kind === "file" ? 1 : 0);
   if (shellSide(a) !== shellSide(b)) return shellSide(a) - shellSide(b);
   return a.name.localeCompare(b.name);
@@ -59,16 +69,23 @@ export interface MergeInput {
  * are the best of each kind and the relative order is untouched.
  *
  * The numbers: `calc` one, because there is only ever one answer. `command`
- * two, because there are five built-ins and no query reaches three of them
- * meaningfully. `setting` and `app` three, because a fourth was never the
+ * three, matching `commands::MAX_RESULTS` so the frontend never throws away a
+ * row the shell deliberately computed. It was two, justified by "no query
+ * reaches three of them meaningfully" — which a pre-merge review disproved
+ * with the shortest query that reaches any of them at all. `se` reaches File
+ * Search at 1.31 and both Settings at 1.30, and the cap dropped whichever
+ * the tie-break ranked third: on `main` that was YSpot Settings, and after
+ * the declaration-order tie-break it became Windows Settings, so a row the
+ * user explicitly asked to see blinked out on the way to typing `settings`.
+ * `setting` and `app` three, because a fourth was never the
  * answer when the first three were not. `window` two, because a matching
  * window is a shortcut rather than a search result. `file` three, tightening
- * §7.3's cap, with the File Search view holding the full list. Fourteen rows
+ * §7.3's cap, with the File Search view holding the full list. Fifteen rows
  * worst case, down from twenty-six.
  */
 export const KIND_CAPS: Record<Row["kind"], number> = {
   calc: 1,
-  command: 2,
+  command: 3,
   setting: 3,
   app: 3,
   window: 2,

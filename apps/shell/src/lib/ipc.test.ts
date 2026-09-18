@@ -7,7 +7,16 @@
 // never rises. So both sides pin the string.
 
 import { describe, expect, it } from "vitest";
-import { fallbackFileRow, fileRow, nextGen, peekNextGen, rowKey, type ResultItem } from "./ipc";
+import {
+  DEPRIORITIZED_FACTOR,
+  fallbackFileRow,
+  fileRow,
+  nextGen,
+  pathWeight,
+  peekNextGen,
+  rowKey,
+  type ResultItem,
+} from "./ipc";
 
 const item = (over: Partial<ResultItem> = {}): ResultItem => ({
   id: { volumeIdx: 2, frn: "9007199254740993" },
@@ -60,5 +69,59 @@ describe("the shared generation counter", () => {
     const b = nextGen();
     expect(b).toBe(a + 1);
     expect(peekNextGen()).toBe(b + 1);
+  });
+});
+
+describe("pathWeight", () => {
+  // Built from a character code so no escape sequence can be mangled by
+  // whatever writes this file, and so the separator being a backslash is
+  // part of what is under test rather than an accident of quoting.
+  const BS = String.fromCharCode(92);
+  const win = (...parts: string[]): string => parts.join(BS);
+
+  // The measured case: `password` put three WinSxS files above the iCloud
+  // Passwords app. A prefix hit at depth 3 scores 0.9 * 0.943 = 0.849; the
+  // app matches at word-start for a flat 0.800.
+  it("demotes the component store below an app matching at word-start", () => {
+    const p = win("C:", "Windows", "WinSxS", "amd64_x_none_8c3c", "PasswordEnrollmentManager.dll");
+    expect(0.849 * pathWeight(p)).toBeLessThan(0.8);
+  });
+
+  it("leaves ordinary locations alone", () => {
+    for (const p of [
+      win("C:", "Users", "me", "Documents", "passwords.txt"),
+      win("C:", "Windows", "System32", "kernel32.dll"),
+      win("C:", "Program Files", "App", "app.exe"),
+      win("D:", "projects", "src", "main.rs"),
+    ]) {
+      expect(pathWeight(p), p).toBe(1);
+    }
+  });
+
+  it("covers every deprioritized root, case-insensitively and on any volume", () => {
+    for (const p of [
+      win("C:", "Windows", "WinSxS", "x", "y.dll"),
+      win("c:", "windows", "winsxs", "x", "y.dll"),
+      win("D:", "Windows", "WinSxS", "x", "y.dll"),
+      win("C:", "Windows", "servicing", "x.dll"),
+      win("C:", "Windows", "assembly", "GAC", "x.dll"),
+      win("C:", "$Recycle.Bin", "S-1-5-21", "x.txt"),
+      win("C:", "System Volume Information", "x.log"),
+    ]) {
+      expect(pathWeight(p), p).toBe(DEPRIORITIZED_FACTOR);
+    }
+  });
+
+  // A folder the user happens to name WinSxS is theirs, not the component
+  // store, and must not be demoted for sharing a name.
+  it("only matches a real Windows root, not a lookalike deeper in the tree", () => {
+    expect(pathWeight(win("C:", "Users", "me", "code", "windows", "winsxs", "notes.md"))).toBe(1);
+    expect(pathWeight(win("C:", "Users", "me", "WinSxS", "notes.md"))).toBe(1);
+  });
+
+  // The promise is that the index is complete, so this demotes and never
+  // excludes: a WinSxS file is still findable when nothing else matches.
+  it("never zeroes a score", () => {
+    expect(DEPRIORITIZED_FACTOR).toBeGreaterThan(0);
   });
 });

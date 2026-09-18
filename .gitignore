@@ -28,3 +28,10 @@ Desktop.ini
 *.log
 .env
 .env.local
+
+# Icon preview, generated on demand by scripts/preview-icons.py
+icons-preview.html
+
+# Python bytecode from the developer tools in scripts/.
+__pycache__/
+*.pyc

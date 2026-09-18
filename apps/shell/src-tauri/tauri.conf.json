@@ -54,7 +54,8 @@
       }
     },
     "resources": [
-      "resources/settings-catalog.json"
+      "resources/settings-catalog.json",
+      "resources/THIRD-PARTY-NOTICES.md"
     ]
   }
 }

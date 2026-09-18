@@ -45,6 +45,24 @@ jobs:
         working-directory: apps/shell
         run: npm test
 
+      # yspotGlyphs.ts is drawn by a script, and a drawing that has drifted
+      # from the script that made it fails as a wrong picture rather than as
+      # an error. Re-drawing here also re-runs the script's own geometry
+      # checks, which is what caught a knockout that filled instead of cut.
+      #
+      # Two steps, for the reason the smoke job below states: in one pwsh
+      # script only the LAST native exit code decides the outcome. These two
+      # were one step until a pre-merge review found it, and the failure was
+      # worse than the generic hazard — the script returns non-zero from its
+      # geometry checks BEFORE it writes the file, so a broken drawing left
+      # yspotGlyphs.ts untouched, `git diff --exit-code` passed, and the step
+      # went green on exactly the bug its comment claims it catches.
+      - name: Drawn icons pass their own geometry checks
+        run: python scripts/draw-yspot-icons.py --emit
+
+      - name: Drawn icons match the script that draws them
+        run: git diff --exit-code -- apps/shell/src/lib/yspotGlyphs.ts
+
       - name: Formatting
         run: cargo fmt --all --check
 
