@@ -76,8 +76,17 @@ impl Hotkey {
         if self.code == "F12" {
             return Some("F12 is reserved for debuggers");
         }
-        if !(self.ctrl || self.alt || self.shift || self.win) {
-            return Some("a hotkey needs at least one modifier");
+        // A bare key would swallow an ordinary keypress system-wide — except
+        // F13-F24, which no keyboard has. Windows has virtual keys for them
+        // and nothing emits those codes unless someone deliberately arranged
+        // it (docs/single-key-summon.md: remap the Menu key), so there is no
+        // keystroke to hijack and they are the one safe bare binding.
+        //
+        // YKeys reached this conclusion first and words it the same way; the
+        // two rules have to agree, because a chord YSpot accepts and YKeys
+        // refuses leaves NEITHER process holding it after a restart.
+        if !(self.ctrl || self.alt || self.shift || self.win) && !self.is_macro_key() {
+            return Some("a hotkey needs at least one modifier, or F13-F24");
         }
         // A lone modifier as the key is not a chord.
         if matches!(
@@ -96,11 +105,29 @@ impl Hotkey {
         None
     }
 
+    /// F13-F24: the keys no keyboard has, which is what makes them safe to
+    /// bind with no modifier at all.
+    fn is_macro_key(&self) -> bool {
+        self.code
+            .strip_prefix('F')
+            .and_then(|n| n.parse::<u8>().ok())
+            .is_some_and(|n| (13..=24).contains(&n))
+    }
+
     /// A caution that does not block (§5.1 SHOULDs a warning on Win chords,
     /// since the OS reserves many of them).
     pub fn warning(&self) -> Option<&'static str> {
-        self.win
-            .then_some("Windows reserves most Win-key chords; this may not register")
+        if self.win {
+            return Some("Windows reserves most Win-key chords; this may not register");
+        }
+        // Bound, registered, and completely dead until the remap exists —
+        // there is no keyboard that sends this on its own. Said here, where
+        // the binding is made, rather than discovered later by pressing a key
+        // that does nothing.
+        if self.is_macro_key() && !(self.ctrl || self.alt || self.shift) {
+            return Some("No keyboard sends F13-F24; this needs a remap (see docs)");
+        }
+        None
     }
 
     /// The likely owner of a chord that failed to register (§5.1's built-in
@@ -351,6 +378,44 @@ mod tests {
         let win = with(|h| h.win = true);
         assert!(win.rejection().is_none());
         assert!(win.warning().is_some());
+    }
+
+    /// The one bare binding that is allowed, and why the others still are not.
+    ///
+    /// F13-F24 are keys no keyboard has: nothing emits them without a
+    /// deliberate remap, so there is no keystroke to swallow. Every other bare
+    /// key would take a character away from the whole machine. YKeys draws the
+    /// line in the same place and the two must agree — a chord YSpot accepts
+    /// and YKeys refuses leaves neither process holding it after a restart.
+    #[test]
+    fn a_macro_key_binds_bare_and_nothing_else_does() {
+        let bare = |code: &str| Hotkey {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            win: false,
+            code: code.to_string(),
+        };
+        for code in ["F13", "F19", "F24"] {
+            assert_eq!(bare(code).rejection(), None, "{code} should bind bare");
+            // Registered and dead until the remap exists; said where it is set.
+            assert!(bare(code).warning().is_some(), "{code} should warn");
+            assert_eq!(bare(code).accelerator(), code, "no modifier to name");
+        }
+        // The neighbours are ordinary keys and stay refused.
+        for code in ["F12", "F11", "KeyK", "Space", "Escape"] {
+            assert!(
+                bare(code).rejection().is_some(),
+                "{code} must not bind bare"
+            );
+        }
+        // With a modifier it is an ordinary chord: no remap needed, no warning.
+        let chord = Hotkey {
+            alt: true,
+            ..bare("F13")
+        };
+        assert_eq!(chord.rejection(), None);
+        assert_eq!(chord.warning(), None);
     }
 
     #[test]
