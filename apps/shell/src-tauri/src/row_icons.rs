@@ -89,7 +89,15 @@ pub fn setting_parsing_name(
     clsid: impl Fn(&str) -> Option<String>,
 ) -> Option<String> {
     match launch {
-        Launch::Uri(_) => Some(SETTINGS_HOME.to_string()),
+        // No icon, deliberately. `SHCreateItemFromParsingName` resolves the
+        // Settings PACKAGE and not the page, so every `ms-settings:` URI came
+        // back byte-identical: Display, Bluetooth and Windows Security were
+        // the same picture, which is worse than no picture — it says these
+        // rows are the same thing. The frontend draws a per-page Fluent glyph
+        // instead (`rowGlyph.ts`), which is what that set was vendored for.
+        // Returning None here also saves 73 rows an extraction and a cache
+        // entry apiece for a bitmap that could not tell them apart.
+        Launch::Uri(_) => None,
         Launch::ControlPanel(canonical) => match clsid(canonical) {
             Some(c) => Some(format!("shell:::{c}")),
             // A canonical name this machine does not register. Not an error:
@@ -144,21 +152,36 @@ mod tests {
         assert!(command_parsing_name("yspot.nonexistent").is_err());
     }
 
-    /// All 73 pages resolve to the same parsing name, so they share one
-    /// extraction rather than writing 73 identical PNGs to disk.
+    /// A URI page asks for no icon at all.
+    ///
+    /// It used to ask for `ms-settings:`, and got it — the same bitmap for
+    /// all 73, because the shell resolves the package rather than the page.
+    /// One picture for Display, Bluetooth and Windows Security is worse than
+    /// none: it asserts the rows are the same thing. They get a per-page
+    /// Fluent glyph from the frontend now, and this returns None so that the
+    /// glyph is what shows rather than losing a race with an extraction.
     #[test]
-    fn every_settings_page_shares_the_one_settings_icon() {
+    fn a_settings_page_asks_for_no_icon_and_never_the_shared_one() {
         let n = |_: &str| -> Option<String> { panic!("a URI page must not consult the registry") };
         for uri in [
             "ms-settings:",
             "ms-settings:display",
             "ms-settings:bluetooth",
+            "ms-settings:windowsdefender",
         ] {
-            assert_eq!(
-                setting_parsing_name(&Launch::Uri(uri.to_string()), n),
-                Some(SETTINGS_HOME.to_string())
-            );
+            assert_eq!(setting_parsing_name(&Launch::Uri(uri.to_string()), n), None);
         }
+    }
+
+    /// The Settings HOME still has one, because it is a built-in command
+    /// rather than a catalog page: one row, one destination, and the Settings
+    /// app's own icon is the right picture for it.
+    #[test]
+    fn the_settings_home_command_keeps_the_settings_app_icon() {
+        assert_eq!(
+            command_parsing_name("windows.settings"),
+            Ok(Some(SETTINGS_HOME.to_string()))
+        );
     }
 
     #[test]
