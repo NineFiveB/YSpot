@@ -1,10 +1,25 @@
 name: CI
 
+# `dev` is here because it has to be. Work happens on `dev` and reaches `main`
+# through a PR, so `pull_request` covered it — until the PR merged, at which
+# point pushes to `dev` silently triggered nothing and a commit sat unverified
+# while its author said CI was running. A branch that is worked on gets CI on
+# its own account, not as a side effect of a PR being open.
+#
+# The cost is a duplicate run once a PR is open: a push to `dev` and the PR's
+# merge-ref are different refs, so `concurrency` cannot collapse them. Paying
+# for a second run is cheaper than the failure above.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
+
+# Supersede in-flight runs of the same ref: pushing three times in a minute
+# should not queue three full Windows builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
