@@ -1,9 +1,10 @@
 // YSpot's own icons -- drawn, not vendored.
 //
-// Windows Security and Windows Backup have no icon in the Fluent UI System
-// Icons set, and Microsoft's shipped artwork for them is not ours to
-// redistribute, so without these two both rows wear the Windows Settings
-// glyph and three rows in the launcher look identical.
+// Windows Security, Windows Backup and YSuite Settings have no icon in the
+// Fluent UI System Icons set, and Microsoft's shipped artwork for the first
+// two is not ours to redistribute. Without these, both Windows rows wear the
+// Windows Settings glyph and three rows in the launcher look identical --
+// which is the complaint the whole set exists to answer.
 //
 // Copyright (c) the YSpot authors, under YSpot's own licence. These are
 // original drawings. What they take from Microsoft's Fluent iconography is

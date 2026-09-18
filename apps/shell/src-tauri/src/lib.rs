@@ -1807,6 +1807,29 @@ pub fn run() {
         .expect("error while running yspot-shell");
 }
 
+/// The licence notice ships beside the executable (`tauri.conf.json`
+/// resources), and the copy at the repo root is the one a human finds and
+/// edits — so a change to the root copy alone would leave the installer
+/// discharging the MIT attribution with a stale file. Nothing but this
+/// keeps them the same: CI never runs `tauri build`, so the bundle config
+/// is exercised only by a release tag.
+///
+/// `include_str!` rather than a runtime read: the paths are checked when the
+/// crate compiles, so deleting or renaming either file is a build error
+/// rather than a test that silently stops covering anything.
+#[cfg(test)]
+#[test]
+fn the_shipped_licence_notice_matches_the_one_at_the_repo_root() {
+    const ROOT: &str = include_str!("../../../../THIRD-PARTY-NOTICES.md");
+    const SHIPPED: &str = include_str!("../resources/THIRD-PARTY-NOTICES.md");
+    assert_eq!(
+        ROOT, SHIPPED,
+        "THIRD-PARTY-NOTICES.md and \
+         apps/shell/src-tauri/resources/THIRD-PARTY-NOTICES.md have diverged; \
+         the shipped copy is the one that discharges the attribution"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

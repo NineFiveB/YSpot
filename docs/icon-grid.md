@@ -56,8 +56,8 @@ reaches us. YSpot's renderer applies `fill` and nothing else, so an original
 icon has to be flattened the same way — a centreline, offset half a stroke
 each side, emitted as the ring between the two.
 
-**The style is not optional.** The first drawing of both YSpot icons was a
-solid silhouette rather than an outline, and it passed every check: on the
+**The style is not optional.** The first drawing of the first two YSpot
+icons was a solid silhouette rather than an outline, and it passed every check: on the
 grid, inside the live area, legible at 16px. Beside the vendored icons at 32px
 it read markedly heavier and plainly belonged to a different set — which is
 the one thing the grid exists to prevent, and the one thing no check on a
@@ -100,7 +100,7 @@ has to earn that.
 it and fails on a diff, because a drawing that has drifted from the script
 that made it fails as a wrong picture, not as an error.
 
-One thing to know before adding a third. **A subpath wound against the outline
+One thing to know before adding a fourth. **A subpath wound against the outline
 is a hole only where it overlaps one.** Outside, its winding is -1, which is
 still non-zero, which still fills. So "cut this shape but not that one" is not
 expressible in a single filled path, and the boolean subtraction that would
@@ -116,14 +116,23 @@ failed was certainly wrong.
 
 Turning a centreline into a 1px ring is exact for a rounded rectangle: inset
 the box by the stroke and the radius with it. For anything curved it is
-Tiller-Hanson, which is an approximation, so the script measures what it
-produced — worst distance from the centreline to either offset, against half a
-stroke — and halves a segment until that is under 0.02. On the shield's long
-bottom curves one undivided segment came out 0.135 wide.
+Tiller-Hanson, which is an approximation, so it is measured twice, by two
+checks that are easy to mistake for one.
 
-Two things that check got wrong before it was right, both worth knowing if you
-touch it: measuring to the nearest *sampled point* rather than to the curve
-reports the sampling chord as error (0.078 on a straight edge, most of a
+*While offsetting*, `offset_segs` halves a segment until its own offset is
+within **0.01** of the intended distance — `_offset_error`, measuring a piece
+against the piece it produced. On the shield's long bottom curves one
+undivided segment came out 0.135 wide.
+
+*Afterwards*, `check_stroke_width` reports the worst distance from the
+centreline to the nearer offset against half a stroke, and fails over
+**0.02**. That one is the report, not the control: loosening it does not
+loosen the halving, and tuning the wrong one of these is the mistake this
+paragraph exists to prevent.
+
+Two things the second check got wrong before it was right, both worth knowing
+if you touch it: measuring to the nearest *sampled point* rather than to the
+curve reports the sampling chord as error (0.078 on a straight edge, most of a
 tolerance), and a tolerance loose enough to hide that is loose enough to hide
 the real thing.
 

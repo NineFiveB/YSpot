@@ -387,7 +387,32 @@ describe("the query `windows`", () => {
     expect(backups.map((r) => r.kind)).toEqual(["command", "setting"]);
   });
 
-  it("puts YSpot Settings first for `settings`, as asked, by the same rule", () => {
+});
+
+// The two shorter queries on the way to the same place. Both reach only
+// built-ins, so they exercise the band and the declaration-order tie-break
+// without any other source in the way.
+describe("the queries `se` and `settings`", () => {
+  // `se` is the shortest query that reaches a built-in at all (the Rust side
+  // requires two characters). Three reach the band — File Search word-starts
+  // at "Search" and takes the synonym's 0.81 base, both Settings word-start
+  // at 0.80 — so a cap of two dropped one of them, and after the
+  // declaration-order tie-break the one it dropped was Windows Settings. The
+  // cap is three now; this is what it buys.
+  it("keeps all three band built-ins that `se` reaches", () => {
+    const rows = mergeRows({
+      apps: [
+        command("YSpot Settings", 0.8 + 0.5, 0),
+        command("Windows Settings", 0.8 + 0.5, 1),
+        command("File Search", 0.81 + 0.5, 4),
+      ],
+      files: [],
+      frozen: null,
+    });
+    expect(rows.map((r) => r.name)).toEqual(["File Search", "YSpot Settings", "Windows Settings"]);
+  });
+
+  it("puts YSpot Settings first for `settings`, as asked", () => {
     // Both are WORD_START 0.8 plus the band. YSpot Settings is declared
     // first; a name sort had Windows first on the strength of a W.
     const rows = mergeRows({

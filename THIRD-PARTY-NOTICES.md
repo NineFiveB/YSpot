@@ -44,5 +44,11 @@ SOFTWARE.
 fonts that ship with Windows. YSpot neither redistributes those fonts nor
 traces their glyphs into vector paths. Microsoft's font redistribution guidance
 forbids converting Windows fonts to other formats, and the fonts themselves are
-covered by a separate, revocable assets agreement. The reasoning is recorded in
-`docs/M1.md`.
+covered by a separate, revocable assets agreement. The full reasoning, with the
+sources it rests on, is the header comment of `scripts/vendor-fluent-icons.py`,
+repeated in the generated `apps/shell/src/lib/fluentGlyphs.ts`.
+
+**Also included:** three icons drawn by YSpot rather than vendored, in
+`apps/shell/src/lib/yspotGlyphs.ts`. They are original work under YSpot's own
+licence; what they take from Microsoft's Fluent iconography is its published
+grid, which `docs/icon-grid.md` records. A grid is a measurement, not artwork.
